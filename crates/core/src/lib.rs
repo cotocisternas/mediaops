@@ -1,12 +1,13 @@
 //! Domain types for mediaops.
 //!
 //! [`TitleId`] and [`pathschema`] are pure functions. [`walker`] and [`install`]
-//! may use caller-supplied filesystem roots (tempdir fixtures). There is still
-//! no tokio runtime and no network.
+//! are the only modules permitted to touch the filesystem, and only through
+//! caller-supplied roots -- `crates/arch-tests` enforces that boundary the way
+//! it enforces AD-2. There is still no tokio runtime and no network.
 
-mod install;
+pub mod install;
 pub mod pathschema;
-mod title_id;
+pub mod title_id;
 pub mod walker;
 
 pub use install::{

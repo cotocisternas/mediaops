@@ -43,15 +43,47 @@ pub enum InstallError {
     MissingLive(String),
     #[error("title does not match destination")]
     TitleMismatch,
+    #[error("backup destination `{0}` is inside the library root")]
+    BackupInsideLibrary(String),
+    /// `replace` moved the live file aside, then could neither place the new
+    /// file nor put the old one back. Both failures are reported, and the live
+    /// bytes are named so an operator can recover them by hand.
+    #[error(
+        "replace failed ({cause}) and the live file could not be restored ({restore}); \
+         the live file is now at `{live_now_at}`"
+    )]
+    RollbackFailed {
+        cause: String,
+        restore: String,
+        live_now_at: String,
+    },
     #[error(transparent)]
     PathSchema(#[from] PathSchemaError),
-    #[error("io error: {0}")]
-    Io(String),
+    /// Carries the failing path and the `ErrorKind`, so callers can tell `EXDEV`
+    /// (staging on another filesystem) from `ENOSPC` from `EACCES`.
+    #[error("io error at `{path}`: {message}")]
+    Io {
+        path: String,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 }
 
-impl From<std::io::Error> for InstallError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err.to_string())
+impl InstallError {
+    fn io(path: &Path, err: &std::io::Error) -> Self {
+        Self::Io {
+            path: path.display().to_string(),
+            kind: err.kind(),
+            message: err.to_string(),
+        }
+    }
+
+    /// `ErrorKind` for an io failure, `None` for every policy refusal.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io { kind, .. } => Some(*kind),
+            _ => None,
+        }
     }
 }
 
@@ -96,17 +128,24 @@ impl VerifiedConvertingHandle {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| InstallError::NotConverting(source.display().to_string()))?;
-        if !name.ends_with(".converting") {
+        let dest_rel = pathschema::render(title_id, placement)?;
+        if pathschema::parse(&dest_rel)? != *title_id {
+            return Err(InstallError::TitleMismatch);
+        }
+        // `<rendered file name>.converting`, not merely *some* `.converting`
+        // file: otherwise an unrelated encode output can replace a live title.
+        let expected = dest_rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| format!("{n}.converting"))
+            .ok_or_else(|| InstallError::NotConverting(source.display().to_string()))?;
+        if name != expected {
             return Err(InstallError::NotConverting(source.display().to_string()));
         }
         reject_symlink_file(
             &source,
             InstallError::NotConverting(source.display().to_string()),
         )?;
-        let dest_rel = pathschema::render(title_id, placement)?;
-        if pathschema::parse(&dest_rel)? != *title_id {
-            return Err(InstallError::TitleMismatch);
-        }
         Ok(Self { source, dest_rel })
     }
 
@@ -116,8 +155,12 @@ impl VerifiedConvertingHandle {
 }
 
 fn reject_symlink_file(path: &Path, on_symlink: InstallError) -> Result<(), InstallError> {
-    let meta = fs::symlink_metadata(path)
-        .map_err(|_| InstallError::MissingSource(path.display().to_string()))?;
+    let meta = fs::symlink_metadata(path).map_err(|err| match err.kind() {
+        // Only a genuine absence is "not found"; permissions and symlink loops
+        // are their own diagnosis.
+        std::io::ErrorKind::NotFound => InstallError::MissingSource(path.display().to_string()),
+        _ => InstallError::io(path, &err),
+    })?;
     if meta.file_type().is_symlink() {
         return Err(on_symlink);
     }
@@ -137,13 +180,15 @@ pub fn install(
     if pathschema::parse(&handle.dest_rel)? != *title_id {
         return Err(InstallError::TitleMismatch);
     }
-    if dest.exists() {
+    // `exists()` follows symlinks, so a dangling symlink squatting the library
+    // path would report `false`. `symlink_metadata` sees the entry itself.
+    if fs::symlink_metadata(&dest).is_ok() {
         return Err(InstallError::DestinationExists(dest.display().to_string()));
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
     }
-    fs::rename(&handle.source, &dest)?;
+    fs::rename(&handle.source, &dest).map_err(|err| InstallError::io(&handle.source, &err))?;
     Ok(dest)
 }
 
@@ -157,26 +202,47 @@ pub fn replace(
     handle: &VerifiedConvertingHandle,
     backup_destination: impl AsRef<Path>,
 ) -> Result<PathBuf, InstallError> {
-    let dest = library_root.as_ref().join(&handle.dest_rel);
+    let library_root = library_root.as_ref();
+    let dest = library_root.join(&handle.dest_rel);
     if pathschema::parse(&handle.dest_rel)? != *title_id {
         return Err(InstallError::TitleMismatch);
     }
-    if !dest.is_file() {
-        return Err(InstallError::MissingLive(dest.display().to_string()));
-    }
     let backup_destination = backup_destination.as_ref();
-    if backup_destination.exists() {
+    // The library is written only through the schema path; a backup landing
+    // inside it would be a second, unschema'd writer.
+    if backup_destination.starts_with(library_root) {
+        return Err(InstallError::BackupInsideLibrary(
+            backup_destination.display().to_string(),
+        ));
+    }
+    let live = fs::symlink_metadata(&dest);
+    match &live {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err(InstallError::MissingLive(dest.display().to_string()));
+        }
+        Err(_) => return Err(InstallError::MissingLive(dest.display().to_string())),
+        Ok(_) => {}
+    }
+    if fs::symlink_metadata(backup_destination).is_ok() {
         return Err(InstallError::BackupExists(
             backup_destination.display().to_string(),
         ));
     }
     if let Some(parent) = backup_destination.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
     }
-    fs::rename(&dest, backup_destination)?;
+    fs::rename(&dest, backup_destination).map_err(|err| InstallError::io(&dest, &err))?;
     if let Err(err) = fs::rename(&handle.source, &dest) {
-        fs::rename(backup_destination, &dest)?;
-        return Err(err.into());
+        // Put the live file back. If that also fails, both failures are
+        // reported -- the cause is never dropped for the rollback's error.
+        if let Err(restore) = fs::rename(backup_destination, &dest) {
+            return Err(InstallError::RollbackFailed {
+                cause: err.to_string(),
+                restore: restore.to_string(),
+                live_now_at: backup_destination.display().to_string(),
+            });
+        }
+        return Err(InstallError::io(&handle.source, &err));
     }
     Ok(dest)
 }
@@ -235,23 +301,22 @@ mod tests {
         let staged_rel = staging_path(&title_id, final_name).expect("staging_path");
         assert_eq!(
             staged_rel.to_str().expect("utf8"),
-            "_incoming/movie:tmdb:603/The.Matrix.(1999).mkv"
+            "_incoming/movie-tmdb-603/The.Matrix.(1999).mkv"
         );
         let staged = tmp.path.join(&staged_rel);
         write_file(&staged, b"matrix-bytes");
 
+        let lib = tmp.path.join("library");
         let handle = VerifiedStagingHandle::verify(&title_id, staged.clone(), &placement)
             .expect("verify staging");
-        let installed = install(&tmp.path, &title_id, &handle).expect("install");
-        let expected = tmp
-            .path
-            .join(render(&title_id, &placement).expect("render"));
+        let installed = install(&lib, &title_id, &handle).expect("install");
+        let expected = lib.join(render(&title_id, &placement).expect("render"));
         assert_eq!(installed, expected);
-        assert!(installed.starts_with(&tmp.path));
+        assert!(installed.starts_with(&lib));
         assert_eq!(fs::read(&installed).expect("read"), b"matrix-bytes");
         assert!(!staged.exists());
         assert_eq!(
-            pathschema::parse(installed.strip_prefix(&tmp.path).expect("strip")).expect("parse"),
+            pathschema::parse(installed.strip_prefix(&lib).expect("strip")).expect("parse"),
             title_id
         );
     }
@@ -265,8 +330,9 @@ mod tests {
             .path
             .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
         write_file(&staged, b"original");
+        let lib = tmp.path.join("library");
         let handle = VerifiedStagingHandle::verify(&title_id, staged, &placement).expect("verify");
-        let installed = install(&tmp.path, &title_id, &handle).expect("install");
+        let installed = install(&lib, &title_id, &handle).expect("install");
 
         let converting = tmp
             .path
@@ -277,14 +343,14 @@ mod tests {
             VerifiedConvertingHandle::verify(&title_id, converting.clone(), &placement)
                 .expect("verify converting");
         let backup = tmp.path.join("backup").join("The.Matrix.(1999).mkv");
-        let replaced = replace(&tmp.path, &title_id, &converting_handle, &backup).expect("replace");
+        let replaced = replace(&lib, &title_id, &converting_handle, &backup).expect("replace");
 
         assert_eq!(replaced, installed);
         assert_eq!(fs::read(&replaced).expect("new"), b"encoded");
         assert_eq!(fs::read(&backup).expect("backup"), b"original");
         assert!(!converting.exists());
         assert_eq!(
-            pathschema::parse(replaced.strip_prefix(&tmp.path).expect("strip")).expect("parse"),
+            pathschema::parse(replaced.strip_prefix(&lib).expect("strip")).expect("parse"),
             title_id
         );
     }
@@ -356,14 +422,15 @@ mod tests {
         let staged_rel = staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging");
         let staged = tmp.path.join(&staged_rel);
         write_file(&staged, b"original");
+        let lib = tmp.path.join("library");
         let handle = VerifiedStagingHandle::verify(&title_id, staged, &placement).expect("verify");
-        let installed = install(&tmp.path, &title_id, &handle).expect("install");
+        let installed = install(&lib, &title_id, &handle).expect("install");
 
         write_file(&tmp.path.join(&staged_rel), b"other-bytes");
         let again =
             VerifiedStagingHandle::verify(&title_id, tmp.path.join(&staged_rel), &placement)
                 .expect("verify again");
-        let err = install(&tmp.path, &title_id, &again).expect_err("second");
+        let err = install(&lib, &title_id, &again).expect_err("second");
         assert!(matches!(err, InstallError::DestinationExists(_)));
         assert_eq!(fs::read(&installed).expect("read"), b"original");
         assert_eq!(
@@ -381,8 +448,9 @@ mod tests {
             .path
             .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
         write_file(&staged, b"original");
+        let lib = tmp.path.join("library");
         let handle = VerifiedStagingHandle::verify(&title_id, staged, &placement).expect("verify");
-        let installed = install(&tmp.path, &title_id, &handle).expect("install");
+        let installed = install(&lib, &title_id, &handle).expect("install");
 
         let converting = tmp
             .path
@@ -394,8 +462,7 @@ mod tests {
                 .expect("verify converting");
         let backup = tmp.path.join("backup").join("The.Matrix.(1999).mkv");
         write_file(&backup, b"keep-me");
-        let err =
-            replace(&tmp.path, &title_id, &converting_handle, &backup).expect_err("backup exists");
+        let err = replace(&lib, &title_id, &converting_handle, &backup).expect_err("backup exists");
         assert!(matches!(err, InstallError::BackupExists(_)));
         assert_eq!(fs::read(&installed).expect("live"), b"original");
         assert_eq!(fs::read(&backup).expect("backup"), b"keep-me");
@@ -403,10 +470,213 @@ mod tests {
 
         fs::remove_file(&backup).expect("clear backup");
         fs::remove_file(&converting).expect("drop converting");
-        let err = replace(&tmp.path, &title_id, &converting_handle, &backup)
-            .expect_err("converting gone");
-        assert!(matches!(err, InstallError::Io(_)));
+        let err =
+            replace(&lib, &title_id, &converting_handle, &backup).expect_err("converting gone");
+        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::NotFound));
         assert_eq!(fs::read(&installed).expect("restored"), b"original");
         assert!(!backup.exists());
+    }
+
+    /// Build a verified staging handle for `title_id` under `tmp`.
+    fn staged_handle(
+        tmp: &TempTree,
+        title_id: &TitleId,
+        placement: &Placement,
+    ) -> VerifiedStagingHandle {
+        let name = render(title_id, placement)
+            .expect("render")
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("name")
+            .to_string();
+        let staged = tmp
+            .path
+            .join(staging_path(title_id, &name).expect("staging"));
+        write_file(&staged, b"bytes");
+        VerifiedStagingHandle::verify(title_id, staged, placement).expect("verify")
+    }
+
+    #[test]
+    fn install_and_replace_refuse_a_handle_built_for_another_title() {
+        let tmp = TempTree::new();
+        let lib = tmp.path.join("library");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let title_603 = TitleId::movie("603").expect("id");
+        let title_604 = TitleId::movie("604").expect("other");
+
+        let handle = staged_handle(&tmp, &title_603, &placement);
+        assert!(matches!(
+            install(&lib, &title_604, &handle),
+            Err(InstallError::TitleMismatch)
+        ));
+        assert!(
+            !lib.exists(),
+            "a refused install must not create anything under the library root"
+        );
+
+        let converting = tmp
+            .path
+            .join("work")
+            .join("The.Matrix.(1999).mkv.converting");
+        write_file(&converting, b"encoded");
+        let converting_handle =
+            VerifiedConvertingHandle::verify(&title_603, converting, &placement).expect("verify");
+        let backup = tmp.path.join("backup").join("old.mkv");
+        assert!(matches!(
+            replace(&lib, &title_604, &converting_handle, &backup),
+            Err(InstallError::TitleMismatch)
+        ));
+    }
+
+    #[test]
+    fn replace_without_a_live_file_is_missing_live() {
+        let tmp = TempTree::new();
+        let lib = tmp.path.join("library");
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let converting = tmp
+            .path
+            .join("work")
+            .join("The.Matrix.(1999).mkv.converting");
+        write_file(&converting, b"encoded");
+        let handle =
+            VerifiedConvertingHandle::verify(&title_id, converting, &placement).expect("verify");
+        let backup = tmp.path.join("backup").join("old.mkv");
+        assert!(matches!(
+            replace(&lib, &title_id, &handle, &backup),
+            Err(InstallError::MissingLive(_))
+        ));
+
+        // A symlink standing in for the live file is not a live file either.
+        let dest = lib.join(render(&title_id, &placement).expect("render"));
+        fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
+        let target = tmp.path.join("elsewhere.mkv");
+        write_file(&target, b"not-in-library");
+        std::os::unix::fs::symlink(&target, &dest).expect("symlink");
+        assert!(matches!(
+            replace(&lib, &title_id, &handle, &backup),
+            Err(InstallError::MissingLive(_))
+        ));
+        assert_eq!(fs::read(&target).expect("target intact"), b"not-in-library");
+    }
+
+    #[test]
+    fn verify_on_a_missing_path_is_missing_source() {
+        let tmp = TempTree::new();
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let absent = tmp
+            .path
+            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        assert!(matches!(
+            VerifiedStagingHandle::verify(&title_id, absent, &placement),
+            Err(InstallError::MissingSource(_))
+        ));
+    }
+
+    #[test]
+    fn unreadable_source_is_not_reported_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempTree::new();
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let staged = tmp
+            .path
+            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        write_file(&staged, b"bytes");
+        let parent = staged.parent().expect("parent").to_path_buf();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).expect("chmod");
+
+        let got = VerifiedStagingHandle::verify(&title_id, staged, &placement);
+        let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o755));
+
+        let err = got.expect_err("unreadable");
+        assert_eq!(
+            err.io_kind(),
+            Some(std::io::ErrorKind::PermissionDenied),
+            "a permissions failure must not masquerade as `source file not found`, got {err}"
+        );
+    }
+
+    #[test]
+    fn converting_handle_must_name_the_file_it_replaces() {
+        let tmp = TempTree::new();
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+
+        // Right suffix, wrong title: this would have replaced a live file.
+        let unrelated = tmp.path.join("work").join("Some.Other.Encode.converting");
+        write_file(&unrelated, b"encoded");
+        assert!(matches!(
+            VerifiedConvertingHandle::verify(&title_id, unrelated, &placement),
+            Err(InstallError::NotConverting(_))
+        ));
+
+        // Not a converting file at all.
+        let plain = tmp.path.join("work").join("The.Matrix.(1999).mkv");
+        write_file(&plain, b"encoded");
+        assert!(matches!(
+            VerifiedConvertingHandle::verify(&title_id, plain, &placement),
+            Err(InstallError::NotConverting(_))
+        ));
+
+        // The real shape is accepted.
+        let ok = tmp
+            .path
+            .join("work")
+            .join("The.Matrix.(1999).mkv.converting");
+        write_file(&ok, b"encoded");
+        assert!(VerifiedConvertingHandle::verify(&title_id, ok, &placement).is_ok());
+    }
+
+    #[test]
+    fn a_symlink_squatting_the_library_path_is_destination_exists() {
+        let tmp = TempTree::new();
+        let lib = tmp.path.join("library");
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let handle = staged_handle(&tmp, &title_id, &placement);
+
+        let dest = lib.join(render(&title_id, &placement).expect("render"));
+        fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
+        // Dangling: `exists()` reports false for this, `symlink_metadata` does not.
+        std::os::unix::fs::symlink(tmp.path.join("nowhere"), &dest).expect("symlink");
+
+        assert!(matches!(
+            install(&lib, &title_id, &handle),
+            Err(InstallError::DestinationExists(_))
+        ));
+        assert!(
+            fs::symlink_metadata(&dest)
+                .expect("still there")
+                .file_type()
+                .is_symlink(),
+            "the refused install must not have replaced the entry"
+        );
+    }
+
+    #[test]
+    fn a_backup_inside_the_library_root_is_refused() {
+        let tmp = TempTree::new();
+        let lib = tmp.path.join("library");
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let handle = staged_handle(&tmp, &title_id, &placement);
+        let installed = install(&lib, &title_id, &handle).expect("install");
+
+        let converting = tmp
+            .path
+            .join("work")
+            .join("The.Matrix.(1999).mkv.converting");
+        write_file(&converting, b"encoded");
+        let converting_handle =
+            VerifiedConvertingHandle::verify(&title_id, converting, &placement).expect("verify");
+
+        let inside = lib.join("_backup").join("The.Matrix.(1999).mkv");
+        assert!(matches!(
+            replace(&lib, &title_id, &converting_handle, &inside),
+            Err(InstallError::BackupInsideLibrary(_))
+        ));
+        assert_eq!(fs::read(&installed).expect("live untouched"), b"bytes");
     }
 }

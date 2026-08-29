@@ -119,6 +119,20 @@ impl TitleId {
         )
     }
 
+    /// Filesystem-safe rendering of the same identity, for staging directory names.
+    ///
+    /// [`Self::render`] is colon-formed and is the identity on the wire and in the
+    /// store, but a colon cannot appear in a directory name on SMB, exFAT, or NTFS.
+    /// Staging paths use this form instead (`movie-tmdb-603`).
+    pub fn staging_token(&self) -> String {
+        format!(
+            "{}-{}-{}",
+            self.kind.as_str(),
+            self.source.as_str(),
+            self.id
+        )
+    }
+
     /// Parse `kind:source:id`. Invalid kind/source/id is an error, never a silent TitleId.
     pub fn parse(raw: &str) -> Result<Self, TitleIdError> {
         let mut parts = raw.splitn(3, ':');
@@ -172,7 +186,11 @@ fn valid_id(source: TitleSource, id: &str) -> bool {
         return false;
     }
     match source {
-        TitleSource::Tmdb | TitleSource::Tvdb => id.bytes().all(|b| b.is_ascii_digit()),
+        // Leading zeros would mint two identities for one title (`0603` vs `603`),
+        // and TitleId is the key story 1.3 indexes on.
+        TitleSource::Tmdb | TitleSource::Tvdb => {
+            id.bytes().all(|b| b.is_ascii_digit()) && !(id.len() > 1 && id.starts_with('0'))
+        }
         TitleSource::Mbid => is_mbid(id),
     }
 }
@@ -312,5 +330,36 @@ mod tests {
         assert!(TitleId::parse("movie:tvdb:1").is_err());
         assert!(TitleId::parse("series:tmdb:1").is_err());
         assert!(TitleId::parse("album:tmdb:1").is_err());
+    }
+
+    #[test]
+    fn numeric_ids_reject_leading_zeros() {
+        // `0603` and `603` would otherwise be two identities for one title.
+        assert!(matches!(
+            TitleId::parse("movie:tmdb:0603"),
+            Err(TitleIdError::InvalidId(_))
+        ));
+        assert!(matches!(
+            TitleId::series("079126"),
+            Err(TitleIdError::InvalidId(_))
+        ));
+        // A bare zero is still a legal id; only *leading* zeros are refused.
+        assert!(TitleId::movie("0").is_ok());
+        assert!(TitleId::movie("603").is_ok());
+    }
+
+    #[test]
+    fn staging_token_is_filesystem_safe_and_distinct_from_render() {
+        let movie = TitleId::movie("603").expect("movie");
+        assert_eq!(movie.render(), "movie:tmdb:603");
+        assert_eq!(movie.staging_token(), "movie-tmdb-603");
+        let album = TitleId::album(RELAYER_MBID).expect("album");
+        assert_eq!(album.staging_token(), format!("album-mbid-{RELAYER_MBID}"));
+        for id in [&movie, &album] {
+            assert!(
+                !id.staging_token().contains(':'),
+                "staging tokens must survive SMB/exFAT/NTFS"
+            );
+        }
     }
 }
