@@ -1,4 +1,23 @@
-//! Pure domain types. No I/O and no tokio runtime.
+//! Domain types for mediaops.
+//!
+//! [`TitleId`] and [`pathschema`] are pure functions. [`walker`] and [`install`]
+//! may use caller-supplied filesystem roots (tempdir fixtures). There is still
+//! no tokio runtime and no network.
+
+mod install;
+pub mod pathschema;
+mod title_id;
+pub mod walker;
+
+pub use install::{
+    InstallError, VerifiedConvertingHandle, VerifiedStagingHandle, install, replace,
+};
+pub use pathschema::{
+    GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, parse, render, staging_path,
+    strip_scene_tags,
+};
+pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource};
+pub use walker::{Allowlist, RemoteEntry, RemoteRef, WalkerError};
 
 use std::process::{ExitCode as ProcessExitCode, Termination};
 
