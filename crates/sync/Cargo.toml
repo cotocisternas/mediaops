@@ -1,0 +1,5 @@
+[package]
+name = "mediaops-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true

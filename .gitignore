@@ -2,3 +2,7 @@
 .bmad-loop/cache/
 .bmad-loop/policy.toml
 _bmad/render/
+/target
+*.pem
+*.key
+tls/
