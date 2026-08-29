@@ -88,6 +88,16 @@ Read-only evidence: `_bmad-output/planning-artifacts/architecture/architecture-m
 - Given `mediaops` and `mediaopsd`, when each is started with `--json`, without `--json`, and with an unknown flag, then stdout/stderr/exit match the I/O matrix (no listen, no lock, no extra stdout).
 - Given `cargo test` with default features, when the suite runs, then nothing requires network, a live box, or a GPU, and `mediaops-core` has `CapabilityToken` with no LLM crate dependency.
 
+### Review Findings
+
+- [x] [Review][Patch] Parse `--json=` values to match clap; `--json=false` stays human on every path [`bins/mediaops/src/main.rs:37`]
+- [x] [Review][Patch] `reqwest` pin keeps default features, so the first `mediaops-arr` consumer can pull `native-tls` [`Cargo.toml:35`]
+- [x] [Review][Patch] Transitive encode-in-mediaopsd closure test does not require `mediaops-encode` in the message [`crates/arch-tests/src/lib.rs:286`]
+- [x] [Review][Patch] Human usage and `--json=true` usage tests omit the stderr envelope assertion [`bins/mediaops/tests/cli.rs:64`]
+- [x] [Review][Patch] `--help`/`--version` tests only assert exit 0, not clap text vs identity/JSON [`bins/mediaops/tests/cli.rs:106`]
+- [x] [Review][Patch] CLI ignores stdout flush errors and clap `err.print()` failures [`bins/mediaops/src/main.rs:63`]
+- [x] [Review][Patch] `AppError::Runtime` → exit 1 is never exercised by binary tests [`bins/mediaops/src/main.rs:53`]
+
 ## Spec Change Log
 
 ## Review Triage Log

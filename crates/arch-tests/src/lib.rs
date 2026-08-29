@@ -284,9 +284,11 @@ mod tests {
         add_direct_dep(&mut metadata, "mediaops-net", "mediaops-encode");
         let found = violations(&metadata);
         assert!(
-            found
-                .iter()
-                .any(|v| v.message.contains("workspace-internal transitive closure")),
+            found.iter().any(|v| {
+                v.message.contains("workspace-internal transitive closure")
+                    && v.message.contains("mediaops-encode")
+                    && v.message.contains("mediaopsd")
+            }),
             "expected mediaopsd closure violation independent of the net→encode edge, got:\n{}",
             messages(&found)
         );
