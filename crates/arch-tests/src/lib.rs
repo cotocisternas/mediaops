@@ -131,6 +131,53 @@ fn closure_contains(graph: &HashMap<String, Vec<String>>, start: &str, needle: &
     false
 }
 
+/// Modules in `mediaops-core` allowed to touch the filesystem.
+///
+/// Story 1.2 carved `walker` and `install` out of the "core is pure domain (no
+/// I/O)" law so they could use caller-supplied roots. That carve-out lived only
+/// in a doc comment, which meant any future `core` module could quietly widen
+/// it. This keeps it enforced, the same way AD-2 is.
+pub const CORE_IO_MODULES: &[&str] = &["walker.rs", "install.rs"];
+
+/// Paths under `crates/core/src` that reference `std::fs` outside the carve-out.
+pub fn core_io_violations(core_src: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(core_src) else {
+        return vec![format!("cannot read {}", core_src.display())];
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        if CORE_IO_MODULES.contains(&name.as_str()) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Only the code, not the tests that build tempdir fixtures.
+        let code = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or(&source)
+            .to_string();
+        let hits: Vec<&str> = ["std::fs", "fs::read", "fs::write", "fs::rename", "fs::File"]
+            .into_iter()
+            .filter(|needle| code.contains(needle))
+            .collect();
+        if !hits.is_empty() {
+            found.push(format!("{name} references {hits:?}"));
+        }
+    }
+    found.sort();
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +353,45 @@ mod tests {
             "expected banned ssh2 violation, got:\n{}",
             messages(&found)
         );
+    }
+
+    #[test]
+    fn core_filesystem_io_stays_in_walker_and_install() {
+        let core_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .join("core")
+            .join("src");
+        assert!(core_src.is_dir(), "{} must exist", core_src.display());
+        let violations = core_io_violations(&core_src);
+        assert!(
+            violations.is_empty(),
+            "core is pure domain outside {CORE_IO_MODULES:?}; found: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn core_io_violation_is_detected_when_a_pure_module_reaches_for_the_filesystem() {
+        // The check must be able to fail, or it proves nothing.
+        let tmp = std::env::temp_dir().join(format!(
+            "mediaops-archtest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        std::fs::write(tmp.join("walker.rs"), "use std::fs;\n").expect("write allowed");
+        std::fs::write(
+            tmp.join("pathschema.rs"),
+            "fn f() { std::fs::read(\"x\"); }\n",
+        )
+        .expect("write violation");
+        let violations = core_io_violations(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(violations.len(), 1, "got {violations:?}");
+        assert!(violations[0].starts_with("pathschema.rs"));
     }
 }
