@@ -1,0 +1,145 @@
+- id: "1"
+  title: Workspace scaffold and dependency law
+  description: >-
+    Cargo workspace with all crate and binary skeletons from the spine's
+    structural seed, plus the arch-tests member crate enforcing AD-2's
+    dependency subgraph and bans. Lands the core ExitCode enum, the
+    stdout/stderr + --json envelope convention, and tracing setup
+    (AD-1, AD-2, AD-17, AD-18, AD-19).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "2"
+  title: PathSchema, TitleId, and the walker
+  description: >-
+    core::pathschema with parse(render(id)) == id round-trip, scene-tag
+    strip and reject bins as schema CI, the TitleId kind:source:id form,
+    the allowlist walker that never follows symlinks off-root, and
+    staging_path (AD-13, CAP-6 groundwork).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "3"
+  title: DesiredState, Plan, jobs, and store
+  description: >-
+    DesiredState TOML with deny_unknown_fields and unit-suffixed size
+    fields converting to Bytes(u64); the Plan artifact embedding raw TOML
+    bytes plus blake3 hash; core::jobs state machines with advance() as
+    the sole state write; the store crate with migrations and the four
+    repositories (AD-8, AD-9, AD-10).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "4"
+  title: Wire contract in the proto crate
+  description: >-
+    mediaops.v1 Control and Transfer services via tonic-prost-build,
+    RemoteRef/RemoteEntry mirroring core types, ErrorDetail plus the only
+    two Status build/parse functions, and the canonical ControlPort
+    implementation over generated clients (AD-3).
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "5"
+  title: net crate — TLS identity and channels
+  description: >-
+    rcgen minting of CA, server, and client certs; rustls server and
+    client configs with require-and-verify client auth; UDS and TCP
+    serve/connect plumbing; the channel-pool primitive and
+    endpoint_fingerprint (AD-14, groundwork for AD-12).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "6"
+  title: mediaopsd seedbox role
+  description: >-
+    Seedbox role binding TCP gRPC+mTLS: the Transfer service (listing,
+    Stat, streaming GetRange) backed by the one walker, and minimal
+    Control (df, version + proto-package handshake). grabber=None only —
+    no arr crate in this story set (AD-5, AD-22, CAP-5 slice).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "7"
+  title: Seedbox bootstrap over ssh
+  description: >-
+    mediaops seedbox bootstrap: import ~/.ssh/config Host seedbox, build
+    musl-static mediaopsd, copy binary and systemd user unit, mint and
+    place certs, config-home layout with git-work-tree refusals, then
+    probe Range concurrency and persist N keyed by endpoint_fingerprint
+    (AD-7, AD-16, AD-22, CAP-5).
+  spec_checkpoint: true
+  done_checkpoint: true
+  invoke_dev_with: >-
+    Offline tests only (AD-20); unit-test the bootstrap via exec-port
+    transcripts. This story's code touches the live SeedIt4Me box when
+    run — stop and surface anything destructive before executing it.
+- id: "8"
+  title: Home gateway
+  description: >-
+    Home mediaopsd role: re-serve the seedbox services on the unix
+    socket, proxy Control and Range streams byte-for-byte, ConfigurePool
+    with 1:1 stream-to-channel pinning and ResourceExhausted refusal of
+    the N+1th stream, and the status RPC exposing endpoint_fingerprint
+    (AD-4, AD-12).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+    Include the AD-12 failure-history test: N concurrent streams must
+    produce N distinct upstream connections.
+- id: "9"
+  title: transfer — pull, verify, resume
+  description: >-
+    PullFile with the files-first range scheduler, the .partial plus
+    .partial.b3 sidecar protocol (fsync-then-record, bytes-only units),
+    resume from recorded ranges, and whole-file BLAKE3 into the install()
+    gate (AD-11, AD-12, CAP-4).
+  spec_checkpoint: true
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "10"
+  title: Library bootstrap and scheduler
+  description: >-
+    mediaops library bootstrap: schema dirs plus app-managed _ops and
+    _incoming, watermark refusal, systemd-user oneshot + OnUnitInactiveSec
+    units, the flock with AD-4's exclusive/lock-free verb classes, and
+    NVENC probe persisted to machine state (AD-6, AD-7, CAP-6).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "11"
+  title: sync plan/apply and CLI verbs
+  description: >-
+    The pure planner (Copy/Skip against index and budgets, music-first)
+    and the apply loop advancing ready jobs, wired to the CLI verbs plan,
+    run, status, watch, and why with --json (AD-9, AD-10, CAP-1 and CAP-7
+    slices for the demo).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "12"
+  title: encode
+  description: >-
+    EncodePolicy execution under the probed NVENC cap: .converting
+    reversible replace through the install gate's replace() entry point,
+    the pausable job queue, and the HDR/DV and 2160p-remux refuse classes
+    (AD-13, AD-16, CAP-10).
+  invoke_dev_with: >-
+    Offline tests only (AD-20); the live box and GPU are story 13's domain.
+    Obey arch-tests; cite AD IDs in code comments only where non-obvious.
+- id: "13"
+  title: First demo on this box
+  description: >-
+    Live integration per increments.md: bootstrap both ends, plan, pull
+    with parallel ranges, kill at ~90% and resume from .partial, schema
+    install, then encode one HEVC-MP4 movie under the NVENC cap; produce
+    the demo runbook. Live-box and GPU work — explicitly not CI (AD-20's
+    feature-gated path).
+  spec_checkpoint: true
+  done_checkpoint: true
+  invoke_dev_with: >-
+    This story runs against the live SeedIt4Me box and the home GPU —
+    stop and surface anything destructive before executing it. Keep all
+    live steps behind the explicit cargo feature + env var per AD-20.
