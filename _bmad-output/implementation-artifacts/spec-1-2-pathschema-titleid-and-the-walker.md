@@ -4,7 +4,7 @@ type: 'feature'
 created: '2026-08-29'
 status: 'done'
 baseline_revision: 'a3273af46fab9af514cf311355e9bfcccf2d79c8'
-review_loop_iteration: 0
+review_loop_iteration: 1
 followup_review_recommended: true
 context:
   - '_bmad-output/implementation-artifacts/epic-1-context.md'
@@ -80,9 +80,117 @@ Read-only evidence: epic-1-context Identity and paths; AD-11 staging layout; AD-
 - Given staging and the install gate, when any path is built, then it uses only `staging_path` (`_incoming/<TitleId>/…`), and `install` / `replace` exist as the two library-path writers (tests call them; other crates may wait).
 - Given `cargo test -p mediaops-core` and `cargo test -p mediaops-arch-tests` with default features, when they run, then they pass offline, binaries still match the 1.1 CLI matrix, and core has no tokio/rusqlite/reqwest.
 
+### Review Findings
+
+Adversarial code review of commit `35a4f03`, 2026-08-29. Four layers (blind-hunter, edge-case-hunter, verification-gap, acceptance-auditor). Nine findings were reproduced with throwaway tests against a clean tree; those are marked **[confirmed]**.
+
+#### Decisions taken (2026-08-29)
+
+- [x] [Review][Decision] **D1 `RemoteRef`/`RemoteEntry` sealed against story 1.4 → resolved: validating constructor.** Both constructors are `pub(crate) fn new` (`crates/core/src/walker.rs:22`, `:45`) with private fields, so `crates/proto` — which already depends on `mediaops-core` — cannot write the `TryFrom<wire::RemoteRef>` that `epics.md:317` requires. Resolution: add `pub fn from_wire_parts(root_id, rel_path) -> Result<Self, WalkerError>` to both types, enforcing the invariants a receiver can actually check without a filesystem (non-empty `root_id`; `rel_path` relative, no `ParentDir`/`RootDir`/`Prefix`). `pub(crate) new` stays as the walker's filesystem door. The `TryFrom` impls still live in `proto`, so the epic's "proto is the sole home of wire↔domain conversion" law is unchanged. Rationale: a wire-borne ref was already produced by a walker on the remote side and cannot be re-validated locally, so literal sole-production cannot survive 1.4; a feature gate was rejected because Cargo unifies features workspace-wide and would enforce nothing. → becomes a patch.
+- [x] [Review][Decision] **D2 `resolve` bypasses the listing exclusions → resolved: share exclusions.** Apply `is_torrent_skip` inside `resolve` so a partial download cannot be minted as a `RemoteRef` through the door `list` closes. One rule, one place. → becomes a patch.
+- [x] [Review][Decision] **D3 `core` filesystem I/O vs the epic's "pure domain" law → resolved: add an arch-test.** Add a test in `crates/arch-tests` confining `std::fs` use to `walker` and `install`, so the 1.2 carve-out is enforced the way AD-2 already is rather than living in a doc comment. → becomes a patch.
+- [x] [Review][Decision] **D4 `staging_path` embeds `:` → resolved: swap the separator.** `_incoming/movie:tmdb:603/…` cannot exist on SMB, exFAT, or NTFS, while the same function deliberately rejects `/` and `\`. Amend the spec's Always constraint to a filesystem-safe staging token (e.g. `movie-tmdb-603`) while `TitleId::render` keeps its colon form for identity. Requires a Spec Change Log entry plus updates to `staging_path`, `VerifiedStagingHandle::verify`, and `staging_path_uses_serialized_title_id`. → becomes a spec change plus a patch.
+
+- [x] [Review][Patch] Panic: byte-slicing a non-ASCII path aborts `parse` instead of erroring [crates/core/src/pathschema.rs:419, :475]
+- [x] [Review][Patch] `render` emits episode/season paths its own `parse` rejects when either number is ≥ 100 [crates/core/src/pathschema.rs:175, :482]
+- [x] [Review][Patch] `resolve` accepts a path outside every allowlisted root when it canonicalizes into one [crates/core/src/walker.rs:157]
+- [x] [Review][Patch] `torrents/incomplete` is listed when the allowlisted root is the torrents dir itself [crates/core/src/walker.rs:214]
+- [x] [Review][Patch] One unreadable subdirectory aborts the entire listing [crates/core/src/walker.rs:184]
+- [x] [Review][Patch] Nested allowlist roots yield duplicate entries and an insertion-order-dependent `resolve` [crates/core/src/walker.rs:115]
+- [x] [Review][Patch] `dest.exists()` follows symlinks, so a dangling symlink at the library path bypasses `DestinationExists` [crates/core/src/install.rs:140]
+- [x] [Review][Patch] `mtime` collapses pre-epoch timestamps and metadata errors into `0` [crates/core/src/walker.rs:221]
+- [x] [Review][Patch] `mtime`/`nlink` assertions compare against the same private helpers that produced them [crates/core/src/walker.rs:306]
+- [x] [Review][Patch] `TitleMismatch`, `MissingLive`, and `MissingSource` are asserted nowhere; deleting the guards keeps the suite green [crates/core/src/install.rs:137, :161]
+- [x] [Review][Patch] `VerifiedConvertingHandle` verifies far less than `VerifiedStagingHandle` despite the shared "Verified" name [crates/core/src/install.rs:88]
+- [x] [Review][Patch] `replace` rollback discards the original error with `?`, hiding why the install failed [crates/core/src/install.rs:177]
+- [x] [Review][Patch] Leading-zero TMDB/TVDB ids mint two distinct identities for one title [crates/core/src/title_id.rs:170]
+- [x] [Review][Patch] Album track stems are parsed far looser than movie and series stems [crates/core/src/pathschema.rs:471]
+- [x] [Review][Patch] `backup_destination` is never checked against `library_root`, so a backup can be written into the library [crates/core/src/install.rs:167]
+- [x] [Review][Patch] `strip_scene_tags` rewrites `-` and `_` to `.` even with no tag to strip [crates/core/src/pathschema.rs:136]
+- [x] [Review][Patch] `parse` is a weaker gate than `render`: braces and reserved tokens it refuses to emit are accepted back [crates/core/src/pathschema.rs:208]
+- [x] [Review][Patch] `PathSchemaError::RejectBin(&'static str)` is stringly-typed; `reject_bin()` silently returns `None` on drift [crates/core/src/pathschema.rs:105, :126]
+- [x] [Review][Patch] `GRAMMAR_VERSION` is never read by `render`, `parse`, or `staging_path`; its only test is a tautology [crates/core/src/pathschema.rs:13]
+- [x] [Review][Patch] `RemoteEntry` exposes two public getters for one field, `r#ref()` and `ref_()` [crates/core/src/walker.rs:54]
+- [x] [Review][Patch] `list()` sorts entries but no test observes the order; deleting `sort_by` keeps the suite green [crates/core/src/walker.rs:149]
+- [x] [Review][Patch] `Io(String)` discards `ErrorKind`, so EXDEV, ENOSPC, and EACCES are indistinguishable to callers [crates/core/src/walker.rs:88, crates/core/src/install.rs:52]
+- [x] [Review][Patch] `reject_symlink_file` reports EACCES, ELOOP, and ENOTDIR all as "source file not found" [crates/core/src/install.rs:114]
+- [x] [Review][Patch] The `staging_path` "empty/invalid TitleId → error" branch is unreachable; `TitleId` already enforces it [crates/core/src/pathschema.rs:298]
+- [x] [Review][Patch] Module visibility is inconsistent: `pathschema`/`walker` are `pub mod`, `install`/`title_id` are private [crates/core/src/lib.rs:7]
+
+- [x] [Review][Defer] No `NAME_MAX` or path-length guard on rendered components [crates/core/src/pathschema.rs:324] — deferred, surfaces as an opaque io error at install time rather than a schema error
+- [x] [Review][Defer] Walker recursion depth is unbounded [crates/core/src/walker.rs:181] — deferred, needs a depth cap or an explicit trust boundary for remote trees
+- [x] [Review][Defer] `RemoteEntry` carries `nlink` but no `dev`/`ino`, so hardlinks cannot be paired [crates/core/src/walker.rs:36] — deferred, adding fields changes the 1.4 wire mirror
+- [x] [Review][Defer] Non-unix builds fabricate `nlink = 1` and both test modules use `std::os::unix` unguarded [crates/core/src/walker.rs:229] — deferred, no non-unix target today
+- [x] [Review][Defer] Legitimate titles containing "Proper" or "Repack" can never be rendered or parsed [crates/core/src/pathschema.rs:377] — deferred, the spec mandates the tag list; needs a product call on positional stripping
+- [x] [Review][Defer] No `fsync` of the parent directory after rename, so "atomic" is not crash-durable [crates/core/src/install.rs:146] — deferred, beyond a types-and-offline-tests story
+- [x] [Review][Defer] Nothing constrains the staged source to a staging root; any dir ending in the `_incoming/<TitleId>/<name>` tail verifies [crates/core/src/install.rs:76] — deferred, adding a staging-root parameter changes the gate signature
+- [x] [Review][Defer] `REPACJ` is frozen into a public const, doc, and test as a scene tag [crates/core/src/pathschema.rs:15] — deferred, it reads as a typo of `REPACK` but both the spec and epic context list it; confirm upstream
+
 ## Spec Change Log
 
+### 2026-08-29 — Review pass 2 (commit `35a4f03`)
+
+- **Staging token is no longer the colon-formed TitleId.** The Always constraint
+  read "Staging paths only from `core::pathschema::staging_path` →
+  `_incoming/<TitleId serialized>/…`". A colon cannot appear in a directory name
+  on SMB, exFAT, or NTFS, and `staging_path` already rejects `/` and `\` for the
+  same portability reason. Staging paths now use `TitleId::staging_token()` —
+  `_incoming/movie-tmdb-603/…`. `TitleId::render()` is unchanged and remains the
+  identity on the wire and in the store; only the path token differs.
+- **`RemoteRef`/`RemoteEntry` gain a second, validating constructor.** The
+  Always constraint read "One walker is the sole producer of `RemoteRef`…".
+  Story 1.4 must build these types in `proto` from wire messages, which sealed
+  `pub(crate)` constructors made impossible. `from_wire_parts` is now the one
+  other door: it cannot re-check a remote filesystem, so it enforces a non-empty
+  `root_id` and a relative `rel_path` with no `..`, root, or prefix component.
+  The walker remains the sole producer *from a filesystem*, and the `TryFrom`
+  impls still live in `proto` per the epic's layering rule.
+- **`core` filesystem I/O is now enforced, not just documented.**
+  `crates/arch-tests` confines `std::fs` in `mediaops-core` to `walker` and
+  `install`, closing the gap where the 1.2 carve-out lived only in a doc comment.
+
+
 ## Review Triage Log
+
+### 2026-08-29 — Review pass 2 (commit `35a4f03`, four layers)
+
+- intent_gap: 0
+- bad_spec: 2 (staging colon token; sealed `RemoteRef`/`RemoteEntry` vs the 1.4 mirror)
+- patch: 29: (high 2, medium 17, low 10)
+- defer: 8
+- reject: 6
+- decisions_taken: 4 (all resolved into patches; see Decisions taken above)
+- addressed_findings:
+  - `[high]` `[patch]` `parse` panicked on non-ASCII paths at two byte-slicing sites; both now use a char-boundary-safe tail split [`crates/core/src/pathschema.rs`](../../crates/core/src/pathschema.rs)
+  - `[high]` `[patch]` `render` emitted `S01E100`-style paths its own `parse` rejected; season/episode/track ranges are now refused at render [`crates/core/src/pathschema.rs`](../../crates/core/src/pathschema.rs)
+  - `[medium]` `[patch]` `resolve` accepted an outside symlink pointing in, and minted refs for `torrents/incomplete`; both are now `UnknownPath` [`crates/core/src/walker.rs`](../../crates/core/src/walker.rs)
+  - `[medium]` `[patch]` `torrents/incomplete` is skipped from the absolute path, so allowlisting the torrents dir itself no longer leaks partial downloads [`crates/core/src/walker.rs`](../../crates/core/src/walker.rs)
+  - `[medium]` `[patch]` Strict `list` names the failing path; new `list_partial` survives unreadable subtrees and reports what it skipped [`crates/core/src/walker.rs`](../../crates/core/src/walker.rs)
+  - `[medium]` `[patch]` Nested allowlist roots are refused (`NestedRoot`), ending duplicate entries and order-dependent `resolve` [`crates/core/src/walker.rs`](../../crates/core/src/walker.rs)
+  - `[medium]` `[patch]` `mtime` keeps its sign for pre-epoch timestamps instead of collapsing to `0` [`crates/core/src/walker.rs`](../../crates/core/src/walker.rs)
+  - `[medium]` `[patch]` `mtime`/`nlink` are asserted without routing through the helpers under test [`crates/core/src/walker.rs`](../../crates/core/src/walker.rs)
+  - `[medium]` `[patch]` `install` uses `symlink_metadata`, so a dangling symlink squatting the library path is `DestinationExists` [`crates/core/src/install.rs`](../../crates/core/src/install.rs)
+  - `[medium]` `[patch]` `VerifiedConvertingHandle` requires `<rendered name>.converting`, not any `.converting` file [`crates/core/src/install.rs`](../../crates/core/src/install.rs)
+  - `[medium]` `[patch]` `replace` rollback reports both failures via `RollbackFailed` and names where the live bytes are [`crates/core/src/install.rs`](../../crates/core/src/install.rs)
+  - `[medium]` `[patch]` A backup destination inside `library_root` is refused; `replace` also refuses a symlinked live file [`crates/core/src/install.rs`](../../crates/core/src/install.rs)
+  - `[medium]` `[patch]` `TitleMismatch`, `MissingLive`, and `MissingSource` now have direct tests; deleting the guards fails the suite [`crates/core/src/install.rs`](../../crates/core/src/install.rs)
+  - `[medium]` `[patch]` Leading-zero TMDB/TVDB ids are refused, so one title cannot mint two identities [`crates/core/src/title_id.rs`](../../crates/core/src/title_id.rs)
+  - `[medium]` `[patch]` Album track stems are parsed as strictly as movie and series stems [`crates/core/src/pathschema.rs`](../../crates/core/src/pathschema.rs)
+  - `[medium]` `[patch]` `strip_scene_tags` preserves `-` and `_` separators instead of rewriting them to `.` [`crates/core/src/pathschema.rs`](../../crates/core/src/pathschema.rs)
+  - `[medium]` `[patch]` `parse` is no longer a weaker gate than `render`; display tokens are validated on the way back in [`crates/core/src/pathschema.rs`](../../crates/core/src/pathschema.rs)
+  - `[low]` `[patch]` `PathSchemaError::RejectBin` carries `RejectBin`, not a `&'static str` that can drift [`crates/core/src/pathschema.rs`](../../crates/core/src/pathschema.rs)
+  - `[low]` `[patch]` `GRAMMAR_VERSION` is pinned by golden-path tests instead of a tautological assert [`crates/core/src/pathschema.rs`](../../crates/core/src/pathschema.rs)
+  - `[low]` `[patch]` `WalkerError::Io` / `InstallError::Io` carry the path and `ErrorKind`; `io_kind()` exposes it [`crates/core/src/walker.rs`](../../crates/core/src/walker.rs)
+  - `[low]` `[patch]` `reject_symlink_file` no longer reports EACCES/ELOOP as "source file not found" [`crates/core/src/install.rs`](../../crates/core/src/install.rs)
+  - `[low]` `[patch]` Duplicate getter `ref_()` removed; `list()` order pinned by test; unreachable `InvalidTitleId` branch deleted; module visibility made uniform [`crates/core/src/lib.rs`](../../crates/core/src/lib.rs)
+- rejected:
+  - Missing `Cargo.toml` hunk — false positive; `thiserror` was already declared at `a3273af`
+  - TOCTOU exclusive rename / `RENAME_NOREPLACE` — rejected in pass 1, unchanged
+  - EXDEV cross-device copy fallback — recorded residual risk, unchanged
+  - `list` skips in-allowlist symlinks while `resolve` follows them — rejected in pass 1
+  - Special file types (fifo/socket/device) silently skipped — correct for a media walker
+  - "`core` doc claims no I/O" — misread; the doc was updated and the 1.2 spec authorizes the carve-out
+
 
 ### 2026-08-29 — Review pass
 - intent_gap: 0
@@ -144,5 +252,5 @@ Status: done
 
 **Verification:** `cargo test -p mediaops-core --offline --locked` → 35 passed. `cargo test -p mediaops-arch-tests --offline --locked` → 8 passed. `cargo test -p mediaops` and `mediaopsd --offline --locked` → 1.1 CLI matrix still pass (3 unit + 9 cli each).
 
-**Residual risks:** `fs::rename` is same-filesystem; cross-device staging → library waits. Walker skips every symlink (stricter than follow-if-still-allowlisted). `replace` still does not persist `current_b3` (story 1.3). `RemoteEntry.ref_()` is the public getter because `ref` is a keyword — proto mirroring in 1.4 should map that field explicitly.
+**Residual risks:** `fs::rename` is same-filesystem; cross-device staging → library waits. Walker skips every symlink (stricter than follow-if-still-allowlisted). `replace` still does not persist `current_b3` (story 1.3). `RemoteEntry` exposes a single getter, `r#ref()`; the duplicate `ref_()` alias was removed in review pass 2. Proto mirroring in 1.4 should map that field explicitly.
 
