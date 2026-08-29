@@ -1,0 +1,25 @@
+# Grok Build CLI. Project overlay: not a bundled bmad-loop profile.
+# Grok reads Cursor `.agents/skills/` and Claude Code `.claude/settings.json`
+# hooks (externalCompat vendor=claude, surface=hooks).
+name = "grok"
+binary = "grok"
+prompt_template = "{prompt}"
+launch_args = ["--no-alt-screen", "--no-subagents"]
+bypass_args = ["--permission-mode", "bypassPermissions"]
+model_flag = "--model"
+usage_parser = "none"
+first_run_note = "run `grok` once in the project so workspace trust and `/hooks-trust` are already accepted; spawned sessions cannot answer those dialogs"
+skill_tree = ".agents/skills"
+seed_files = [
+  ".mcp.json",
+  ".claude/settings.json",
+  ".claude/settings.local.json",
+]
+
+[env]
+GROK_SUBAGENTS = "0"
+
+[hooks]
+dialect = "claude-settings-json"
+config_path = ".claude/settings.json"
+events = { SessionStart = "SessionStart", Stop = "Stop", SessionEnd = "SessionEnd", PreCompact = "PreCompact" }
