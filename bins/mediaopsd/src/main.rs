@@ -34,11 +34,21 @@ enum ParseOutcome {
     HelpOrVersion,
 }
 
+fn json_token_requests_json(arg: &str) -> bool {
+    if arg == "--json" {
+        return true;
+    }
+    let Some(value) = arg.strip_prefix("--json=") else {
+        return false;
+    };
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "t" | "yes" | "y" | "1" | "on"
+    )
+}
+
 fn json_requested() -> bool {
-    std::env::args_os().any(|arg| match arg.to_str() {
-        Some(arg) => arg == "--json" || arg.starts_with("--json="),
-        None => false,
-    })
+    std::env::args_os().any(|arg| arg.to_str().is_some_and(json_token_requests_json))
 }
 
 fn init_tracing() {
@@ -60,7 +70,7 @@ fn to_exit_code(err: &AppError) -> ExitCode {
 fn write_stdout(line: &str) -> Result<(), AppError> {
     let mut out = io::stdout().lock();
     writeln!(out, "{line}").map_err(|e| AppError::Runtime(e.into()))?;
-    let _ = out.flush();
+    out.flush().map_err(|e| AppError::Runtime(e.into()))?;
     Ok(())
 }
 
@@ -100,12 +110,12 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
         Ok(cli) => Ok(ParseOutcome::Parsed(cli)),
         Err(err) => match err.kind() {
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
-                let _ = err.print();
+                err.print().map_err(|e| AppError::Runtime(anyhow!(e)))?;
                 Ok(ParseOutcome::HelpOrVersion)
             }
             _ => {
                 if !json_flag {
-                    let _ = err.print();
+                    err.print().map_err(|e| AppError::Runtime(anyhow!(e)))?;
                 }
                 Err(AppError::Usage(err.to_string()))
             }
@@ -126,5 +136,36 @@ async fn main() -> ExitCode {
             Err(err) => finish_error(json_flag || cli.json, &err),
         },
         Err(err) => finish_error(json_flag, &err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_token_matches_clap_boolish_true() {
+        assert!(json_token_requests_json("--json"));
+        assert!(json_token_requests_json("--json=true"));
+        assert!(json_token_requests_json("--json=TRUE"));
+        assert!(json_token_requests_json("--json=1"));
+        assert!(!json_token_requests_json("--json=false"));
+        assert!(!json_token_requests_json("--json=0"));
+        assert!(!json_token_requests_json("--json=maybe"));
+        assert!(!json_token_requests_json("--help"));
+    }
+
+    #[test]
+    fn runtime_maps_to_exit_1() {
+        let err = AppError::Runtime(anyhow!("stdout closed"));
+        assert_eq!(to_exit_code(&err), ExitCode::Runtime);
+        assert_eq!(i32::from(to_exit_code(&err)), 1);
+    }
+
+    #[test]
+    fn usage_maps_to_exit_2() {
+        let err = AppError::Usage("unexpected argument".into());
+        assert_eq!(to_exit_code(&err), ExitCode::Usage);
+        assert_eq!(i32::from(to_exit_code(&err)), 2);
     }
 }
