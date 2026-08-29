@@ -1,34 +1,29 @@
 # Implementation Readiness — mediaops
 
 - **Date:** 2026-08-29
-- **Gate verdict:** FAIL
+- **Gate verdict:** PASS
 - **Assessed by:** bmad-sprint-planning readiness gate
 
 ## Artifact inventory
 
 | Artifact | Location | State |
 | --- | --- | --- |
-| Brainstorm intent | `_bmad-output/brainstorming/brainstorm-rust-seedbox-media-app-2026-08-28/` (`brainstorm-intent.md`, `product-idea.md`, `modules.md`) | Present |
-| Spec (canonical contract) | `_bmad-output/specs/spec-mediaops/SPEC.md` + companions (`module-map.md`, `grabber-inventory.md`, `bootstrap-surfaces.md`, `failure-history-tests.md`, `increments.md`) | Present — 12 capabilities (CAP-1…CAP-12), constraints, non-goals, success signal |
-| Architecture | `_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md` | Present — bound to spec as companion; vetted by 3 reviews (adversarial-divergence, rubric-walker, version-verification) |
-| Epics and stories | — | **Missing** |
-| Sprint tracking (`sprint-status.yaml`) | — | Missing (expected — cannot be generated without epics) |
+| Brainstorm intent | `_bmad-output/brainstorming/brainstorm-rust-seedbox-media-app-2026-08-28/` | Present |
+| Spec (canonical contract) | `_bmad-output/specs/spec-mediaops/SPEC.md` + companions | Present — CAP-1…CAP-12, constraints, non-goals, success signal |
+| Architecture | `_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md` | Present — spec companion; 3 reviews |
+| Spec story queue | `_bmad-output/specs/spec-mediaops/stories.yaml` | Present — 13 first-demo entries (folder+id dispatch) |
+| Epics and stories | `_bmad-output/planning-artifacts/epics.md` | Present — 8 epics, 23 stories with Given/When/Then ACs |
+| Sprint tracking | `_bmad-output/implementation-artifacts/sprint-status.yaml` | Generated 2026-08-29 |
 
-Traceability in what exists is healthy: the spec cites its brainstorm sources in frontmatter, the architecture spine is a spec companion, and `increments.md` scopes first demo vs. deferred vs. forbidden work.
+A developer can implement without inventing decisions the spec and spine do not record. UX is N/A (CLI-first; TUI deferred).
 
-## Findings (ordered by severity)
+## Scope notes (not blockers)
 
-### 1. No epics or stories exist — BLOCKER
-
-The planning chain stops at spec + architecture. There is no work breakdown anywhere in the planning artifacts, so:
-
-- Sprint planning has nothing to parse into `sprint-status.yaml`.
-- A developer picking up the plan would have to invent the decomposition and sequencing that nothing records.
-
-**Fix:** run `bmad-create-epics-and-stories` (or the `bmad-spec` "break this into stories" intent) to decompose the spec's capabilities into epics and stories.
-
-**Head start for that skill:** `increments.md` already scopes the first demo (bootstrap → plan → parallel Range pull → `.partial` resume → BLAKE3 verify + schema install → NVENC encode), plus designed-but-unused, deferred, and forbidden lists. Epic sequencing should honor that boundary.
+- Epics 1–4 are the first demo on this box (`increments.md`). Epics 5–8 are remaining v1 (quiet-box apply, holds, reclaim, relocate/docs).
+- CAP-11 LLM verbs, TUI, `ui <app>`, bearer-token 2FA, and a generalized wants queue stay deferred; v1 only reserves the capability-token enum in `core`.
+- Story 2.3 and 4.3 may touch the live SeedIt4Me box / home GPU; default CI stays offline (AD-20).
+- No story files exist yet in implementation-artifacts, so every story is `backlog` until `bmad-build` / the loop writes specs.
 
 ## Next step
 
-Re-run `bmad-sprint-planning` after epics and stories exist; the gate should then pass and tracking can be generated.
+`bmad-build` or `bmad-loop run` on story `1-1-workspace-scaffold-and-dependency-law`. Commit these planning artifacts first — the loop requires a clean worktree.
