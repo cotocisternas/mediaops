@@ -1,10 +1,15 @@
 # Grok Build CLI. Project overlay: not a bundled bmad-loop profile.
 # Grok reads Cursor `.agents/skills/` and Claude Code `.claude/settings.json`
 # hooks (externalCompat vendor=claude, surface=hooks).
+#
+# Subagents stay enabled: bmad-build-auto requires synchronous spawn_subagent
+# for epic-context compilation, implementation, and review.
+# --no-plan keeps unattended sessions out of Grok plan-mode (that needs a human
+# to approve exit_plan_mode and would stall the orchestrator).
 name = "grok"
 binary = "grok"
 prompt_template = "{prompt}"
-launch_args = ["--no-alt-screen", "--no-subagents"]
+launch_args = ["--no-alt-screen", "--no-plan"]
 bypass_args = ["--permission-mode", "bypassPermissions"]
 model_flag = "--model"
 usage_parser = "none"
@@ -15,9 +20,6 @@ seed_files = [
   ".claude/settings.json",
   ".claude/settings.local.json",
 ]
-
-[env]
-GROK_SUBAGENTS = "0"
 
 [hooks]
 dialect = "claude-settings-json"
