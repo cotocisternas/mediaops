@@ -110,6 +110,12 @@ pub fn violations(metadata: &Metadata) -> Vec<Violation> {
     found
 }
 
+/// Whether the text right after a `#[cfg(test)]` marker opens the test module.
+fn opens_test_module(after_marker: &str) -> bool {
+    let head = after_marker.trim_start();
+    head.starts_with("mod tests {") || head.starts_with("pub(crate) mod tests {")
+}
+
 fn closure_contains(graph: &HashMap<String, Vec<String>>, start: &str, needle: &str) -> bool {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
@@ -160,7 +166,17 @@ pub fn core_io_violations(core_src: &std::path::Path) -> Vec<String> {
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Only the code, not the tests that build tempdir fixtures.
+        // Only the code, not the tests that build tempdir fixtures. The scan
+        // stops at the first `#[cfg(test)]`, so a test-only item in the middle
+        // of a file would hide every line below it from this check.
+        if let Some((_, after_marker)) = source.split_once("\n#[cfg(test)]")
+            && !opens_test_module(after_marker)
+        {
+            found.push(format!(
+                "{name} has a #[cfg(test)] item before `mod tests`, which truncates this scan; \
+                 move test-only items inside the test module"
+            ));
+        }
         let code = source
             .split("\n#[cfg(test)]")
             .next()
@@ -373,15 +389,7 @@ mod tests {
     #[test]
     fn core_io_violation_is_detected_when_a_pure_module_reaches_for_the_filesystem() {
         // The check must be able to fail, or it proves nothing.
-        let tmp = std::env::temp_dir().join(format!(
-            "mediaops-archtest-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let tmp = scratch_dir("io");
         std::fs::write(tmp.join("walker.rs"), "use std::fs;\n").expect("write allowed");
         std::fs::write(
             tmp.join("pathschema.rs"),
@@ -393,5 +401,43 @@ mod tests {
 
         assert_eq!(violations.len(), 1, "got {violations:?}");
         assert!(violations[0].starts_with("pathschema.rs"));
+    }
+
+    #[test]
+    fn a_test_item_above_mod_tests_is_reported_because_it_truncates_the_scan() {
+        let tmp = scratch_dir("cfgtest");
+        std::fs::write(
+            tmp.join("desired_state.rs"),
+            "fn f() {}\n#[cfg(test)]\nconst FIXTURE: &str = \"x\";\n\
+             #[cfg(test)]\nmod tests {}\nfn g() { std::fs::read(\"x\"); }\n",
+        )
+        .expect("write mid-file cfg(test) item");
+        std::fs::write(
+            tmp.join("bytes.rs"),
+            "fn f() {}\n#[cfg(test)]\npub(crate) mod tests {\n    use std::fs;\n}\n",
+        )
+        .expect("write conventional trailing test module");
+        let violations = core_io_violations(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(violations.len(), 1, "got {violations:?}");
+        assert!(
+            violations[0].starts_with("desired_state.rs")
+                && violations[0].contains("before `mod tests`"),
+            "got {violations:?}"
+        );
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-archtest-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
     }
 }

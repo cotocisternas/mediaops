@@ -43,6 +43,8 @@ pub enum DesiredStateError {
     Parse(String),
     #[error("unsupported schema_version {0}; expected {SCHEMA_VERSION}")]
     UnsupportedVersion(u32),
+    #[error("{field} must be greater than zero")]
+    MustBeNonZero { field: &'static str },
     #[error("{field} = {value} overflows Bytes")]
     SizeOverflow { field: &'static str, value: u64 },
 }
@@ -58,6 +60,18 @@ impl DesiredState {
         }
         let raw: DesiredStateToml =
             toml::from_str(text).map_err(|err| DesiredStateError::Parse(err.to_string()))?;
+        // Representable but nonsensical. A zero range length divides by zero in
+        // the first consumer that counts chunks and never terminates a range
+        // loop; a zero encoder cap stalls encode forever with no diagnostic.
+        // There is no "disable" semantic on either field, so refuse at parse.
+        if raw.range_len_mib == 0 {
+            return Err(DesiredStateError::MustBeNonZero {
+                field: "range_len_mib",
+            });
+        }
+        if raw.max_nvenc == 0 {
+            return Err(DesiredStateError::MustBeNonZero { field: "max_nvenc" });
+        }
         Ok(Self {
             schema_version: raw.schema_version,
             max_copy: gib(raw.max_copy_gib, "max_copy_gib")?,
@@ -114,7 +128,10 @@ fn mib(n: u64, field: &'static str) -> Result<Bytes, DesiredStateError> {
 }
 
 #[cfg(test)]
-pub(crate) const HAPPY_TOML: &str = r#"
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) const HAPPY_TOML: &str = r#"
 schema_version = 1
 max_copy_gib = 256
 min_free_gib = 256
@@ -122,10 +139,6 @@ range_len_mib = 8
 max_nvenc = 2
 lock = true
 "#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn assert_is_bytes(_: Bytes) {}
 
@@ -237,5 +250,25 @@ lock = false
                 value: 17179869184
             })
         ));
+    }
+
+    #[test]
+    fn zero_range_len_is_refused() {
+        let toml = HAPPY_TOML.replace("range_len_mib = 8", "range_len_mib = 0");
+        assert_eq!(
+            DesiredState::from_toml(&toml),
+            Err(DesiredStateError::MustBeNonZero {
+                field: "range_len_mib"
+            })
+        );
+    }
+
+    #[test]
+    fn zero_max_nvenc_is_refused() {
+        let toml = HAPPY_TOML.replace("max_nvenc = 2", "max_nvenc = 0");
+        assert_eq!(
+            DesiredState::from_toml(&toml),
+            Err(DesiredStateError::MustBeNonZero { field: "max_nvenc" })
+        );
     }
 }

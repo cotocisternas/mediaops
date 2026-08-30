@@ -4,7 +4,7 @@ type: 'feature'
 created: '2026-08-29'
 status: 'done'
 baseline_commit: '1bb8fc204d9d318c93384a4a8a14d9574463fdd2'
-review_loop_iteration: 0
+review_loop_iteration: 1
 context:
   - '_bmad-output/implementation-artifacts/epic-1-context.md'
 ---
@@ -53,7 +53,7 @@ Add under `crates/core/src/` and re-export from `lib.rs`:
 - `desired_state.rs` -- TOML parse → `DesiredState`; size fields become `Bytes`; `schema_version == 1`
 - `plan.rs` -- `Action` enum; `Plan { desired_state_toml: Vec<u8>, desired_state_b3, actions }`; `from_toml_bytes`; `desired_state()` re-parses embedded bytes; `matches_snapshot(&[u8])` is blake3 equality; serde JSON
 
-`crates/core/Cargo.toml` -- add workspace `toml` and `blake3` (hash TOML bytes; not rayon). No tokio, rusqlite.
+`crates/core/Cargo.toml` -- add workspace `toml` and `blake3` (hash TOML bytes; `rayon` is opt-in in blake3, so nothing has to be switched off). No tokio, rusqlite.
 
 Read-only evidence: epic-1-context Desired-state/Plan paragraph; AD-9; Config convention (unit-suffixed sizes → `Bytes`); spec-1-2 public API must stay.
 
@@ -90,25 +90,38 @@ Jobs (`advance`/`ready`) and `store` (`title_index`/`jobs`, rusqlite) are in def
 **DesiredState parse**
 
 - Version peek first so v2-with-new-fields is UnsupportedVersion, not unknown-field.
-  [`desired_state.rs:51`](../../crates/core/src/desired_state.rs#L51)
+  [`desired_state.rs:54`](../../crates/core/src/desired_state.rs#L54)
+
+- Zero `range_len_mib` / `max_nvenc` are representable but nonsensical; refuse at parse.
+  [`desired_state.rs:63`](../../crates/core/src/desired_state.rs#L63)
 
 - Size fields become `Bytes` at parse; no bare integer leaves this crate.
-  [`desired_state.rs:61`](../../crates/core/src/desired_state.rs#L61)
+  [`desired_state.rs:75`](../../crates/core/src/desired_state.rs#L75)
 
 **Plan snapshot**
 
 - Plan stores exact TOML bytes and blake3 of those bytes, never a canonical form.
-  [`plan.rs:50`](../../crates/core/src/plan.rs#L50)
+  [`plan.rs:53`](../../crates/core/src/plan.rs#L53)
 
 - Staleness is bytes-hash vs bytes-hash; it does not re-parse the active file.
-  [`plan.rs:84`](../../crates/core/src/plan.rs#L84)
+  [`plan.rs:87`](../../crates/core/src/plan.rs#L87)
 
 - Plan JSON refuses extra keys the same way DesiredState refuses extra TOML.
-  [`plan.rs:30`](../../crates/core/src/plan.rs#L30)
+  [`plan.rs:31`](../../crates/core/src/plan.rs#L31)
+
+- Loading a plan checks the digest before anything reads the snapshot as schema,
+  and does not re-parse it -- an archived plan outlives its `schema_version`.
+  [`plan.rs:129`](../../crates/core/src/plan.rs#L129)
+
+- `from_json_slice` gives callers the typed error; `Deserialize` can only flatten it.
+  [`plan.rs:117`](../../crates/core/src/plan.rs#L117)
 
 **Action**
 
 - Exhaustive unit enum; match every variant, no `_` arm, not non_exhaustive.
+  [`plan.rs:10`](../../crates/core/src/plan.rs#L10)
+
+- Wire tokens are snake_case, like every other identifier in the plan contract.
   [`plan.rs:9`](../../crates/core/src/plan.rs#L9)
 
 **Bytes boundary**
@@ -121,8 +134,26 @@ Jobs (`advance`/`ready`) and `store` (`title_index`/`jobs`, rusqlite) are in def
 - Public re-exports; new modules stay out of the filesystem carve-out.
   [`lib.rs:17`](../../crates/core/src/lib.rs#L17)
 
-- Workspace blake3 pin has no rayon; core hashes TOML bytes only.
+- Workspace blake3 pin keeps default features; `rayon` was always opt-in, and
+  dropping `std` would have cost later crates `Hasher::update_reader`.
   [`Cargo.toml:31`](../../Cargo.toml#L31)
 
+- The core-IO scan stops at the first `#[cfg(test)]`, so a test-only item above
+  `mod tests` is itself a violation.
+  [`arch-tests/src/lib.rs:169`](../../crates/arch-tests/src/lib.rs#L169)
+
 - Bytes-hash is not parse equality: same DesiredState, different TOML bytes, no match.
-  [`plan.rs:192`](../../crates/core/src/plan.rs#L192)
+  [`plan.rs:210`](../../crates/core/src/plan.rs#L210)
+
+## Review Findings
+
+Pass 1 (`/code-review #3`, high effort). 6 findings, all applied; 0 deferred, 0 rejected.
+
+- **Plan integrity ordering (high).** `from_json` parsed the embedded TOML before comparing the digest, so tampered bytes surfaced as a parse error instead of `DigestMismatch`, and a future `SCHEMA_VERSION` would have made every archived plan undeserializable. The digest is now compared first and the schema re-parse is lazy in `Plan::desired_state`.
+- **Typed `PlanError` was unreachable (medium).** Added `Plan::from_json_slice`, so a caller can branch on `DigestMismatch` instead of string-matching a flattened `serde` message. `PlanError::Json` carries the parse message.
+- **No lower bounds on DesiredState (medium).** `range_len_mib = 0` divides by zero in the first consumer that counts chunks; `max_nvenc = 0` stalls encode. Both are now `MustBeNonZero` at parse. No ceiling was invented for `min_free_gib` — the only non-arbitrary bound is the existing `SizeOverflow` guard.
+- **`Action` wire casing (medium).** Now `#[serde(rename_all = "snake_case")]`, settled before 1.4 freezes the contract.
+- **blake3 `default-features = false` (low).** The flag never touched `rayon` (already opt-in); it only dropped `std`, which would have denied later crates `Hasher::update_reader`. Flag removed, rationale corrected. `Cargo.lock` is unchanged.
+- **AD-2 core-IO scan truncation (low).** `HAPPY_TOML` sat above `mod tests`, silently ending the `std::fs` scan mid-file. It moved inside the test module, and the scan now reports any `#[cfg(test)]` item that appears before `mod tests`.
+
+**Verification:** `cargo test --workspace --offline --locked` → all pass (core 81, arch-tests 11, CLI matrices unchanged). `cargo clippy --workspace --all-targets --offline --locked` → clean.

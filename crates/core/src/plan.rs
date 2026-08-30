@@ -6,6 +6,7 @@ use crate::desired_state::{DesiredState, DesiredStateError};
 
 /// Exhaustive plan action. Match every variant; do not add a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Action {
     Copy,
     Skip,
@@ -38,6 +39,8 @@ struct PlanJson {
 pub enum PlanError {
     #[error("desired-state snapshot is not valid UTF-8")]
     InvalidUtf8,
+    #[error("invalid plan JSON: {0}")]
+    Json(String),
     #[error(transparent)]
     DesiredState(#[from] DesiredStateError),
     #[error("desired_state_b3 must be 64 lowercase hex characters")]
@@ -107,12 +110,27 @@ impl<'de> Deserialize<'de> for Plan {
 }
 
 impl Plan {
+    /// Load a plan from JSON with typed errors, so a caller can tell
+    /// [`PlanError::DigestMismatch`] (tampering: refuse and alert) from
+    /// ordinary malformed input. The `Deserialize` impl flattens both into one
+    /// opaque `serde` string, leaving callers nothing but the message to match.
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, PlanError> {
+        let json: PlanJson =
+            serde_json::from_slice(bytes).map_err(|err| PlanError::Json(err.to_string()))?;
+        Self::from_json(json)
+    }
+
+    /// Integrity first: the digest is compared before anything interprets the
+    /// embedded bytes, so corrupted or tampered TOML reports `DigestMismatch`
+    /// rather than a parse error. The schema is deliberately *not* re-parsed
+    /// here -- a plan is an immutable archived record, and a later
+    /// `SCHEMA_VERSION` bump must not make old plans unreadable. Call
+    /// [`Plan::desired_state`] when the parsed document is actually needed.
     fn from_json(json: PlanJson) -> Result<Self, PlanError> {
         if !is_lowercase_b3_hex(&json.desired_state_b3) {
             return Err(PlanError::InvalidDigest);
         }
         let desired_state_toml = json.desired_state_toml.into_bytes();
-        DesiredState::from_toml_bytes(&desired_state_toml)?;
         if blake3_hex(&desired_state_toml) != json.desired_state_b3 {
             return Err(PlanError::DigestMismatch);
         }
@@ -135,7 +153,7 @@ fn is_lowercase_b3_hex(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desired_state::{DesiredState, HAPPY_TOML};
+    use crate::desired_state::tests::HAPPY_TOML;
 
     #[test]
     fn plan_round_trip_preserves_bytes_and_digest() {
@@ -229,21 +247,26 @@ mod tests {
     }
 
     #[test]
-    fn action_json_tokens_are_pascal_case() {
+    fn action_json_tokens_are_snake_case() {
+        // Every other identifier in the plan contract is snake_case, and a plan
+        // is a persisted artifact: the casing is frozen once one is written.
         let cases = [
-            (Action::Copy, "Copy"),
-            (Action::Skip, "Skip"),
-            (Action::Review, "Review"),
-            (Action::Unmonitor, "Unmonitor"),
-            (Action::DeleteRemote, "DeleteRemote"),
-            (Action::Encode, "Encode"),
-            (Action::Reclaim, "Reclaim"),
-            (Action::EdgeApply, "EdgeApply"),
-            (Action::GrabApply, "GrabApply"),
+            (Action::Copy, "copy"),
+            (Action::Skip, "skip"),
+            (Action::Review, "review"),
+            (Action::Unmonitor, "unmonitor"),
+            (Action::DeleteRemote, "delete_remote"),
+            (Action::Encode, "encode"),
+            (Action::Reclaim, "reclaim"),
+            (Action::EdgeApply, "edge_apply"),
+            (Action::GrabApply, "grab_apply"),
         ];
         for (action, token) in cases {
             let encoded = serde_json::to_string(&action).expect("serialize");
             assert_eq!(encoded, format!("\"{token}\""));
+            let decoded: Action =
+                serde_json::from_str(&encoded).expect("round-trip the wire token");
+            assert_eq!(decoded, action);
         }
     }
 
@@ -304,6 +327,68 @@ mod tests {
         assert!(
             err.to_string().contains("does not match blake3"),
             "got {err}"
+        );
+    }
+
+    #[test]
+    fn from_json_slice_reports_typed_errors() {
+        let mut mismatch = plan_json_value();
+        mismatch["desired_state_b3"] = serde_json::Value::String("0".repeat(64));
+        assert_eq!(
+            Plan::from_json_slice(&serde_json::to_vec(&mismatch).expect("json")),
+            Err(PlanError::DigestMismatch)
+        );
+
+        let mut malformed_digest = plan_json_value();
+        malformed_digest["desired_state_b3"] = serde_json::Value::String("abc".into());
+        assert_eq!(
+            Plan::from_json_slice(&serde_json::to_vec(&malformed_digest).expect("json")),
+            Err(PlanError::InvalidDigest)
+        );
+
+        let err = Plan::from_json_slice(b"{").expect_err("malformed json");
+        assert!(matches!(err, PlanError::Json(_)), "got {err:?}");
+
+        let good = serde_json::to_vec(&plan_json_value()).expect("json");
+        assert_eq!(
+            Plan::from_json_slice(&good).expect("valid plan"),
+            Plan::from_toml_bytes(HAPPY_TOML.as_bytes()).expect("snapshot")
+        );
+    }
+
+    #[test]
+    fn corrupted_snapshot_reports_digest_mismatch_not_a_parse_error() {
+        // Integrity is the signal to surface: the bytes no longer hash to the
+        // recorded digest, whatever they now happen to be.
+        let mut value = plan_json_value();
+        value["desired_state_toml"] = serde_json::Value::String("schema_version = ".into());
+        assert_eq!(
+            Plan::from_json_slice(&serde_json::to_vec(&value).expect("json")),
+            Err(PlanError::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn archived_plan_outlives_the_schema_version_it_snapshotted() {
+        // A plan is an immutable record. Once SCHEMA_VERSION moves past the one
+        // a plan snapshotted, its digest and actions must still be readable.
+        let snapshot = "schema_version = 2\n";
+        let digest = blake3::hash(snapshot.as_bytes()).to_hex().to_string();
+        let value = serde_json::json!({
+            "desired_state_toml": snapshot,
+            "desired_state_b3": digest,
+            "actions": ["copy", "delete_remote"],
+        });
+
+        let plan = serde_json::from_value::<Plan>(value).expect("archived plan still loads");
+        assert_eq!(plan.desired_state_toml(), snapshot.as_bytes());
+        assert_eq!(plan.desired_state_b3(), digest);
+        assert_eq!(plan.actions(), &[Action::Copy, Action::DeleteRemote]);
+        // Only interpreting the snapshot as the current schema fails, and it
+        // fails where the caller asked for it.
+        assert_eq!(
+            plan.desired_state(),
+            Err(DesiredStateError::UnsupportedVersion(2))
         );
     }
 }
