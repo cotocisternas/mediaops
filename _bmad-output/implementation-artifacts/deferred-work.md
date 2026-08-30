@@ -26,3 +26,14 @@ review that raised it so a later story can pick it up with context.
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
   summary: `install.rs` still says digest persistence is story 1.3, but this slice deferred `title_index`/`store`.
   evidence: `crates/core/src/install.rs` crate docs still claim replace is the only writer of `current_b3` and that persistence is story 1.3. This story's Never list forbids rewriting install; the comment is now wrong relative to the split.
+
+## Deferred from: code review of PR #4 / SPEC.md (2026-08-30)
+
+- **Home gateway owns the WAN pool and the CLI never contains a seedbox address** (`bins/mediaops/src/bootstrap.rs:123`) — AD-4 / NFR3 / Epic 3. Bootstrap today calls `probe_range_n` from the CLI. Long-term the home unix-socket gateway is the only process that knows the seedbox address; moving the probe is Epic 3 work, not a silent Epic 2 rewrite.
+- **`store` repository traits live in `core`** (`crates/store/src/lib.rs:21`) — AD-8. This slice added a concrete `Store` and `probes` table; the 1.3 split already deferred the trait + `title_index`/`jobs`.
+- **`parse_ssh_config` does not honor `Include`, `Host *`, or `Match`** (`crates/ssh/src/lib.rs:34`) — v1 imports `Host seedbox` as an exact block. Full OpenSSH semantics can wait until a real config fails.
+- **GetRange is not a streaming disk pipe** (`crates/net/src/seedbox.rs:146`) — after a size cap and a full read, true chunked `AsyncRead` with client-cancel backpressure is still missing. Deferred as a follow-up to the cap/read fix.
+- **TLS accept is sequential (`.then`)** (`crates/net/src/listen.rs:28`) — a handshake timeout is the important guard; concurrent accept is a later listen-loop refinement.
+- **`upsert_tls_table` round-trips TOML and drops comments** (`crates/core/src/desired_state.rs:227`) — AD-6 wants a diff before rewriting user-edited desired-state. Comment-preserving splice is a larger TOML-edit problem than this review should invent.
+- **`ControlPort::df` returns only `Bytes` and drops daemon semver** (`crates/proto/src/lib.rs:292`) — Story 2.2 wants the CLI to see semver + proto package. The Epic 1 `ControlPort` trait shape only returns free bytes; changing it is a contract story, not a net-crate patch.
+- **musl-static `mediaopsd` vs `tls-aws-lc` / `.cargo/config.toml`** (`crates/net/Cargo.toml:20`) — Story 2.3 / AD-22 require `x86_64-unknown-linux-musl`. Whether aws-lc-sys links on that target is unproven here; pin the target and crypto backend when the first musl build is actually run.

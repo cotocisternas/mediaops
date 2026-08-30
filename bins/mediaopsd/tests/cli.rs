@@ -164,3 +164,59 @@ fn usage_json_equals_false_stays_human() {
     );
     assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
 }
+
+#[test]
+fn serve_help_mentions_all_interfaces_bind() {
+    let output = bin()
+        .args(["serve", "--help"])
+        .output()
+        .expect("run mediaopsd serve --help");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        stdout.contains("0.0.0.0:50051"),
+        "serve --help must mention bind 0.0.0.0:50051, got: {stdout}"
+    );
+}
+
+fn unused_role_exits_usage(role: &str) {
+    let dir = std::env::temp_dir().join(format!(
+        "mediaopsd-role-{role}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let output = bin()
+        .args([
+            "serve",
+            "--role",
+            role,
+            "--tls-dir",
+            dir.to_str().unwrap(),
+            "--root",
+            "media=/tmp",
+        ])
+        .output()
+        .expect("run unused role");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "role {role} must exit usage without hanging, status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn serve_reverse_connect_exits_usage() {
+    unused_role_exits_usage("reverse-connect");
+}
+
+#[test]
+fn serve_home_exits_usage() {
+    unused_role_exits_usage("home");
+}

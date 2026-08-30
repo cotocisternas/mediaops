@@ -1,9 +1,13 @@
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 
 use anyhow::anyhow;
-use clap::Parser;
 use clap::error::ErrorKind;
-use mediaops_core::ExitCode;
+use clap::{Args, Parser, Subcommand};
+use mediaops_core::{ExitCode, ProviderKind};
+use mediaops_ssh::SystemExec;
+
+mod bootstrap;
 
 const BIN_NAME: &str = "mediaops";
 
@@ -11,20 +15,66 @@ const BIN_NAME: &str = "mediaops";
 #[command(name = BIN_NAME, version)]
 struct Cli {
     /// Emit a single JSON envelope on stdout.
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Seedbox(SeedboxArgs),
+}
+
+#[derive(Args, Debug)]
+struct SeedboxArgs {
+    #[command(subcommand)]
+    command: SeedboxCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum SeedboxCommand {
+    /// Install mediaopsd on Host seedbox and mint mTLS (destructive; needs --yes).
+    Bootstrap {
+        #[arg(long, default_value = "already-there")]
+        provider: String,
+        /// Actually mint, copy, and probe. Without this, print the plan and refuse.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        ssh_config: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        address: Option<String>,
+        #[arg(long)]
+        skip_probe: bool,
+        /// Allowlisted root as `id=path`. Repeatable. Required for SwizzinBox.
+        #[arg(long = "root", value_parser = bootstrap::parse_root)]
+        roots: Vec<(String, PathBuf)>,
+    },
 }
 
 enum AppError {
     Usage(String),
     Runtime(anyhow::Error),
+    Policy(String),
+    LockConflict(String),
+    Emitted(ExitCode),
 }
 
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(message) => write!(f, "{message}"),
+            Self::Usage(message) | Self::Policy(message) | Self::LockConflict(message) => {
+                write!(f, "{message}")
+            }
             Self::Runtime(err) => write!(f, "{err}"),
+            Self::Emitted(_) => write!(f, "already emitted"),
         }
     }
 }
@@ -64,6 +114,9 @@ fn to_exit_code(err: &AppError) -> ExitCode {
     match err {
         AppError::Usage(_) => ExitCode::Usage,
         AppError::Runtime(_) => ExitCode::Runtime,
+        AppError::Policy(_) => ExitCode::PolicyRefusal,
+        AppError::LockConflict(_) => ExitCode::LockConflict,
+        AppError::Emitted(code) => *code,
     }
 }
 
@@ -96,6 +149,9 @@ fn emit_error(json: bool, code: ExitCode, err: &AppError) -> Result<(), AppError
 
 fn finish_error(json_flag: bool, err: &AppError) -> ExitCode {
     let code = to_exit_code(err);
+    if matches!(err, AppError::Emitted(_)) {
+        return code;
+    }
     if !json_flag {
         tracing::error!(error = %err, "command failed");
     }
@@ -123,6 +179,65 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
     }
 }
 
+async fn run(cli: Cli) -> Result<(), AppError> {
+    match cli.command {
+        None => emit_success(cli.json),
+        Some(Command::Seedbox(SeedboxArgs {
+            command:
+                SeedboxCommand::Bootstrap {
+                    provider,
+                    yes,
+                    config_dir,
+                    desired_state,
+                    ssh_config,
+                    state_db,
+                    address,
+                    skip_probe,
+                    roots,
+                },
+        })) => {
+            let provider =
+                ProviderKind::parse(&provider).map_err(|err| AppError::Usage(err.to_string()))?;
+            let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
+            let desired_state =
+                desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
+            let args = bootstrap::BootstrapArgs {
+                provider,
+                yes,
+                desired_state,
+                ssh_config: ssh_config.unwrap_or_else(bootstrap::default_ssh_config),
+                state_db: state_db.unwrap_or_else(bootstrap::default_state_db),
+                config_dir,
+                address,
+                skip_probe,
+                roots,
+            };
+            match bootstrap::bootstrap(args, &SystemExec).await {
+                Ok(report) => {
+                    let line = bootstrap::render_report(cli.json, &report)
+                        .map_err(|e| AppError::Runtime(anyhow!(e)))?;
+                    write_stdout(&line)
+                }
+                Err(bootstrap::BootstrapError::NeedsConfirm(report)) => {
+                    let line = bootstrap::render_needs_confirm(cli.json, &report)
+                        .map_err(|e| AppError::Runtime(anyhow!(e)))?;
+                    write_stdout(&line)?;
+                    Err(AppError::Emitted(ExitCode::PolicyRefusal))
+                }
+                Err(err) => {
+                    let mapped = match err.exit_code() {
+                        ExitCode::Usage => AppError::Usage(err.to_string()),
+                        ExitCode::PolicyRefusal => AppError::Policy(err.to_string()),
+                        ExitCode::LockConflict => AppError::LockConflict(err.to_string()),
+                        _ => AppError::Runtime(anyhow!(err.to_string())),
+                    };
+                    Err(mapped)
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -131,10 +246,13 @@ async fn main() -> ExitCode {
     let json_flag = json_requested();
     match parse_cli(json_flag) {
         Ok(ParseOutcome::HelpOrVersion) => ExitCode::Ok,
-        Ok(ParseOutcome::Parsed(cli)) => match emit_success(cli.json) {
-            Ok(()) => ExitCode::Ok,
-            Err(err) => finish_error(json_flag || cli.json, &err),
-        },
+        Ok(ParseOutcome::Parsed(cli)) => {
+            let json = json_flag || cli.json;
+            match run(cli).await {
+                Ok(()) => ExitCode::Ok,
+                Err(err) => finish_error(json, &err),
+            }
+        }
         Err(err) => finish_error(json_flag, &err),
     }
 }
@@ -167,5 +285,18 @@ mod tests {
         let err = AppError::Usage("unexpected argument".into());
         assert_eq!(to_exit_code(&err), ExitCode::Usage);
         assert_eq!(i32::from(to_exit_code(&err)), 2);
+    }
+
+    #[test]
+    fn policy_maps_to_exit_5() {
+        let err = AppError::Policy("need --yes".into());
+        assert_eq!(to_exit_code(&err), ExitCode::PolicyRefusal);
+    }
+
+    #[test]
+    fn lock_conflict_maps_to_exit_3() {
+        let err = AppError::LockConflict("held".into());
+        assert_eq!(to_exit_code(&err), ExitCode::LockConflict);
+        assert_eq!(i32::from(to_exit_code(&err)), 3);
     }
 }

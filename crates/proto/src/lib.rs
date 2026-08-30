@@ -18,6 +18,17 @@ use prost::Message;
 /// Control responses carry this package name (AD-22). Additive evolution stays here.
 pub const PROTO_PACKAGE: &str = "mediaops.v1";
 
+/// Refuse a daemon whose proto package we do not speak (AD-22).
+pub fn check_handshake(proto_package: &str) -> Result<(), ControlError> {
+    if proto_package != PROTO_PACKAGE {
+        return Err(ControlError {
+            exit_code: ExitCode::Runtime,
+            message: format!("unsupported proto package `{proto_package}`; want {PROTO_PACKAGE}"),
+        });
+    }
+    Ok(())
+}
+
 /// Failure converting a generated wire value to a domain type (or the reverse).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConvertError {
@@ -284,15 +295,18 @@ where
             .df(DfRequest {})
             .await
             .map_err(control_error_from_status)?;
-        Ok(Bytes::from(response.into_inner()))
+        let inner = response.into_inner();
+        check_handshake(&inner.proto_package)?;
+        Ok(Bytes::from(inner))
     }
 
     async fn unmonitor(&self, title_id: &TitleId) -> Result<(), ControlError> {
         let mut client = self.inner.clone();
-        client
+        let response = client
             .unmonitor(UnmonitorRequest::from(title_id))
             .await
             .map_err(control_error_from_status)?;
+        check_handshake(&response.into_inner().proto_package)?;
         Ok(())
     }
 
@@ -308,42 +322,48 @@ where
             .delete_remote(request)
             .await
             .map_err(control_error_from_status)?;
-        DeleteRemoteOutcome::try_from(response.into_inner()).map_err(convert_to_control)
+        let inner = response.into_inner();
+        check_handshake(&inner.proto_package)?;
+        DeleteRemoteOutcome::try_from(inner).map_err(convert_to_control)
     }
 
     async fn grab_apply(&self) -> Result<(), ControlError> {
         let mut client = self.inner.clone();
-        client
+        let response = client
             .grab_apply(GrabApplyRequest {})
             .await
             .map_err(control_error_from_status)?;
+        check_handshake(&response.into_inner().proto_package)?;
         Ok(())
     }
 
     async fn edge_check(&self) -> Result<(), ControlError> {
         let mut client = self.inner.clone();
-        client
+        let response = client
             .edge_check(EdgeCheckRequest {})
             .await
             .map_err(control_error_from_status)?;
+        check_handshake(&response.into_inner().proto_package)?;
         Ok(())
     }
 
     async fn key_discovery(&self) -> Result<(), ControlError> {
         let mut client = self.inner.clone();
-        client
+        let response = client
             .key_discovery(KeyDiscoveryRequest {})
             .await
             .map_err(control_error_from_status)?;
+        check_handshake(&response.into_inner().proto_package)?;
         Ok(())
     }
 
     async fn guard_preview(&self) -> Result<(), ControlError> {
         let mut client = self.inner.clone();
-        client
+        let response = client
             .guard_preview(GuardPreviewRequest {})
             .await
             .map_err(control_error_from_status)?;
+        check_handshake(&response.into_inner().proto_package)?;
         Ok(())
     }
 }
@@ -612,6 +632,12 @@ mod tests {
             Vec::<CoreRemoteEntry>::try_from(list),
             Err(ConvertError::MissingField("ref"))
         ));
+    }
+
+    #[test]
+    fn handshake_rejects_unknown_package() {
+        assert!(check_handshake("mediaops.v2").is_err());
+        assert!(check_handshake(PROTO_PACKAGE).is_ok());
     }
 
     #[test]

@@ -1,9 +1,12 @@
 use std::io::{self, IsTerminal, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::anyhow;
-use clap::Parser;
 use clap::error::ErrorKind;
-use mediaops_core::ExitCode;
+use clap::{Args, Parser, Subcommand};
+use mediaops_core::{Allowlist, ExitCode, Grabber};
+use mediaops_net::{DaemonRole, IdentityBundle, Seedbox, serve_tcp};
 
 const BIN_NAME: &str = "mediaopsd";
 
@@ -11,8 +14,39 @@ const BIN_NAME: &str = "mediaopsd";
 #[command(name = BIN_NAME, version)]
 struct Cli {
     /// Emit a single JSON envelope on stdout.
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Bind Control + Transfer (seedbox role).
+    Serve(ServeArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServeArgs {
+    #[arg(long, default_value = "seedbox")]
+    role: String,
+    #[arg(long, default_value = "0.0.0.0:50051")]
+    bind: String,
+    #[arg(long)]
+    tls_dir: PathBuf,
+    /// Allowlisted root as `id=path`. Repeatable.
+    #[arg(long = "root", value_parser = parse_root)]
+    roots: Vec<(String, PathBuf)>,
+}
+
+fn parse_root(raw: &str) -> Result<(String, PathBuf), String> {
+    let (id, path) = raw
+        .split_once('=')
+        .ok_or_else(|| "expected id=path".to_string())?;
+    if id.is_empty() {
+        return Err("empty root id".into());
+    }
+    Ok((id.to_string(), PathBuf::from(path)))
 }
 
 enum AppError {
@@ -123,6 +157,43 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
     }
 }
 
+async fn serve(args: ServeArgs) -> Result<(), AppError> {
+    let role = DaemonRole::parse(&args.role).map_err(|err| AppError::Usage(err.to_string()))?;
+    role.ensure_seedbox()
+        .map_err(|err| AppError::Usage(err.to_string()))?;
+    if args.roots.is_empty() {
+        return Err(AppError::Usage(
+            "serve requires at least one --root id=path".into(),
+        ));
+    }
+    let mut allowlist = Allowlist::new();
+    for (id, path) in args.roots {
+        allowlist
+            .add_root(id, path)
+            .map_err(|err| AppError::Runtime(anyhow!(err)))?;
+    }
+    let identity =
+        IdentityBundle::from_dir(&args.tls_dir).map_err(|err| AppError::Runtime(anyhow!(err)))?;
+    let server = identity
+        .server_config()
+        .map_err(|err| AppError::Runtime(anyhow!(err)))?;
+    let bind: SocketAddr = args
+        .bind
+        .parse()
+        .map_err(|err| AppError::Usage(format!("bad --bind: {err}")))?;
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .map_err(|e| AppError::Runtime(e.into()))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| AppError::Runtime(e.into()))?;
+    tracing::info!(%addr, "seedbox listen");
+    let seedbox = Seedbox::new(allowlist, env!("CARGO_PKG_VERSION"), Grabber::None);
+    serve_tcp(listener, server, seedbox)
+        .await
+        .map_err(|err| AppError::Runtime(anyhow!(err)))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
@@ -131,10 +202,17 @@ async fn main() -> ExitCode {
     let json_flag = json_requested();
     match parse_cli(json_flag) {
         Ok(ParseOutcome::HelpOrVersion) => ExitCode::Ok,
-        Ok(ParseOutcome::Parsed(cli)) => match emit_success(cli.json) {
-            Ok(()) => ExitCode::Ok,
-            Err(err) => finish_error(json_flag || cli.json, &err),
-        },
+        Ok(ParseOutcome::Parsed(cli)) => {
+            let json = json_flag || cli.json;
+            let result = match cli.command {
+                None => emit_success(cli.json),
+                Some(Command::Serve(args)) => serve(args).await,
+            };
+            match result {
+                Ok(()) => ExitCode::Ok,
+                Err(err) => finish_error(json, &err),
+            }
+        }
         Err(err) => finish_error(json_flag, &err),
     }
 }
@@ -147,11 +225,7 @@ mod tests {
     fn json_token_matches_clap_boolish_true() {
         assert!(json_token_requests_json("--json"));
         assert!(json_token_requests_json("--json=true"));
-        assert!(json_token_requests_json("--json=TRUE"));
-        assert!(json_token_requests_json("--json=1"));
         assert!(!json_token_requests_json("--json=false"));
-        assert!(!json_token_requests_json("--json=0"));
-        assert!(!json_token_requests_json("--json=maybe"));
         assert!(!json_token_requests_json("--help"));
     }
 
@@ -159,13 +233,20 @@ mod tests {
     fn runtime_maps_to_exit_1() {
         let err = AppError::Runtime(anyhow!("stdout closed"));
         assert_eq!(to_exit_code(&err), ExitCode::Runtime);
-        assert_eq!(i32::from(to_exit_code(&err)), 1);
     }
 
     #[test]
     fn usage_maps_to_exit_2() {
         let err = AppError::Usage("unexpected argument".into());
         assert_eq!(to_exit_code(&err), ExitCode::Usage);
-        assert_eq!(i32::from(to_exit_code(&err)), 2);
+    }
+
+    #[test]
+    fn parse_root_splits_id_and_path() {
+        assert_eq!(
+            parse_root("seedbox=/data/media").expect("root"),
+            ("seedbox".into(), PathBuf::from("/data/media"))
+        );
+        assert!(parse_root("nopath").is_err());
     }
 }

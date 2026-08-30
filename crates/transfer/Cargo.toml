@@ -3,3 +3,8 @@ name = "mediaops-transfer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+mediaops-core.workspace = true
+mediaops-net.workspace = true
+mediaops-proto.workspace = true
