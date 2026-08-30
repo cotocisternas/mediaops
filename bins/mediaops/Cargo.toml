@@ -7,7 +7,13 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
+directories.workspace = true
 mediaops-core.workspace = true
+mediaops-ssh.workspace = true
+mediaops-store.workspace = true
+mediaops-transfer.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "json"] }

@@ -3,8 +3,11 @@
 use serde::Deserialize;
 
 use crate::bytes::Bytes;
+use crate::probe::UnderlayMode;
+use crate::provider::ProviderKind;
 
 const SCHEMA_VERSION: u32 = 1;
+const SHA256_HEX_LEN: usize = 64;
 
 /// First-pass peek: extra fields are ignored so a future version can be
 /// diagnosed as `UnsupportedVersion` instead of an unknown-field parse error.
@@ -22,6 +25,38 @@ struct DesiredStateToml {
     range_len_mib: u64,
     max_nvenc: u32,
     lock: bool,
+    #[serde(default)]
+    grabber: Grabber,
+    #[serde(default)]
+    provider: Option<ProviderKind>,
+    #[serde(default)]
+    seedbox_address: Option<String>,
+    #[serde(default)]
+    underlay: UnderlayMode,
+    #[serde(default)]
+    tls: Option<TlsIdentity>,
+}
+
+/// *arr is optional. `none` means no live grabber HTTP (Epic 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Grabber {
+    #[default]
+    None,
+}
+
+/// Paths + SHA-256-of-DER fingerprints. Never PEMs (AD-14).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsIdentity {
+    pub ca_path: String,
+    pub server_cert_path: String,
+    pub server_key_path: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
+    pub ca_sha256: String,
+    pub server_sha256: String,
+    pub client_sha256: String,
 }
 
 /// Parsed desired-state. Size fields exist only as [`Bytes`].
@@ -33,6 +68,11 @@ pub struct DesiredState {
     range_len: Bytes,
     max_nvenc: u32,
     lock: bool,
+    grabber: Grabber,
+    provider: Option<ProviderKind>,
+    seedbox_address: Option<String>,
+    underlay: UnderlayMode,
+    tls: Option<TlsIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -47,6 +87,10 @@ pub enum DesiredStateError {
     MustBeNonZero { field: &'static str },
     #[error("{field} = {value} overflows Bytes")]
     SizeOverflow { field: &'static str, value: u64 },
+    #[error("{field} must be 64 lowercase hex characters")]
+    InvalidFingerprint { field: &'static str },
+    #[error("{field} must not contain a PEM body")]
+    PemInDesiredState { field: &'static str },
 }
 
 impl DesiredState {
@@ -72,6 +116,9 @@ impl DesiredState {
         if raw.max_nvenc == 0 {
             return Err(DesiredStateError::MustBeNonZero { field: "max_nvenc" });
         }
+        if let Some(tls) = raw.tls.as_ref() {
+            validate_tls(tls)?;
+        }
         Ok(Self {
             schema_version: raw.schema_version,
             max_copy: gib(raw.max_copy_gib, "max_copy_gib")?,
@@ -79,6 +126,11 @@ impl DesiredState {
             range_len: mib(raw.range_len_mib, "range_len_mib")?,
             max_nvenc: raw.max_nvenc,
             lock: raw.lock,
+            grabber: raw.grabber,
+            provider: raw.provider,
+            seedbox_address: raw.seedbox_address,
+            underlay: raw.underlay,
+            tls: raw.tls,
         })
     }
 
@@ -113,6 +165,104 @@ impl DesiredState {
     pub fn lock(&self) -> bool {
         self.lock
     }
+
+    pub fn grabber(&self) -> Grabber {
+        self.grabber
+    }
+
+    pub fn provider(&self) -> Option<ProviderKind> {
+        self.provider
+    }
+
+    pub fn seedbox_address(&self) -> Option<&str> {
+        self.seedbox_address.as_deref()
+    }
+
+    pub fn underlay(&self) -> UnderlayMode {
+        self.underlay
+    }
+
+    pub fn tls(&self) -> Option<&TlsIdentity> {
+        self.tls.as_ref()
+    }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == SHA256_HEX_LEN && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+fn looks_like_pem(value: &str) -> bool {
+    value.contains("BEGIN ") || value.contains("-----")
+}
+
+fn validate_tls(tls: &TlsIdentity) -> Result<(), DesiredStateError> {
+    for (field, value) in [
+        ("ca_path", tls.ca_path.as_str()),
+        ("server_cert_path", tls.server_cert_path.as_str()),
+        ("server_key_path", tls.server_key_path.as_str()),
+        ("client_cert_path", tls.client_cert_path.as_str()),
+        ("client_key_path", tls.client_key_path.as_str()),
+        ("ca_sha256", tls.ca_sha256.as_str()),
+        ("server_sha256", tls.server_sha256.as_str()),
+        ("client_sha256", tls.client_sha256.as_str()),
+    ] {
+        if looks_like_pem(value) {
+            return Err(DesiredStateError::PemInDesiredState { field });
+        }
+    }
+    for (field, value) in [
+        ("ca_sha256", tls.ca_sha256.as_str()),
+        ("server_sha256", tls.server_sha256.as_str()),
+        ("client_sha256", tls.client_sha256.as_str()),
+    ] {
+        if !is_lowercase_sha256(value) {
+            return Err(DesiredStateError::InvalidFingerprint { field });
+        }
+    }
+    Ok(())
+}
+
+/// Insert or replace the `[tls]` table in a desired-state document. Paths and
+/// fingerprints only — callers must never pass PEM bodies.
+pub fn upsert_tls_table(toml_text: &str, tls: &TlsIdentity) -> Result<String, DesiredStateError> {
+    validate_tls(tls)?;
+    let mut table: toml::Table =
+        toml::from_str(toml_text).map_err(|err| DesiredStateError::Parse(err.to_string()))?;
+    let mut tls_table = toml::Table::new();
+    tls_table.insert("ca_path".into(), toml::Value::String(tls.ca_path.clone()));
+    tls_table.insert(
+        "server_cert_path".into(),
+        toml::Value::String(tls.server_cert_path.clone()),
+    );
+    tls_table.insert(
+        "server_key_path".into(),
+        toml::Value::String(tls.server_key_path.clone()),
+    );
+    tls_table.insert(
+        "client_cert_path".into(),
+        toml::Value::String(tls.client_cert_path.clone()),
+    );
+    tls_table.insert(
+        "client_key_path".into(),
+        toml::Value::String(tls.client_key_path.clone()),
+    );
+    tls_table.insert(
+        "ca_sha256".into(),
+        toml::Value::String(tls.ca_sha256.clone()),
+    );
+    tls_table.insert(
+        "server_sha256".into(),
+        toml::Value::String(tls.server_sha256.clone()),
+    );
+    tls_table.insert(
+        "client_sha256".into(),
+        toml::Value::String(tls.client_sha256.clone()),
+    );
+    table.insert("tls".into(), toml::Value::Table(tls_table));
+    let encoded =
+        toml::to_string(&table).map_err(|err| DesiredStateError::Parse(err.to_string()))?;
+    DesiredState::from_toml(&encoded)?;
+    Ok(encoded)
 }
 
 fn gib(n: u64, field: &'static str) -> Result<Bytes, DesiredStateError> {
@@ -130,6 +280,7 @@ fn mib(n: u64, field: &'static str) -> Result<Bytes, DesiredStateError> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::probe::UnderlayMode;
 
     pub(crate) const HAPPY_TOML: &str = r#"
 schema_version = 1
@@ -270,5 +421,47 @@ lock = false
             DesiredState::from_toml(&toml),
             Err(DesiredStateError::MustBeNonZero { field: "max_nvenc" })
         );
+    }
+
+    #[test]
+    fn grabber_defaults_to_none() {
+        let ds = DesiredState::from_toml(HAPPY_TOML).expect("parse");
+        assert_eq!(ds.grabber(), Grabber::None);
+        assert_eq!(ds.underlay(), UnderlayMode::Direct);
+        assert!(ds.tls().is_none());
+    }
+
+    #[test]
+    fn pem_body_in_tls_is_refused() {
+        let toml = format!(
+            "{HAPPY_TOML}\n[tls]\nca_path = \"-----BEGIN CERTIFICATE-----\"\n\
+             server_cert_path = \"/a\"\nserver_key_path = \"/b\"\n\
+             client_cert_path = \"/c\"\nclient_key_path = \"/d\"\n\
+             ca_sha256 = \"{fp}\"\nserver_sha256 = \"{fp}\"\nclient_sha256 = \"{fp}\"\n",
+            fp = "a".repeat(64)
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&toml),
+            Err(DesiredStateError::PemInDesiredState { field: "ca_path" })
+        ));
+    }
+
+    #[test]
+    fn upsert_tls_table_never_writes_pem() {
+        let fp = "ab".repeat(32);
+        let tls = TlsIdentity {
+            ca_path: "/cfg/tls/ca.pem".into(),
+            server_cert_path: "/cfg/tls/server.pem".into(),
+            server_key_path: "/cfg/tls/server.key".into(),
+            client_cert_path: "/cfg/tls/client.pem".into(),
+            client_key_path: "/cfg/tls/client.key".into(),
+            ca_sha256: fp.clone(),
+            server_sha256: fp.clone(),
+            client_sha256: fp,
+        };
+        let encoded = upsert_tls_table(HAPPY_TOML, &tls).expect("upsert");
+        assert!(!encoded.contains("BEGIN "));
+        let ds = DesiredState::from_toml(&encoded).expect("reparse");
+        assert_eq!(ds.tls().expect("tls").ca_path, "/cfg/tls/ca.pem");
     }
 }

@@ -3,3 +3,9 @@ name = "mediaops-store"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+mediaops-core.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+thiserror.workspace = true
+tokio = { workspace = true, default-features = false, features = ["rt"] }

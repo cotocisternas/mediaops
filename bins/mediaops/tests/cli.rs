@@ -113,9 +113,79 @@ fn help_exits_ok() {
         "help must print clap usage, got: {stdout}"
     );
     assert!(
+        stdout.contains("seedbox"),
+        "help must mention seedbox: {stdout}"
+    );
+    assert!(
         serde_json::from_str::<Value>(stdout.trim()).is_err(),
         "help must not be a JSON envelope: {stdout}"
     );
+}
+
+#[test]
+fn seedbox_bootstrap_unimplemented_provider_fails_loudly() {
+    let output = bin()
+        .args([
+            "--json",
+            "seedbox",
+            "bootstrap",
+            "--provider",
+            "docker-compose",
+        ])
+        .output()
+        .expect("run bootstrap unimplemented");
+    assert_eq!(output.status.code(), Some(2));
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("unimplemented") || message.contains("docker_compose"),
+        "got {message}"
+    );
+}
+
+#[test]
+fn seedbox_bootstrap_without_yes_is_policy_refusal() {
+    let dir = std::env::temp_dir().join(format!(
+        "mediaops-cli-bootstrap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let ssh = dir.join("ssh_config");
+    std::fs::write(&ssh, "Host seedbox\n  HostName example\n  User x\n").expect("ssh");
+    let ds = dir.join("desired-state.toml");
+    std::fs::write(
+        &ds,
+        "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 1\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
+    )
+    .expect("ds");
+    let output = bin()
+        .args([
+            "--json",
+            "seedbox",
+            "bootstrap",
+            "--provider",
+            "already-there",
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--desired-state",
+            ds.to_str().unwrap(),
+            "--ssh-config",
+            ssh.to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("run bootstrap plan");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "policy_refusal");
 }
 
 #[test]

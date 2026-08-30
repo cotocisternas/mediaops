@@ -294,6 +294,63 @@ impl Allowlist {
         Ok(remote_ref)
     }
 
+    /// Resolve a [`RemoteRef`] to a path under an allowlisted root.
+    pub fn absolute(&self, remote: &RemoteRef) -> Result<PathBuf, WalkerError> {
+        let root = self
+            .roots
+            .iter()
+            .find(|r| r.id == remote.root_id())
+            .ok_or_else(|| WalkerError::UnknownPath(remote.root_id().to_string()))?;
+        if !is_contained_relative(remote.rel_path()) {
+            return Err(WalkerError::UnknownPath(
+                remote.rel_path().display().to_string(),
+            ));
+        }
+        let path = root.canonical.join(remote.rel_path());
+        if !path.starts_with(&root.canonical) {
+            return Err(WalkerError::UnknownPath(path.display().to_string()));
+        }
+        Ok(path)
+    }
+
+    /// Stat a file that a prior walker listing produced.
+    pub fn entry(&self, remote: &RemoteRef) -> Result<RemoteEntry, WalkerError> {
+        let path = self.absolute(remote)?;
+        if is_torrent_skip(&path) {
+            return Err(WalkerError::UnknownPath(path.display().to_string()));
+        }
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|_| WalkerError::UnknownPath(path.display().to_string()))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(WalkerError::UnknownPath(path.display().to_string()));
+        }
+        Ok(RemoteEntry::from_wire_parts(
+            remote.clone(),
+            meta.len(),
+            mtime_secs(&meta),
+            nlink(&meta),
+        ))
+    }
+
+    /// Open a file for a range read. Never follows a symlink.
+    pub fn open(&self, remote: &RemoteRef) -> Result<std::fs::File, WalkerError> {
+        let path = self.absolute(remote)?;
+        let _ = self.entry(remote)?;
+        std::fs::File::open(&path).map_err(|err| WalkerError::io(&path, &err))
+    }
+
+    /// Least available bytes among allowlisted roots (`df`).
+    pub fn free_bytes(&self) -> Result<u64, WalkerError> {
+        if self.roots.is_empty() {
+            return Ok(0);
+        }
+        let mut min = u64::MAX;
+        for root in &self.roots {
+            min = min.min(statvfs_available(&root.canonical)?);
+        }
+        Ok(min)
+    }
+
     fn ref_for_canonical(
         &self,
         original: &Path,
@@ -428,6 +485,31 @@ fn nlink(meta: &Metadata) -> u64 {
     {
         let _ = meta;
         1
+    }
+}
+
+fn statvfs_available(path: &Path) -> Result<u64, WalkerError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            WalkerError::UnknownPath(path.display().to_string())
+        })?;
+        let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let rc = unsafe { libc::statvfs(cstr.as_ptr(), vfs.as_mut_ptr()) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(WalkerError::io(path, &err));
+        }
+        let vfs = unsafe { vfs.assume_init() };
+        Ok(vfs.f_bavail as u64 * vfs.f_frsize as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(WalkerError::UnknownPath(
+            "df is unix-only in v1".to_string(),
+        ))
     }
 }
 
@@ -825,5 +907,23 @@ mod tests {
                 "{bad} must not survive the wire boundary"
             );
         }
+    }
+
+    #[test]
+    fn entry_and_open_round_trip_a_listed_file() {
+        let tmp = TempTree::new();
+        let root = tmp.path.join("media");
+        write_file(&root.join("a.bin"), b"hello");
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root).expect("root");
+        let listed = allowlist.list().expect("list");
+        assert_eq!(listed.len(), 1);
+        let entry = allowlist.entry(listed[0].r#ref()).expect("entry");
+        assert_eq!(entry.len(), 5);
+        let mut file = allowlist.open(listed[0].r#ref()).expect("open");
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut buf).expect("read");
+        assert_eq!(buf, b"hello");
+        assert!(allowlist.free_bytes().expect("df") > 0);
     }
 }
