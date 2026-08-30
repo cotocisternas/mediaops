@@ -5,6 +5,8 @@ review that raised it so a later story can pick it up with context.
 
 ## Deferred from: code review of spec-1-2-pathschema-titleid-and-the-walker (2026-08-29)
 
+Story 1.2 review is **closed** (2026-08-30). Spec `followup_review_recommended: false`. These eight items remain ledger-only; they are not a second 1.2 implementation pass.
+
 - **No `NAME_MAX` or path-length guard on rendered components** (`crates/core/src/pathschema.rs:324`) — `validate_display_token` accepts an arbitrarily long title, so a 300-character title renders a folder or file name past the 255-byte limit. The failure surfaces as an opaque `InstallError::Io` at `fs::rename` time instead of a `PathSchemaError` at render time.
 - **Walker recursion depth is unbounded** (`crates/core/src/walker.rs:181`) — `walk_dir` recurses per directory level with no depth cap. A deeply nested remote tree can exhaust the stack and abort the process. Needs either a depth limit or an explicit statement that allowlisted roots are trusted.
 - **`RemoteEntry` carries `nlink` but no `dev`/`ino`** (`crates/core/src/walker.rs:36`) — a caller can tell *that* a file is hardlinked but never *to what*, which is what hardlink-aware handling of seeded torrents actually needs. Deferred because the epic pins `RemoteEntry` to `{ref, len, mtime, nlink}` and story 1.4 mirrors it field-for-field on the wire; adding fields is a contract change.
@@ -16,16 +18,17 @@ review that raised it so a later story can pick it up with context.
 
 ## Deferred from: spec split of spec-1-3-desiredstate-plan-jobs-and-store (2026-08-29)
 
-- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
-  summary: `core::jobs` state machines — JobKind, per-kind states, `advance`, and Encode-ready-when-parent-Installed.
-  evidence: Split from 1.3 so this spec can stay inside the token budget; AD-10 types are independently shippable from DesiredState/Plan and were inflating the I/O matrix and Design Notes.
-- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
-  summary: `store` first persistence — rusqlite adapter, `title_index`/`jobs` tables, and repository traits.
-  evidence: Split from 1.3; AD-8 sqlite is a second shippable deliverable (migrate, digest immutability, daemon-must-not-link-store) that does not have to land with the parse/snapshot types.
+Explored 2026-08-30 (after PR #4). Proposed follow-ons: slice A `core::jobs` (pure), then slice B store v2 (traits + `title_index`/`jobs`, migrate `user_version` 1→2). See spec-1-3 "Split remainder". Do not greenfield sqlite: Epic 2 already owns `probes` at version 1.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
+  summary: `core::jobs` state machines — JobKind, per-kind states, `advance`, and Encode-ready-when-parent-Installed.
+  evidence: Split from 1.3 so this spec can stay inside the token budget; AD-10 types are independently shippable from DesiredState/Plan and were inflating the I/O matrix and Design Notes. Still unbuilt. Can land before sqlite (Epic 4 is the first consumer).
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
+  summary: `store` v2 persistence — rusqlite adapter already exists for `probes`; add `title_index`/`jobs` tables and repository traits in `core`.
+  evidence: Split from 1.3; AD-8. Epic 2 inverted the original "do not create probes yet" AC. Next story migrates 1→2, wraps probes in the same trait family, keeps mediaopsd store-free.
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
   summary: `install.rs` still says digest persistence is story 1.3, but this slice deferred `title_index`/`store`.
-  evidence: `crates/core/src/install.rs` crate docs still claim replace is the only writer of `current_b3` and that persistence is story 1.3. This story's Never list forbids rewriting install; the comment is now wrong relative to the split.
+  evidence: `crates/core/src/install.rs` crate docs still claim replace is the only writer of `current_b3` and that persistence is story 1.3. Fold the comment (and the persistence door) into slice B.
 
 ## Deferred from: code review of PR #4 / SPEC.md (2026-08-30)
 

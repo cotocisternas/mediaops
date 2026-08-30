@@ -5,11 +5,19 @@ created: '2026-08-29'
 status: 'done'
 baseline_revision: 'a3273af46fab9af514cf311355e9bfcccf2d79c8'
 review_loop_iteration: 1
-followup_review_recommended: true
+followup_review_recommended: false
 context:
   - '_bmad-output/implementation-artifacts/epic-1-context.md'
 warnings: []
-deferred: []
+deferred:
+  - 'No NAME_MAX / path-length guard on rendered components'
+  - 'Walker recursion depth is unbounded'
+  - 'RemoteEntry has nlink but not dev/ino'
+  - 'Non-unix nlink = 1 fabrication'
+  - 'Titles containing Proper/Repack cannot render'
+  - 'No parent-dir fsync after install rename'
+  - 'Staging verify is Path::ends_with, not a staging-root check'
+  - 'REPACJ frozen as a public scene tag (possible REPACK typo)'
 ---
 
 <intent-contract>
@@ -126,7 +134,14 @@ Adversarial code review of commit `35a4f03`, 2026-08-29. Four layers (blind-hunt
 - [x] [Review][Defer] Nothing constrains the staged source to a staging root; any dir ending in the `_incoming/<TitleId>/<name>` tail verifies [crates/core/src/install.rs:76] — deferred, adding a staging-root parameter changes the gate signature
 - [x] [Review][Defer] `REPACJ` is frozen into a public const, doc, and test as a scene tag [crates/core/src/pathschema.rs:15] — deferred, it reads as a typo of `REPACK` but both the spec and epic context list it; confirm upstream
 
+**Review closed (2026-08-30).** Patches from the 2026-08-29 adversarial pass are in `main`. No follow-up review is queued. The eight deferrals stay on the ledger in [deferred-work.md](deferred-work.md); they are not open story work. Epic 2 later closed a walker hole this story's listing tests did not cover: `Stat`/`GetRange`/`entry`/`open` now refuse intermediate directory symlinks and open with `O_NOFOLLOW`.
+
 ## Spec Change Log
+
+### 2026-08-30 — Review closed; Epic 2 walker follow-up
+
+- **Review is closed.** `followup_review_recommended` is false. Remaining items are the eight deferrals in frontmatter / deferred-work, not a second 1.2 review loop.
+- **Allowlist Stat/GetRange no longer follow parent symlinks.** Listing already skipped symlink dirs; `absolute`/`entry`/`open` still walked through them until Epic 2 (`6e2be4c`). Component-wise `symlink_metadata` plus unix `O_NOFOLLOW` now match the Always constraint "never follow symlinks off the allowlist."
 
 ### 2026-08-29 — Review pass 2 (commit `35a4f03`)
 

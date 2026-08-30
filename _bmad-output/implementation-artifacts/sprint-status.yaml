@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-29-2026 01:26
-last_updated: 08-30-2026 18:30
+last_updated: 08-30-2026 18:39
 project: mediaops
 project_key: NOKEY
 tracking_system: file-system
@@ -43,10 +43,10 @@ development_status:
   1-4-wire-contract-in-the-proto-crate: done
   epic-1-retrospective: optional
 
-  epic-2: in-progress
-  2-1-net-crate-tls-identity-and-channels: review
-  2-2-mediaopsd-seedbox-role: review
-  2-3-seedbox-bootstrap-over-ssh: review
+  epic-2: done
+  2-1-net-crate-tls-identity-and-channels: done
+  2-2-mediaopsd-seedbox-role: done
+  2-3-seedbox-bootstrap-over-ssh: done
   epic-2-retrospective: optional
 
   epic-3: backlog

@@ -78,6 +78,39 @@ Plan JSON field `desired_state_toml` is a UTF-8 string (TOML is text); hash the 
 
 Jobs (`advance`/`ready`) and `store` (`title_index`/`jobs`, rusqlite) are in deferred-work, not this spec.
 
+## Split remainder
+
+Original story 1.3 in `epics.md` also promised `core::jobs` and first sqlite persistence. Those were cut here so DesiredState/Plan/Action could ship inside the token budget. They are **not done**. Epic 1 is closed as implemented; this remainder is follow-on work, not a reopen of 1.3's frozen intent.
+
+The code moved underfoot:
+
+- Epic 2 created `probes` at `PRAGMA user_version = 1` (`crates/store`). Original 1.3 AC said "do not create `probes` yet." Any later store story **migrates 1 → 2**; it does not greenfield `title_index`/`jobs` as version 1.
+- `store` is a concrete `Store` with `get_probe`/`put_probe`. AD-8 still wants repository traits in `core`; none exist.
+- `install.rs` still says digest persistence is story 1.3. After this split that sentence is false until a store story writes `current_b3` / `install_b3`.
+- `mediaopsd` still must not link `store`. The CLI already does (bootstrap probes).
+
+### Slice A — `core::jobs` (pure)
+
+AD-10. No sqlite, no tokio.
+
+- `JobKind` and per-kind state enums (want, pull, encode, hold at minimum; match exhaustive).
+- `advance(state, event) -> Result<State>` as a pure function; illegal transition is an error, not a caller convention.
+- Readiness: Encode is ready when its parent Copy job is Installed; evaluated here, not in `sync`/`encode`.
+- `parent_job_id` on the type so a later planner can link one job row per Plan action to the originating want.
+
+Consumer: Epic 4 planner/timer. Can land before sqlite.
+
+### Slice B — store v2 (traits + tables)
+
+AD-8 remainder, after slice A (jobs table persists A's types).
+
+- Repository traits in `core`; `store` implements them (including today's probes, so bootstrap keeps compiling).
+- Tables `title_index` (`install_b3` immutable, `current_b3` gate-updated) and `jobs`. Keep `probes`. Do not create `holds_decisions`.
+- Forward-only migration `user_version` 1 → 2. Refuse `> 2`.
+- `install`/`replace` remain the only writers of `current_b3`; this slice is the persistence door they call, and it fixes the stale install.rs crate doc.
+
+Consumer: Epic 3 records install digests; Epic 4 persists job rows. Seedbox daemon stays store-free.
+
 ## Verification
 
 **Commands:**
