@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
-use clap::{Args, Parser, Subcommand};
 use clap::error::ErrorKind;
+use clap::{Args, Parser, Subcommand};
 use mediaops_core::{Allowlist, ExitCode, Grabber};
 use mediaops_net::{DaemonRole, IdentityBundle, Seedbox, serve_tcp};
 
@@ -30,7 +30,7 @@ enum Command {
 struct ServeArgs {
     #[arg(long, default_value = "seedbox")]
     role: String,
-    #[arg(long, default_value = "127.0.0.1:50051")]
+    #[arg(long, default_value = "0.0.0.0:50051")]
     bind: String,
     #[arg(long)]
     tls_dir: PathBuf,
@@ -40,7 +40,9 @@ struct ServeArgs {
 }
 
 fn parse_root(raw: &str) -> Result<(String, PathBuf), String> {
-    let (id, path) = raw.split_once('=').ok_or_else(|| "expected id=path".to_string())?;
+    let (id, path) = raw
+        .split_once('=')
+        .ok_or_else(|| "expected id=path".to_string())?;
     if id.is_empty() {
         return Err("empty root id".into());
     }
@@ -160,7 +162,9 @@ async fn serve(args: ServeArgs) -> Result<(), AppError> {
     role.ensure_seedbox()
         .map_err(|err| AppError::Usage(err.to_string()))?;
     if args.roots.is_empty() {
-        return Err(AppError::Usage("serve requires at least one --root id=path".into()));
+        return Err(AppError::Usage(
+            "serve requires at least one --root id=path".into(),
+        ));
     }
     let mut allowlist = Allowlist::new();
     for (id, path) in args.roots {
@@ -168,8 +172,8 @@ async fn serve(args: ServeArgs) -> Result<(), AppError> {
             .add_root(id, path)
             .map_err(|err| AppError::Runtime(anyhow!(err)))?;
     }
-    let identity = IdentityBundle::from_dir(&args.tls_dir)
-        .map_err(|err| AppError::Runtime(anyhow!(err)))?;
+    let identity =
+        IdentityBundle::from_dir(&args.tls_dir).map_err(|err| AppError::Runtime(anyhow!(err)))?;
     let server = identity
         .server_config()
         .map_err(|err| AppError::Runtime(anyhow!(err)))?;

@@ -39,21 +39,27 @@ pub enum ExecError {
     Status { program: String, status: i32 },
 }
 
-/// Refuse rsync/rclone/ftp and recursive scp. SSH is bootstrap exec, not a copy pipe.
+/// Refuse rsync/rclone/ftp/sftp/lftp and recursive scp. SSH is bootstrap exec, not a copy pipe.
 pub fn reject_bulk_copy(command: &ExecCommand) -> Result<(), ExecError> {
     let name = command.program_name();
-    if matches!(name, "rsync" | "rclone" | "ftp") {
+    if matches!(name, "rsync" | "rclone" | "ftp" | "sftp" | "lftp") {
         return Err(ExecError::BulkCopy);
     }
-    if name == "scp"
-        && command
-            .args
-            .iter()
-            .any(|a| a == "-r" || a == "-R" || a == "--recursive")
-    {
+    if name == "scp" && command.args.iter().any(|a| is_scp_recursive_flag(a)) {
         return Err(ExecError::BulkCopy);
     }
     Ok(())
+}
+
+/// Short clusters like `-rp` / `-Pr` are recursive; a lone `-P` is scp's port flag.
+fn is_scp_recursive_flag(arg: &str) -> bool {
+    if arg == "--recursive" {
+        return true;
+    }
+    if arg.starts_with('-') && !arg.starts_with("--") {
+        return arg != "-P" && (arg.contains('r') || arg.contains('R'));
+    }
+    false
 }
 
 #[allow(async_fn_in_trait)]
@@ -84,5 +90,26 @@ mod tests {
             vec!["mediaopsd".into(), "seedbox:.local/bin/mediaopsd".into()],
         );
         assert_eq!(reject_bulk_copy(&cmd), Ok(()));
+    }
+
+    #[test]
+    fn scp_combined_recursive_flags_are_bulk_copy() {
+        let cmd = ExecCommand::new("scp", vec!["-rp".into(), "a".into(), "b".into()]);
+        assert_eq!(reject_bulk_copy(&cmd), Err(ExecError::BulkCopy));
+    }
+
+    #[test]
+    fn scp_port_flag_is_allowed() {
+        let cmd = ExecCommand::new(
+            "scp",
+            vec!["-P".into(), "2097".into(), "a".into(), "seedbox:x".into()],
+        );
+        assert_eq!(reject_bulk_copy(&cmd), Ok(()));
+    }
+
+    #[test]
+    fn sftp_is_bulk_copy() {
+        let cmd = ExecCommand::new("sftp", vec!["seedbox".into()]);
+        assert_eq!(reject_bulk_copy(&cmd), Err(ExecError::BulkCopy));
     }
 }

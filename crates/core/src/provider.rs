@@ -3,11 +3,15 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[serde(alias = "swizzin-box")]
     SwizzinBox,
+    #[serde(alias = "already-there")]
     AlreadyThere,
+    #[serde(alias = "docker-compose")]
     DockerCompose,
     #[serde(rename = "ultra.cc")]
     UltraCc,
+    #[serde(alias = "quickbox")]
     QuickBox,
 }
 
@@ -92,5 +96,17 @@ mod tests {
             ProviderKind::DockerCompose.ensure_installable(),
             Ok(())
         ));
+    }
+
+    #[test]
+    fn deserializes_kebab_cli_names() {
+        assert_eq!(
+            serde_json::from_str::<ProviderKind>("\"already-there\"").expect("already-there"),
+            ProviderKind::AlreadyThere
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderKind>("\"swizzin-box\"").expect("swizzin-box"),
+            ProviderKind::SwizzinBox
+        );
     }
 }

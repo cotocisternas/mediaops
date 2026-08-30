@@ -8,4 +8,4 @@ rust-version.workspace = true
 mediaops-core.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 thiserror.workspace = true
-tokio = { workspace = true, default-features = false, features = ["rt"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt"] }

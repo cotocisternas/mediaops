@@ -1,11 +1,11 @@
 //! Bootstrap exec via system ssh. SwizzinBox provider. No bulk copy (AD-16, AD-21).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    ExecCommand, ExecError, ExecOutput, ExecPort, ProviderError, ProviderKind, already_there_install,
-    reject_bulk_copy,
+    ExecCommand, ExecError, ExecOutput, ExecPort, ProviderError, ProviderKind,
+    already_there_install, reject_bulk_copy,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -31,8 +31,12 @@ pub struct SshHost {
 }
 
 /// Import `Host seedbox` — the alias is the ssh config Host, not an invented format.
+///
+/// A `Host` line may list several aliases (`Host seedbox other`); the block applies
+/// when any token equals the requested alias. `Include`, `Host *`, and `Match` are
+/// ignored (deferred).
 pub fn parse_ssh_config(text: &str, alias: &str) -> Result<SshHost, SshError> {
-    let mut current: Option<String> = None;
+    let mut applies = false;
     let mut host = SshHost {
         alias: alias.to_string(),
         hostname: None,
@@ -47,17 +51,29 @@ pub fn parse_ssh_config(text: &str, alias: &str) -> Result<SshHost, SshError> {
         }
         let mut parts = line.split_whitespace();
         let Some(key) = parts.next() else { continue };
-        let value = parts.collect::<Vec<_>>().join(" ");
+        if key.eq_ignore_ascii_case("Include") {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("Match") {
+            applies = false;
+            continue;
+        }
         if key.eq_ignore_ascii_case("Host") {
-            current = Some(value.clone());
-            if value == alias {
+            let tokens: Vec<&str> = parts.collect();
+            if tokens.iter().all(|token| *token == "*") {
+                applies = false;
+                continue;
+            }
+            applies = tokens.iter().any(|token| *token == alias);
+            if applies {
                 found = true;
             }
             continue;
         }
-        if current.as_deref() != Some(alias) {
+        if !applies {
             continue;
         }
+        let value = parts.collect::<Vec<_>>().join(" ");
         match key.to_ascii_lowercase().as_str() {
             "hostname" => host.hostname = Some(value),
             "user" => host.user = Some(value),
@@ -112,14 +128,30 @@ pub fn musl_build_command() -> ExecCommand {
     )
 }
 
-pub fn scp_file_command(local: &Path, remote: &str) -> ExecCommand {
+pub fn musl_binary_path() -> PathBuf {
+    PathBuf::from("target/x86_64-unknown-linux-musl/release/mediaopsd")
+}
+
+pub fn scp_file_command(local: &Path, remote: &str, ssh_config: &Path) -> ExecCommand {
     ExecCommand::new(
         "scp",
         vec![
+            "-F".into(),
+            ssh_config.display().to_string(),
             local.display().to_string(),
             format!("seedbox:{remote}"),
         ],
     )
+}
+
+pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
+    let mut args = vec![
+        "-F".into(),
+        ssh_config.display().to_string(),
+        "seedbox".into(),
+    ];
+    args.extend(remote_argv.iter().map(|arg| (*arg).to_string()));
+    ExecCommand::new("ssh", args)
 }
 
 pub async fn install_provider(
@@ -128,6 +160,8 @@ pub async fn install_provider(
     local_binary: &Path,
     unit_text: &str,
     unit_local: &Path,
+    tls_dir: &Path,
+    ssh_config: &Path,
 ) -> Result<(), SshError> {
     kind.ensure_installable()?;
     match kind {
@@ -137,15 +171,53 @@ pub async fn install_provider(
         }
         ProviderKind::SwizzinBox => {
             exec.run(&musl_build_command()).await?;
+            exec.run(&ssh_exec(
+                ssh_config,
+                &[
+                    "mkdir",
+                    "-p",
+                    ".local/bin",
+                    ".config/systemd/user",
+                    ".config/mediaops/tls",
+                ],
+            ))
+            .await?;
             exec.run(&scp_file_command(
                 local_binary,
                 ".local/bin/mediaopsd",
+                ssh_config,
             ))
             .await?;
-            std::fs::write(unit_local, unit_text).map_err(|err| SshError::Other(err.to_string()))?;
+            for name in ["ca.pem", "server.pem", "server.key"] {
+                exec.run(&scp_file_command(
+                    &tls_dir.join(name),
+                    &format!(".config/mediaops/tls/{name}"),
+                    ssh_config,
+                ))
+                .await?;
+            }
+            std::fs::write(unit_local, unit_text)
+                .map_err(|err| SshError::Other(err.to_string()))?;
             exec.run(&scp_file_command(
                 unit_local,
                 ".config/systemd/user/mediaopsd.service",
+                ssh_config,
+            ))
+            .await?;
+            exec.run(&ssh_exec(
+                ssh_config,
+                &["systemctl", "--user", "daemon-reload"],
+            ))
+            .await?;
+            exec.run(&ssh_exec(
+                ssh_config,
+                &[
+                    "systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                    "mediaopsd.service",
+                ],
             ))
             .await?;
             Ok(())
@@ -168,9 +240,10 @@ impl ExecPort for SystemExec {
                 message: err.to_string(),
             })?;
         if !output.status.success() {
-            return Err(ExecError::Status {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ExecError::Failed {
                 program: command.program.clone(),
-                status: output.status.code().unwrap_or(1),
+                message: format!("exited {}: {stderr}", output.status.code().unwrap_or(1)),
             });
         }
         Ok(ExecOutput {
@@ -235,6 +308,16 @@ mod tests {
     }
 
     #[test]
+    fn host_line_with_multiple_aliases_imports_hostname() {
+        let text = "Host seedbox other\n  HostName box.example\n  User foo\nHost elsewhere\n  HostName no\n";
+        let host = parse_ssh_config(text, "seedbox").expect("host");
+        assert_eq!(host.hostname.as_deref(), Some("box.example"));
+        assert_eq!(host.user.as_deref(), Some("foo"));
+        let other = parse_ssh_config(text, "other").expect("other alias");
+        assert_eq!(other.hostname.as_deref(), Some("box.example"));
+    }
+
+    #[test]
     fn git_work_tree_is_refused() {
         let dir = std::env::temp_dir().join(format!(
             "mediaops-ssh-git-{}-{}",
@@ -258,6 +341,8 @@ mod tests {
             Path::new("/tmp/mediaopsd"),
             "",
             Path::new("/tmp/unit"),
+            Path::new("/tmp/tls"),
+            Path::new("/tmp/ssh_config"),
         )
         .await
         .expect_err("unimplemented");
@@ -277,6 +362,8 @@ mod tests {
             Path::new("/tmp/mediaopsd"),
             "",
             Path::new("/tmp/unit"),
+            Path::new("/tmp/tls"),
+            Path::new("/tmp/ssh_config"),
         )
         .await
         .expect("noop");
@@ -318,20 +405,56 @@ mod tests {
         let bin = dir.join("mediaopsd");
         std::fs::write(&bin, b"fake").expect("bin");
         let unit = dir.join("mediaopsd.service");
+        let tls = dir.join("tls");
+        std::fs::create_dir_all(&tls).expect("tls");
+        for name in ["ca.pem", "server.pem", "server.key"] {
+            std::fs::write(tls.join(name), b"pem").expect("tls file");
+        }
+        let ssh_config = dir.join("ssh_config");
+        std::fs::write(&ssh_config, "Host seedbox\n").expect("ssh");
+        let unit_text = systemd_user_unit(
+            "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls",
+        );
         install_provider(
             &exec,
             ProviderKind::SwizzinBox,
             &bin,
-            &systemd_user_unit("/home/x/.local/bin/mediaopsd serve --config /cfg"),
+            &unit_text,
             &unit,
+            &tls,
+            &ssh_config,
         )
         .await
         .expect("install");
         let calls = exec.recorded();
         assert_eq!(calls[0].program_name(), "cargo");
-        assert!(calls[0].args.iter().any(|a| a.contains("musl")));
-        assert_eq!(calls[1].program_name(), "scp");
+        assert!(
+            calls[0]
+                .args
+                .iter()
+                .any(|a| a.contains("x86_64-unknown-linux-musl"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| { c.program_name() == "ssh" && c.args.iter().any(|a| a == "mkdir") })
+        );
+        let scp_calls: Vec<_> = calls.iter().filter(|c| c.program_name() == "scp").collect();
+        assert!(scp_calls.len() >= 2, "binary + unit + tls files");
+        assert!(calls.iter().any(|c| {
+            c.program_name() == "ssh"
+                && c.args.iter().any(|a| a == "systemctl")
+                && c.args.iter().any(|a| a == "enable")
+        }));
         assert!(!calls.iter().any(|c| reject_bulk_copy(c).is_err()));
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a.contains("client.key")))
+        );
+        let written = std::fs::read_to_string(&unit).expect("unit on disk");
+        assert!(written.contains("WantedBy=default.target"));
+        assert!(written.contains("--tls-dir"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

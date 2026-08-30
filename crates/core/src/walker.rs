@@ -161,6 +161,27 @@ fn is_contained_relative(rel: &Path) -> bool {
         })
 }
 
+/// Join `rel` onto `root`, refusing any symlink component.
+///
+/// `fs::symlink_metadata` of a fully joined path still follows intermediate
+/// directory symlinks, so a crafted `RemoteRef` like `escape/secret.bin` would
+/// otherwise Stat/GetRange a file that [`Allowlist::list`] never emits.
+fn join_unfollowed(root: &Path, rel: &Path) -> Result<PathBuf, WalkerError> {
+    let mut path = root.to_path_buf();
+    for component in rel.components() {
+        let Component::Normal(name) = component else {
+            return Err(WalkerError::UnknownPath(rel.display().to_string()));
+        };
+        path.push(name);
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|_| WalkerError::UnknownPath(path.display().to_string()))?;
+        if meta.file_type().is_symlink() {
+            return Err(WalkerError::UnknownPath(path.display().to_string()));
+        }
+    }
+    Ok(path)
+}
+
 #[derive(Debug, Clone)]
 struct AllowlistedRoot {
     id: String,
@@ -306,8 +327,10 @@ impl Allowlist {
                 remote.rel_path().display().to_string(),
             ));
         }
-        let path = root.canonical.join(remote.rel_path());
-        if !path.starts_with(&root.canonical) {
+        // Join+stat would follow intermediate directory symlinks (kernel path
+        // walk). Refuse each component so a RemoteRef cannot escape.
+        let path = join_unfollowed(&root.canonical, remote.rel_path())?;
+        if is_torrent_skip(&path) || !path.starts_with(&root.canonical) {
             return Err(WalkerError::UnknownPath(path.display().to_string()));
         }
         Ok(path)
@@ -336,7 +359,33 @@ impl Allowlist {
     pub fn open(&self, remote: &RemoteRef) -> Result<std::fs::File, WalkerError> {
         let path = self.absolute(remote)?;
         let _ = self.entry(remote)?;
-        std::fs::File::open(&path).map_err(|err| WalkerError::io(&path, &err))
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|err| WalkerError::io(&path, &err))?;
+            let meta = file
+                .metadata()
+                .map_err(|err| WalkerError::io(&path, &err))?;
+            if !meta.is_file() {
+                return Err(WalkerError::UnknownPath(path.display().to_string()));
+            }
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let file = fs::File::open(&path).map_err(|err| WalkerError::io(&path, &err))?;
+            let meta = file
+                .metadata()
+                .map_err(|err| WalkerError::io(&path, &err))?;
+            if !meta.is_file() {
+                return Err(WalkerError::UnknownPath(path.display().to_string()));
+            }
+            Ok(file)
+        }
     }
 
     /// Least available bytes among allowlisted roots (`df`).
@@ -492,9 +541,8 @@ fn statvfs_available(path: &Path) -> Result<u64, WalkerError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            WalkerError::UnknownPath(path.display().to_string())
-        })?;
+        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| WalkerError::UnknownPath(path.display().to_string()))?;
         let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         let rc = unsafe { libc::statvfs(cstr.as_ptr(), vfs.as_mut_ptr()) };
         if rc != 0 {
@@ -657,6 +705,46 @@ mod tests {
         );
         assert!(allowlist.resolve(&outside.join("secret.bin")).is_err());
         assert!(allowlist.resolve(&allowed.join("escape")).is_err());
+
+        // A client-crafted RemoteRef through the symlink dir must not Stat or
+        // GetRange the escaped file that list() never showed.
+        let crafted = RemoteRef::from_wire_parts("in".into(), PathBuf::from("escape/secret.bin"))
+            .expect("wire shape is relative");
+        assert!(
+            matches!(allowlist.entry(&crafted), Err(WalkerError::UnknownPath(_))),
+            "Stat must not follow an intermediate directory symlink"
+        );
+        assert!(
+            matches!(allowlist.open(&crafted), Err(WalkerError::UnknownPath(_))),
+            "GetRange must not follow an intermediate directory symlink"
+        );
+    }
+
+    #[test]
+    fn symlink_file_is_not_opened_as_the_target() {
+        let tmp = TempTree::new();
+        let allowed = tmp.path.join("allowed");
+        let outside = tmp.path.join("outside");
+        write_file(&allowed.join("ok.bin"), b"ok");
+        write_file(&outside.join("secret.bin"), b"escaped");
+
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("in", allowed.clone()).expect("root");
+        let listed = allowlist.list().expect("list");
+        assert_eq!(listed.len(), 1);
+        let remote = listed[0].r#ref().clone();
+        assert!(allowlist.entry(&remote).is_ok());
+        assert!(allowlist.open(&remote).is_ok());
+
+        fs::remove_file(allowed.join("ok.bin")).expect("remove");
+        std::os::unix::fs::symlink(outside.join("secret.bin"), allowed.join("ok.bin"))
+            .expect("file symlink");
+
+        assert!(matches!(
+            allowlist.entry(&remote),
+            Err(WalkerError::UnknownPath(_))
+        ));
+        assert!(allowlist.open(&remote).is_err());
     }
 
     #[test]

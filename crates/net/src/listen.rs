@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use http::Uri;
 use hyper_util::rt::TokioIo;
@@ -27,18 +28,7 @@ pub async fn serve_tcp(
     let incoming = TcpListenerStream::new(listener)
         .then(move |item| {
             let acceptor = acceptor.clone();
-            async move {
-                match item {
-                    Ok(stream) => match acceptor.accept(stream).await {
-                        Ok(tls) => Some(Ok(tls)),
-                        Err(err) => {
-                            tracing::warn!(error = %err, "tls handshake failed");
-                            None
-                        }
-                    },
-                    Err(err) => Some(Err(err)),
-                }
-            }
+            async move { handshake_incoming(item, acceptor).await }
         })
         .filter_map(|item| item);
     serve_incoming(incoming, seedbox).await
@@ -53,21 +43,38 @@ pub async fn serve_unix(
     let incoming = UnixListenerStream::new(listener)
         .then(move |item| {
             let acceptor = acceptor.clone();
-            async move {
-                match item {
-                    Ok(stream) => match acceptor.accept(stream).await {
-                        Ok(tls) => Some(Ok(tls)),
-                        Err(err) => {
-                            tracing::warn!(error = %err, "tls handshake failed");
-                            None
-                        }
-                    },
-                    Err(err) => Some(Err(err)),
-                }
-            }
+            async move { handshake_incoming(item, acceptor).await }
         })
         .filter_map(|item| item);
     serve_incoming(incoming, seedbox).await
+}
+
+async fn handshake_incoming<S>(
+    item: std::io::Result<S>,
+    acceptor: TlsAcceptor,
+) -> Option<std::io::Result<tokio_rustls::server::TlsStream<S>>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match item {
+        Ok(stream) => {
+            match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => Some(Ok(tls)),
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "tls handshake failed");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!("tls handshake timed out");
+                    None
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "accept failed");
+            None
+        }
+    }
 }
 
 async fn serve_incoming<S, E>(
@@ -75,20 +82,30 @@ async fn serve_incoming<S, E>(
     seedbox: Seedbox,
 ) -> Result<(), NetError>
 where
-    S: tonic::transport::server::Connected + tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    S: tonic::transport::server::Connected
+        + tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + Send
+        + Unpin
+        + 'static,
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     Server::builder()
         .add_service(mediaops_proto::control_server::ControlServer::new(
             seedbox.clone(),
         ))
-        .add_service(mediaops_proto::transfer_server::TransferServer::new(seedbox))
+        .add_service(mediaops_proto::transfer_server::TransferServer::new(
+            seedbox,
+        ))
         .serve_with_incoming(incoming)
         .await
         .map_err(|err| NetError::Serve(err.to_string()))
 }
 
-pub async fn connect_tcp(addr: std::net::SocketAddr, client: Arc<ClientConfig>) -> Result<Channel, NetError> {
+pub async fn connect_tcp(
+    addr: std::net::SocketAddr,
+    client: Arc<ClientConfig>,
+) -> Result<Channel, NetError> {
     let connector = TlsConnector::from(client);
     let name = ServerName::try_from(SERVER_NAME).map_err(|err| NetError::Tls(err.to_string()))?;
     let svc = service_fn(move |_uri: Uri| {
@@ -103,6 +120,8 @@ pub async fn connect_tcp(addr: std::net::SocketAddr, client: Arc<ClientConfig>) 
     });
     Endpoint::from_shared("http://localhost")
         .map_err(|err| NetError::Connect(err.to_string()))?
+        .connect_timeout(Duration::from_secs(10))
+        .concurrency_limit(1)
         .connect_with_connector(svc)
         .await
         .map_err(|err| NetError::Connect(err.to_string()))
@@ -124,6 +143,8 @@ pub async fn connect_unix(path: &Path, client: Arc<ClientConfig>) -> Result<Chan
     });
     Endpoint::from_shared("http://localhost")
         .map_err(|err| NetError::Connect(err.to_string()))?
+        .connect_timeout(Duration::from_secs(10))
+        .concurrency_limit(1)
         .connect_with_connector(svc)
         .await
         .map_err(|err| NetError::Connect(err.to_string()))

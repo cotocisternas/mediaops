@@ -1,16 +1,18 @@
 //! N independent channels; one in-flight stream per slot (AD-12).
 
-use tokio::sync::{Mutex, MutexGuard};
+use std::sync::Arc;
+
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tonic::transport::Channel;
 
 use crate::NetError;
 
 pub struct ChannelPool {
-    slots: Vec<Mutex<Channel>>,
+    slots: Vec<Arc<Mutex<Channel>>>,
 }
 
-pub struct SlotGuard<'a> {
-    guard: MutexGuard<'a, Channel>,
+pub struct SlotGuard {
+    guard: OwnedMutexGuard<Channel>,
 }
 
 impl ChannelPool {
@@ -19,7 +21,10 @@ impl ChannelPool {
             return Err(NetError::Pool("channel pool requires N >= 1".into()));
         }
         Ok(Self {
-            slots: channels.into_iter().map(Mutex::new).collect(),
+            slots: channels
+                .into_iter()
+                .map(|ch| Arc::new(Mutex::new(ch)))
+                .collect(),
         })
     }
 
@@ -32,9 +37,9 @@ impl ChannelPool {
     }
 
     /// One in-flight checkout per slot. N+1 is exhausted, never queued onto a shared channel.
-    pub fn try_checkout(&self) -> Result<SlotGuard<'_>, NetError> {
+    pub fn try_checkout(&self) -> Result<SlotGuard, NetError> {
         for slot in &self.slots {
-            if let Ok(guard) = slot.try_lock() {
+            if let Ok(guard) = slot.clone().try_lock_owned() {
                 return Ok(SlotGuard { guard });
             }
         }
@@ -42,7 +47,7 @@ impl ChannelPool {
     }
 }
 
-impl SlotGuard<'_> {
+impl SlotGuard {
     pub fn channel(&self) -> &Channel {
         &self.guard
     }

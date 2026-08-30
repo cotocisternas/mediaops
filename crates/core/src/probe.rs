@@ -1,10 +1,11 @@
 //! Range-concurrency probe types. Persistence lives in `store`; hashing is pure.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnderlayMode {
     Direct,
     Tailscale,
+    #[serde(rename = "wireguard", alias = "wire_guard")]
     WireGuard,
 }
 
@@ -21,7 +22,7 @@ impl UnderlayMode {
         match name {
             "direct" => Ok(Self::Direct),
             "tailscale" => Ok(Self::Tailscale),
-            "wireguard" => Ok(Self::WireGuard),
+            "wireguard" | "wire_guard" => Ok(Self::WireGuard),
             other => Err(ProbeError::UnknownUnderlay(other.to_string())),
         }
     }
@@ -96,5 +97,32 @@ mod tests {
     fn plateau_picks_last_meaningful_gain() {
         let n = plateau_n(&[(1, 10), (2, 20), (3, 21), (4, 21)]).expect("samples");
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn wireguard_toml_tag_is_wireguard() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct Wrap {
+            underlay: UnderlayMode,
+        }
+        let parsed: Wrap = toml::from_str("underlay = \"wireguard\"").expect("deserialize");
+        assert_eq!(parsed.underlay, UnderlayMode::WireGuard);
+        assert_eq!(parsed.underlay.as_str(), "wireguard");
+        assert_eq!(
+            UnderlayMode::parse("wire_guard").expect("alias"),
+            UnderlayMode::WireGuard
+        );
+        let encoded = toml::to_string(&parsed).expect("serialize");
+        assert!(encoded.contains("wireguard"), "{encoded}");
+        assert!(!encoded.contains("wire_guard"), "{encoded}");
+        let fp = endpoint_fingerprint("seedbox.example:50051", UnderlayMode::WireGuard);
+        assert_eq!(
+            fp,
+            endpoint_fingerprint(
+                "seedbox.example:50051",
+                UnderlayMode::parse("wireguard").expect("parse")
+            )
+        );
+        assert_eq!(fp.len(), 64);
     }
 }

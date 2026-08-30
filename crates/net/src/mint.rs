@@ -1,7 +1,8 @@
 //! TLS identity minting (AD-14). ECDSA P-256 CA + server + client.
 
-use std::fs;
-use std::path::Path;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mediaops_core::TlsIdentity;
@@ -103,21 +104,17 @@ pub fn mint() -> Result<IdentityBundle, NetError> {
 
 impl IdentityBundle {
     pub fn write_to_dir(&self, dir: &Path) -> Result<TlsIdentity, NetError> {
-        fs::create_dir_all(dir).map_err(|err| NetError::Io(err.to_string()))?;
+        create_tls_dir(dir)?;
         let ca_path = dir.join("ca.pem");
         let server_cert_path = dir.join("server.pem");
         let server_key_path = dir.join("server.key");
         let client_cert_path = dir.join("client.pem");
         let client_key_path = dir.join("client.key");
-        fs::write(&ca_path, &self.ca_pem).map_err(|err| NetError::Io(err.to_string()))?;
-        fs::write(&server_cert_path, &self.server_cert_pem)
-            .map_err(|err| NetError::Io(err.to_string()))?;
-        fs::write(&server_key_path, &self.server_key_pem)
-            .map_err(|err| NetError::Io(err.to_string()))?;
-        fs::write(&client_cert_path, &self.client_cert_pem)
-            .map_err(|err| NetError::Io(err.to_string()))?;
-        fs::write(&client_key_path, &self.client_key_pem)
-            .map_err(|err| NetError::Io(err.to_string()))?;
+        write_atomic(&ca_path, &self.ca_pem, false)?;
+        write_atomic(&server_cert_path, &self.server_cert_pem, false)?;
+        write_atomic(&server_key_path, &self.server_key_pem, true)?;
+        write_atomic(&client_cert_path, &self.client_cert_pem, false)?;
+        write_atomic(&client_key_path, &self.client_key_pem, true)?;
         Ok(TlsIdentity {
             ca_path: path_string(&ca_path),
             server_cert_path: path_string(&server_cert_path),
@@ -131,19 +128,23 @@ impl IdentityBundle {
     }
 
     pub fn from_dir(dir: &Path) -> Result<Self, NetError> {
-        let ca_pem = fs::read_to_string(dir.join("ca.pem")).map_err(|err| NetError::Io(err.to_string()))?;
-        let server_cert_pem =
-            fs::read_to_string(dir.join("server.pem")).map_err(|err| NetError::Io(err.to_string()))?;
-        let server_key_pem =
-            fs::read_to_string(dir.join("server.key")).map_err(|err| NetError::Io(err.to_string()))?;
-        let client_cert_pem =
-            fs::read_to_string(dir.join("client.pem")).map_err(|err| NetError::Io(err.to_string()))?;
-        let client_key_pem =
-            fs::read_to_string(dir.join("client.key")).map_err(|err| NetError::Io(err.to_string()))?;
+        let ca_pem =
+            fs::read_to_string(dir.join("ca.pem")).map_err(|err| NetError::Io(err.to_string()))?;
+        let server_cert_pem = fs::read_to_string(dir.join("server.pem"))
+            .map_err(|err| NetError::Io(err.to_string()))?;
+        let server_key_pem = fs::read_to_string(dir.join("server.key"))
+            .map_err(|err| NetError::Io(err.to_string()))?;
+        let client_cert_pem = read_optional_pem(&dir.join("client.pem"))?;
+        let client_key_pem = read_optional_pem(&dir.join("client.key"))?;
+        let client_sha256 = if client_cert_pem.is_empty() {
+            String::new()
+        } else {
+            sha256_hex(cert_der(&client_cert_pem)?.as_ref())
+        };
         Ok(Self {
             ca_sha256: sha256_hex(cert_der(&ca_pem)?.as_ref()),
             server_sha256: sha256_hex(cert_der(&server_cert_pem)?.as_ref()),
-            client_sha256: sha256_hex(cert_der(&client_cert_pem)?.as_ref()),
+            client_sha256,
             ca_pem,
             server_cert_pem,
             server_key_pem,
@@ -173,6 +174,11 @@ impl IdentityBundle {
 
     pub fn client_config(&self) -> Result<Arc<ClientConfig>, NetError> {
         ensure_crypto_provider();
+        if self.client_cert_pem.is_empty() || self.client_key_pem.is_empty() {
+            return Err(NetError::Tls(
+                "client certificate and key are required".into(),
+            ));
+        }
         let mut roots = RootCertStore::empty();
         roots
             .add(cert_der(&self.ca_pem)?)
@@ -185,6 +191,58 @@ impl IdentityBundle {
             .map_err(|err| NetError::Tls(err.to_string()))?;
         config.alpn_protocols = vec![b"h2".to_vec()];
         Ok(Arc::new(config))
+    }
+}
+
+fn create_tls_dir(dir: &Path) -> Result<(), NetError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(dir)
+            .map_err(|err| NetError::Io(err.to_string()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir).map_err(|err| NetError::Io(err.to_string()))
+    }
+}
+
+fn write_atomic(path: &Path, contents: &str, private_key: bool) -> Result<(), NetError> {
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    if tmp.exists() {
+        fs::remove_file(&tmp).map_err(|err| NetError::Io(err.to_string()))?;
+    }
+    {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if private_key {
+                opts.mode(0o600);
+            }
+        }
+        let mut file = opts
+            .open(&tmp)
+            .map_err(|err| NetError::Io(err.to_string()))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|err| NetError::Io(err.to_string()))?;
+        file.sync_all()
+            .map_err(|err| NetError::Io(err.to_string()))?;
+    }
+    fs::rename(&tmp, path).map_err(|err| NetError::Io(err.to_string()))
+}
+
+fn read_optional_pem(path: &Path) -> Result<String, NetError> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(NetError::Io(err.to_string())),
     }
 }
 

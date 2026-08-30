@@ -156,7 +156,7 @@ fn seedbox_bootstrap_without_yes_is_policy_refusal() {
     ));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let ssh = dir.join("ssh_config");
-    std::fs::write(&ssh, "Host seedbox\n  HostName example\n  User x\n").expect("ssh");
+    std::fs::write(&ssh, "Host seedbox\n  HostName 127.0.0.1\n  User x\n").expect("ssh");
     let ds = dir.join("desired-state.toml");
     std::fs::write(
         &ds,
@@ -181,11 +181,97 @@ fn seedbox_bootstrap_without_yes_is_policy_refusal() {
         ])
         .output()
         .expect("run bootstrap plan");
+    assert!(
+        !dir.join("tls").exists(),
+        "without --yes must not create tls/"
+    );
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output.status.code(), Some(5));
     let value = stdout_json(&output);
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "policy_refusal");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    let steps = value["data"]["steps"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    let haystack = format!("{message} {steps}");
+    assert!(
+        haystack.contains("mint") && haystack.contains("tls") && haystack.contains("fingerprint"),
+        "plan must mention mint/tls/fingerprint, got {haystack}"
+    );
+    assert_eq!(value["data"]["applied"], false);
+    assert!(
+        value["data"]["steps"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0)
+            > 0,
+        "NeedsConfirm JSON must include BootstrapReport steps in data"
+    );
+    let stdout = String::from_utf8(output.stdout.clone()).expect("utf8");
+    assert_eq!(
+        stdout.trim().lines().count(),
+        1,
+        "must not double-emit envelopes: {stdout}"
+    );
+}
+
+#[test]
+fn seedbox_bootstrap_git_work_tree_is_policy_refusal() {
+    let dir = std::env::temp_dir().join(format!(
+        "mediaops-cli-git-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join(".git")).expect("mkdir");
+    let ssh = dir.join("ssh_config");
+    std::fs::write(&ssh, "Host seedbox\n  HostName 127.0.0.1\n  User x\n").expect("ssh");
+    let ds = dir.join("desired-state.toml");
+    std::fs::write(
+        &ds,
+        "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 1\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
+    )
+    .expect("ds");
+    let output = bin()
+        .args([
+            "--json",
+            "seedbox",
+            "bootstrap",
+            "--provider",
+            "already-there",
+            "--yes",
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--desired-state",
+            ds.to_str().unwrap(),
+            "--ssh-config",
+            ssh.to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+            "--skip-probe",
+        ])
+        .output()
+        .expect("run bootstrap git");
+    assert!(
+        !dir.join("tls").join("ca.pem").exists(),
+        "git work tree must refuse before mint"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("git"), "got {message}");
 }
 
 #[test]

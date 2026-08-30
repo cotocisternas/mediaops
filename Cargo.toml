@@ -45,12 +45,12 @@ cargo_metadata = "=0.23.1"
 directories = "=6.0.0"
 fs4 = "=1.1.0"
 sha2 = "=0.10.9"
-libc = "0.2"
-tokio-stream = "0.1"
-tower = "0.5"
-http = "1"
-hyper-util = "0.1"
-rustls-pki-types = "1"
+libc = "=0.2.189"
+tokio-stream = { version = "=0.1.19", default-features = false }
+tower = { version = "=0.5.3", default-features = false }
+http = { version = "=1.5.0", default-features = false }
+hyper-util = { version = "=0.1.20", default-features = false }
+rustls-pki-types = "=1.15.1"
 
 mediaops-core = { path = "crates/core" }
 mediaops-proto = { path = "crates/proto" }

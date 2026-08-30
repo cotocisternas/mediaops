@@ -1,13 +1,17 @@
+use std::fs::File;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    DesiredState, Envelope, ExitCode, Probe, ProviderKind, endpoint_fingerprint, upsert_tls_table,
+    DesiredState, Envelope, EnvelopeError, ExecPort, ExitCode, Probe, ProviderKind, TlsIdentity,
+    endpoint_fingerprint, upsert_tls_table,
 };
 use mediaops_ssh::{
-    SystemExec, install_provider, parse_ssh_config, refuse_git_work_tree, systemd_user_unit,
+    SshHost, install_provider, musl_binary_path, parse_ssh_config, refuse_git_work_tree,
+    systemd_user_unit,
 };
 use mediaops_store::Store;
-use mediaops_transfer::mint;
+use mediaops_transfer::{IdentityBundle, mint, probe_range_n};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -18,8 +22,9 @@ pub struct BootstrapArgs {
     pub desired_state: PathBuf,
     pub ssh_config: PathBuf,
     pub state_db: PathBuf,
-    pub address: String,
+    pub address: Option<String>,
     pub skip_probe: bool,
+    pub roots: Vec<(String, PathBuf)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,10 +37,23 @@ pub struct BootstrapReport {
     pub applied: bool,
 }
 
-pub fn plan_steps(args: &BootstrapArgs) -> Vec<String> {
+pub fn parse_root(raw: &str) -> Result<(String, PathBuf), String> {
+    let (id, path) = raw
+        .split_once('=')
+        .ok_or_else(|| "expected id=path".to_string())?;
+    if id.is_empty() {
+        return Err("empty root id".into());
+    }
+    Ok((id.to_string(), PathBuf::from(path)))
+}
+
+pub fn plan_steps(args: &BootstrapArgs, address: &str) -> Vec<String> {
     let mut steps = vec![
         format!("import ssh Host seedbox from {}", args.ssh_config.display()),
-        format!("mint ECDSA P-256 certs into {}", args.config_dir.join("tls").display()),
+        format!(
+            "mint ECDSA P-256 certs into {}",
+            args.config_dir.join("tls").display()
+        ),
         format!("write fingerprints into {}", args.desired_state.display()),
     ];
     match args.provider {
@@ -49,97 +67,147 @@ pub fn plan_steps(args: &BootstrapArgs) -> Vec<String> {
     if args.skip_probe {
         steps.push("skip range probe".into());
     } else {
-        steps.push(format!("probe Range concurrency at {}", args.address));
+        steps.push(format!("probe Range concurrency at {address}"));
     }
     steps
 }
 
-pub async fn bootstrap(args: BootstrapArgs) -> Result<BootstrapReport, BootstrapError> {
+pub async fn bootstrap(
+    args: BootstrapArgs,
+    exec: &impl ExecPort,
+) -> Result<BootstrapReport, BootstrapError> {
     args.provider
         .ensure_installable()
         .map_err(BootstrapError::Provider)?;
-    let ssh_text =
-        std::fs::read_to_string(&args.ssh_config).map_err(|err| BootstrapError::Io(err.to_string()))?;
-    let host = parse_ssh_config(&ssh_text, "seedbox").map_err(|err| BootstrapError::Ssh(err.to_string()))?;
+    if args.provider == ProviderKind::SwizzinBox && args.roots.is_empty() {
+        return Err(BootstrapError::Usage(
+            "swizzin-box bootstrap requires at least one --root id=path".into(),
+        ));
+    }
+
+    std::fs::create_dir_all(&args.config_dir).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let lock_file = File::create(args.config_dir.join("bootstrap.lock"))
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    match fs4::FileExt::try_lock(&lock_file) {
+        Ok(()) => {}
+        Err(fs4::TryLockError::WouldBlock) => return Err(BootstrapError::LockConflict),
+        Err(err) => return Err(BootstrapError::Io(err.to_string())),
+    }
+
+    let ssh_text = std::fs::read_to_string(&args.ssh_config)
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let host = parse_ssh_config(&ssh_text, "seedbox").map_err(BootstrapError::from_ssh)?;
     let tls_dir = args.config_dir.join("tls");
     refuse_git_work_tree(&args.config_dir)
         .and_then(|_| refuse_git_work_tree(&tls_dir))
-        .map_err(|err| BootstrapError::Ssh(err.to_string()))?;
+        .map_err(BootstrapError::from_ssh)?;
 
-    let steps = plan_steps(&args);
+    let address = resolve_grpc_address(args.address.as_deref(), &host)?;
+    let steps = plan_steps(&args, &address);
+    let underlay_for_plan = std::fs::read_to_string(&args.desired_state)
+        .ok()
+        .and_then(|text| DesiredState::from_toml(&text).ok())
+        .map(|ds| ds.underlay())
+        .unwrap_or_default();
     if !args.yes {
         return Err(BootstrapError::NeedsConfirm(BootstrapReport {
             provider: args.provider.as_str().to_string(),
             host_alias: host.alias,
-            endpoint_fingerprint: endpoint_fingerprint(&args.address, DesiredState::from_toml(
-                &std::fs::read_to_string(&args.desired_state).unwrap_or_default(),
-            )
-            .map(|ds| ds.underlay())
-            .unwrap_or_default()),
+            endpoint_fingerprint: endpoint_fingerprint(&address, underlay_for_plan),
             range_concurrency: 0,
             steps,
             applied: false,
         }));
     }
 
-    let toml_text =
-        std::fs::read_to_string(&args.desired_state).map_err(|err| BootstrapError::Io(err.to_string()))?;
-    let ds = DesiredState::from_toml(&toml_text).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let toml_text = std::fs::read_to_string(&args.desired_state)
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let ds =
+        DesiredState::from_toml(&toml_text).map_err(|err| BootstrapError::Io(err.to_string()))?;
     let underlay = ds.underlay();
-    let fingerprint = endpoint_fingerprint(&args.address, underlay);
+    let fingerprint = endpoint_fingerprint(&address, underlay);
 
-    let bundle = mint().map_err(|err| BootstrapError::Io(err.to_string()))?;
-    let tls = bundle
-        .write_to_dir(&tls_dir)
-        .map_err(|err| BootstrapError::Io(err.to_string()))?;
-    let updated = upsert_tls_table(&toml_text, &tls).map_err(|err| BootstrapError::Io(err.to_string()))?;
-    if updated.contains("BEGIN ") {
-        return Err(BootstrapError::Io(
-            "desired-state grew a PEM body; refusing to write".into(),
-        ));
-    }
-    std::fs::write(&args.desired_state, updated).map_err(|err| BootstrapError::Io(err.to_string()))?;
-
-    let unit = systemd_user_unit("mediaopsd serve --role seedbox");
-    let unit_path = args.config_dir.join("mediaopsd.service");
-    let fake_bin = args.config_dir.join("mediaopsd");
-    install_provider(&SystemExec, args.provider, &fake_bin, &unit, &unit_path)
+    let store = Store::open(&args.state_db)
         .await
-        .map_err(|err| BootstrapError::Ssh(err.to_string()))?;
-
-    let store = Store::open(&args.state_db).map_err(|err| BootstrapError::Io(err.to_string()))?;
-    let n = if args.skip_probe {
-        store
-            .get_probe(&fingerprint)
-            .map_err(|err| BootstrapError::Io(err.to_string()))?
-            .map(|p| p.range_concurrency)
-            .unwrap_or(1)
-    } else if let Some(existing) = store
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let existing = store
         .get_probe(&fingerprint)
-        .map_err(|err| BootstrapError::Io(err.to_string()))?
-    {
-        existing.range_concurrency
-    } else {
-        let n = mediaops_transfer::probe_range_n(
-            args.address
-                .parse()
-                .map_err(|err| BootstrapError::Io(format!("{err}")))?,
-            bundle
-                .client_config()
-                .map_err(|err| BootstrapError::Io(err.to_string()))?,
-            4,
-        )
         .await
         .map_err(|err| BootstrapError::Io(err.to_string()))?;
-        store
-            .put_probe(&Probe {
-                endpoint_fingerprint: fingerprint.clone(),
-                range_concurrency: n,
-            })
-            .map_err(|err| BootstrapError::Io(err.to_string()))?;
-        n
+    let probe_plan = if args.skip_probe {
+        match existing {
+            Some(probe) => ProbePlan::Reuse(probe.range_concurrency),
+            None => {
+                return Err(BootstrapError::Io(
+                    "--skip-probe requires an existing probes row for this endpoint".into(),
+                ));
+            }
+        }
+    } else {
+        match existing {
+            Some(probe) => ProbePlan::Reuse(probe.range_concurrency),
+            None => ProbePlan::Sweep,
+        }
     };
 
+    let reuse_tls = tls_bundle_on_disk(&tls_dir);
+    let bundle = if reuse_tls {
+        IdentityBundle::from_dir(&tls_dir).map_err(|err| BootstrapError::Io(err.to_string()))?
+    } else {
+        let bundle = mint().map_err(|err| BootstrapError::Io(err.to_string()))?;
+        bundle
+            .write_to_dir(&tls_dir)
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+        bundle
+    };
+    if !reuse_tls || ds.tls().is_none() {
+        let tls = tls_identity_from_bundle(&tls_dir, &bundle);
+        let updated = upsert_tls_table(&toml_text, &tls)
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+        if updated.contains("BEGIN ") {
+            return Err(BootstrapError::Io(
+                "desired-state grew a PEM body; refusing to write".into(),
+            ));
+        }
+        write_atomic(&args.desired_state, &updated)?;
+    }
+
+    let unit = systemd_user_unit(&seedbox_exec_start(&args.roots));
+    let unit_path = args.config_dir.join("mediaopsd.service");
+    install_provider(
+        exec,
+        args.provider,
+        &musl_binary_path(),
+        &unit,
+        &unit_path,
+        &tls_dir,
+        &args.ssh_config,
+    )
+    .await
+    .map_err(BootstrapError::from_ssh)?;
+
+    let n = match probe_plan {
+        ProbePlan::Reuse(n) => n,
+        ProbePlan::Sweep => {
+            let sock = resolve_socket_addr(&address)?;
+            let client = bundle
+                .client_config()
+                .map_err(|err| BootstrapError::Io(err.to_string()))?;
+            let n = probe_range_n(sock, client, 32)
+                .await
+                .map_err(|err| BootstrapError::Io(err.to_string()))?;
+            store
+                .put_probe(&Probe {
+                    endpoint_fingerprint: fingerprint.clone(),
+                    range_concurrency: n,
+                })
+                .await
+                .map_err(|err| BootstrapError::Io(err.to_string()))?;
+            n
+        }
+    };
+
+    drop(lock_file);
     Ok(BootstrapReport {
         provider: args.provider.as_str().to_string(),
         host_alias: host.alias,
@@ -150,19 +218,118 @@ pub async fn bootstrap(args: BootstrapArgs) -> Result<BootstrapReport, Bootstrap
     })
 }
 
+enum ProbePlan {
+    Reuse(u32),
+    Sweep,
+}
+
+fn tls_bundle_on_disk(dir: &Path) -> bool {
+    [
+        "ca.pem",
+        "server.pem",
+        "server.key",
+        "client.pem",
+        "client.key",
+    ]
+    .into_iter()
+    .all(|name| dir.join(name).is_file())
+}
+
+fn tls_identity_from_bundle(tls_dir: &Path, bundle: &IdentityBundle) -> TlsIdentity {
+    TlsIdentity {
+        ca_path: path_string(&tls_dir.join("ca.pem")),
+        server_cert_path: path_string(&tls_dir.join("server.pem")),
+        server_key_path: path_string(&tls_dir.join("server.key")),
+        client_cert_path: path_string(&tls_dir.join("client.pem")),
+        client_key_path: path_string(&tls_dir.join("client.key")),
+        ca_sha256: bundle.ca_sha256.clone(),
+        server_sha256: bundle.server_sha256.clone(),
+        client_sha256: bundle.client_sha256.clone(),
+    }
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn seedbox_exec_start(roots: &[(String, PathBuf)]) -> String {
+    let mut cmd = String::from(
+        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls",
+    );
+    for (id, path) in roots {
+        cmd.push_str(" --root ");
+        cmd.push_str(id);
+        cmd.push('=');
+        cmd.push_str(&path.display().to_string());
+    }
+    cmd
+}
+
+fn write_atomic(path: &Path, contents: &str) -> Result<(), BootstrapError> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("desired-state.toml");
+    let tmp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, contents).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    Ok(())
+}
+
+/// gRPC listen port is 50051; ssh `Port` (often 2097) is not the probe address.
+fn resolve_grpc_address(explicit: Option<&str>, host: &SshHost) -> Result<String, BootstrapError> {
+    if let Some(address) = explicit.filter(|a| !a.is_empty()) {
+        return Ok(address.to_string());
+    }
+    let hostname = host.hostname.as_deref().ok_or_else(|| {
+        BootstrapError::Usage("Host seedbox has no HostName; pass --address HOST:50051".into())
+    })?;
+    Ok(format!("{hostname}:50051"))
+}
+
+fn resolve_socket_addr(address: &str) -> Result<SocketAddr, BootstrapError> {
+    if let Ok(sock) = address.parse::<SocketAddr>() {
+        return Ok(sock);
+    }
+    address
+        .to_socket_addrs()
+        .map_err(|err| BootstrapError::Io(err.to_string()))?
+        .next()
+        .ok_or_else(|| BootstrapError::Io(format!("could not resolve {address}")))
+}
+
 #[derive(Debug)]
 pub enum BootstrapError {
     Provider(mediaops_core::ProviderError),
     Ssh(String),
     Io(String),
+    Usage(String),
+    Policy(String),
+    LockConflict,
     NeedsConfirm(BootstrapReport),
+}
+
+impl BootstrapError {
+    fn from_ssh(err: mediaops_ssh::SshError) -> Self {
+        match err {
+            mediaops_ssh::SshError::GitWorkTree(path) => {
+                Self::Policy(format!("refusing to mint TLS into a git work tree: {path}"))
+            }
+            other => Self::Ssh(other.to_string()),
+        }
+    }
 }
 
 impl std::fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Provider(err) => write!(f, "{err}"),
-            Self::Ssh(err) | Self::Io(err) => write!(f, "{err}"),
+            Self::Ssh(err) | Self::Io(err) | Self::Usage(err) | Self::Policy(err) => {
+                write!(f, "{err}")
+            }
+            Self::LockConflict => write!(f, "bootstrap lock is held by another process"),
             Self::NeedsConfirm(report) => write!(
                 f,
                 "refusing to run destructive bootstrap steps without --yes: {}",
@@ -175,8 +342,9 @@ impl std::fmt::Display for BootstrapError {
 impl BootstrapError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Self::Provider(_) => ExitCode::Usage,
-            Self::NeedsConfirm(_) => ExitCode::PolicyRefusal,
+            Self::Provider(_) | Self::Usage(_) => ExitCode::Usage,
+            Self::NeedsConfirm(_) | Self::Policy(_) => ExitCode::PolicyRefusal,
+            Self::LockConflict => ExitCode::LockConflict,
             Self::Ssh(_) | Self::Io(_) => ExitCode::Runtime,
         }
     }
@@ -196,6 +364,37 @@ pub fn render_report(json: bool, report: &BootstrapReport) -> Result<String, ser
     }
 }
 
+pub fn render_needs_confirm(
+    json: bool,
+    report: &BootstrapReport,
+) -> Result<String, serde_json::Error> {
+    if json {
+        let envelope = Envelope {
+            ok: false,
+            data: Some(report),
+            error: Some(EnvelopeError {
+                code: ExitCode::PolicyRefusal.error_code().to_string(),
+                message: format!(
+                    "refusing to run destructive bootstrap steps without --yes: {}",
+                    report.steps.join("; ")
+                ),
+            }),
+        };
+        serde_json::to_string(&envelope)
+    } else {
+        let mut out = format!(
+            "seedbox bootstrap planned host={} fingerprint={} N={}\n",
+            report.host_alias, report.endpoint_fingerprint, report.range_concurrency
+        );
+        for step in &report.steps {
+            out.push_str(step);
+            out.push('\n');
+        }
+        out.push_str("refusing to run destructive bootstrap steps without --yes");
+        Ok(out)
+    }
+}
+
 pub fn default_config_dir() -> PathBuf {
     directories::BaseDirs::new()
         .map(|b| b.config_dir().join("mediaops"))
@@ -204,7 +403,13 @@ pub fn default_config_dir() -> PathBuf {
 
 pub fn default_state_db() -> PathBuf {
     directories::BaseDirs::new()
-        .map(|b| b.data_local_dir().join("mediaops").join("state.db"))
+        .map(|b| {
+            b.state_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| b.home_dir().join(".local").join("state"))
+                .join("mediaops")
+                .join("state.db")
+        })
         .unwrap_or_else(|| PathBuf::from(".mediaops-state").join("state.db"))
 }
 
@@ -216,4 +421,207 @@ pub fn default_ssh_config() -> PathBuf {
 
 pub fn default_desired_state(config_dir: &Path) -> PathBuf {
     config_dir.join("desired-state.toml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mediaops_core::{Probe, UnderlayMode};
+    use mediaops_ssh::{TranscriptExec, musl_binary_path};
+
+    const DS: &str = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 1\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n";
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-boot-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn write_ssh(dir: &Path) -> PathBuf {
+        let ssh = dir.join("ssh_config");
+        std::fs::write(
+            &ssh,
+            "Host seedbox\n  HostName 127.0.0.1\n  User x\n  Port 2097\n",
+        )
+        .expect("ssh");
+        ssh
+    }
+
+    fn write_ds(dir: &Path) -> PathBuf {
+        let ds = dir.join("desired-state.toml");
+        if !ds.exists() {
+            std::fs::write(&ds, DS).expect("ds");
+        }
+        ds
+    }
+
+    fn args(dir: &Path, yes: bool, skip_probe: bool, provider: ProviderKind) -> BootstrapArgs {
+        BootstrapArgs {
+            provider,
+            yes,
+            config_dir: dir.to_path_buf(),
+            desired_state: write_ds(dir),
+            ssh_config: write_ssh(dir),
+            state_db: dir.join("state.db"),
+            address: None,
+            skip_probe,
+            roots: Vec::new(),
+        }
+    }
+
+    fn address_fp() -> String {
+        endpoint_fingerprint("127.0.0.1:50051", UnderlayMode::Direct)
+    }
+
+    async fn seed_probe(path: &Path, n: u32) {
+        let store = Store::open(path).await.expect("store");
+        store
+            .put_probe(&Probe {
+                endpoint_fingerprint: address_fp(),
+                range_concurrency: n,
+            })
+            .await
+            .expect("put");
+    }
+
+    #[tokio::test]
+    async fn yes_already_there_skip_probe_mints_once() {
+        let dir = scratch("yes-already");
+        seed_probe(&dir.join("state.db"), 8).await;
+        let exec = TranscriptExec::new();
+        let report = bootstrap(args(&dir, true, true, ProviderKind::AlreadyThere), &exec)
+            .await
+            .expect("apply");
+        assert!(report.applied);
+        assert_eq!(report.range_concurrency, 8);
+        let tls = dir.join("tls");
+        for name in [
+            "ca.pem",
+            "server.pem",
+            "server.key",
+            "client.pem",
+            "client.key",
+        ] {
+            assert!(tls.join(name).is_file(), "missing {name}");
+        }
+        let toml_text = std::fs::read_to_string(dir.join("desired-state.toml")).expect("ds");
+        assert!(!toml_text.contains("BEGIN "));
+        assert!(!toml_text.contains("-----BEGIN"));
+        let ds = DesiredState::from_toml(&toml_text).expect("parse");
+        let tls_id = ds.tls().expect("tls table");
+        for fp in [
+            &tls_id.ca_sha256,
+            &tls_id.server_sha256,
+            &tls_id.client_sha256,
+        ] {
+            assert_eq!(fp.len(), 64);
+            assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert!(exec.recorded().is_empty());
+        let ca = std::fs::read(tls.join("ca.pem")).expect("ca");
+        let exec2 = TranscriptExec::new();
+        let again = bootstrap(args(&dir, true, true, ProviderKind::AlreadyThere), &exec2)
+            .await
+            .expect("second");
+        assert!(again.applied);
+        assert_eq!(ca, std::fs::read(tls.join("ca.pem")).expect("ca2"));
+        let toml2 = std::fs::read_to_string(dir.join("desired-state.toml")).expect("ds2");
+        assert_eq!(toml_text, toml2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn skip_probe_without_row_errors() {
+        let dir = scratch("skip-missing");
+        let exec = TranscriptExec::new();
+        let err = bootstrap(args(&dir, true, true, ProviderKind::AlreadyThere), &exec)
+            .await
+            .expect_err("missing row");
+        assert!(err.to_string().contains("skip-probe"));
+        assert!(!dir.join("tls").join("ca.pem").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn git_work_tree_refuses_before_mint() {
+        let dir = scratch("git");
+        std::fs::create_dir_all(dir.join(".git")).expect("git");
+        let exec = TranscriptExec::new();
+        let err = bootstrap(args(&dir, true, true, ProviderKind::AlreadyThere), &exec)
+            .await
+            .expect_err("git");
+        assert_eq!(err.exit_code(), ExitCode::PolicyRefusal);
+        assert!(err.to_string().contains("git"));
+        assert!(!dir.join("tls").join("ca.pem").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn swizzin_scp_uses_musl_artifact_path() {
+        let dir = scratch("swizzin");
+        seed_probe(&dir.join("state.db"), 4).await;
+        let exec = TranscriptExec::new();
+        let mut boot = args(&dir, true, true, ProviderKind::SwizzinBox);
+        boot.roots = vec![("media".into(), PathBuf::from("/data/media"))];
+        let report = bootstrap(boot, &exec).await.expect("swizzin");
+        assert!(report.applied);
+        let calls = exec.recorded();
+        let musl = musl_binary_path();
+        let musl_s = musl.display().to_string();
+        assert!(
+            calls
+                .iter()
+                .any(|c| { c.program_name() == "scp" && c.args.iter().any(|a| a == &musl_s) }),
+            "expected musl path {musl_s} in scp, got {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a.contains("client.key")))
+        );
+        let unit = std::fs::read_to_string(dir.join("mediaopsd.service")).expect("unit");
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("--tls-dir"));
+        assert!(unit.contains("--bind 0.0.0.0:50051"));
+        assert!(unit.contains("--root media=/data/media"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn lock_conflict_is_exit_3() {
+        let dir = scratch("lock");
+        seed_probe(&dir.join("state.db"), 2).await;
+        let held = File::create(dir.join("bootstrap.lock")).expect("lock file");
+        fs4::FileExt::try_lock(&held).expect("hold");
+        let exec = TranscriptExec::new();
+        let err = bootstrap(args(&dir, true, true, ProviderKind::AlreadyThere), &exec)
+            .await
+            .expect_err("conflict");
+        assert!(matches!(err, BootstrapError::LockConflict));
+        assert_eq!(err.exit_code(), ExitCode::LockConflict);
+        assert!(!dir.join("tls").join("ca.pem").exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_state_db_is_xdg_state_not_share() {
+        let path = default_state_db();
+        let rendered = path.to_string_lossy();
+        assert!(
+            rendered.contains("/.local/state/") || rendered.ends_with("state.db"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("/.local/share/"),
+            "AD-7 is ~/.local/state not share: {rendered}"
+        );
+    }
 }

@@ -9,9 +9,9 @@ use mediaops_proto::transfer_server::Transfer;
 use mediaops_proto::{
     DeleteRemoteRequest, DeleteRemoteResponse, DfRequest, DfResponse, EdgeCheckRequest,
     EdgeCheckResponse, ErrorDetail, GetRangeRequest, GetRangeResponse, GrabApplyRequest,
-    GrabApplyResponse,     GuardPreviewRequest, GuardPreviewResponse, KeyDiscoveryRequest, KeyDiscoveryResponse,
-    ListRequest, ListResponse, PROTO_PACKAGE, RemoteEntry as WireEntry, StatRequest, StatResponse,
-    UnmonitorRequest, UnmonitorResponse, status_from_error_detail,
+    GrabApplyResponse, GuardPreviewRequest, GuardPreviewResponse, KeyDiscoveryRequest,
+    KeyDiscoveryResponse, ListRequest, ListResponse, PROTO_PACKAGE, RemoteEntry as WireEntry,
+    StatRequest, StatResponse, UnmonitorRequest, UnmonitorResponse, status_from_error_detail,
 };
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -51,6 +51,13 @@ fn status_from_convert(err: mediaops_proto::ConvertError) -> Status {
     }))
 }
 
+fn status_from_join(err: tokio::task::JoinError) -> Status {
+    status_from_error_detail(&ErrorDetail::from(ControlError {
+        exit_code: ExitCode::Runtime,
+        message: err.to_string(),
+    }))
+}
+
 fn unused(name: &str) -> Status {
     status_from_error_detail(&ErrorDetail::from(ControlError {
         exit_code: ExitCode::Runtime,
@@ -61,7 +68,11 @@ fn unused(name: &str) -> Status {
 #[tonic::async_trait]
 impl Control for Seedbox {
     async fn df(&self, _request: Request<DfRequest>) -> Result<Response<DfResponse>, Status> {
-        let free = self.allowlist.free_bytes().map_err(status_from_walker)?;
+        let allowlist = self.allowlist.clone();
+        let free = tokio::task::spawn_blocking(move || allowlist.free_bytes())
+            .await
+            .map_err(status_from_join)?
+            .map_err(status_from_walker)?;
         let (semver, proto_package) = self.handshake();
         Ok(Response::new(DfResponse {
             semver,
@@ -123,7 +134,11 @@ impl Control for Seedbox {
 #[tonic::async_trait]
 impl Transfer for Seedbox {
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let entries = self.allowlist.list().map_err(status_from_walker)?;
+        let allowlist = self.allowlist.clone();
+        let entries = tokio::task::spawn_blocking(move || allowlist.list())
+            .await
+            .map_err(status_from_join)?
+            .map_err(status_from_walker)?;
         let wire = entries
             .iter()
             .map(WireEntry::try_from)
@@ -134,7 +149,11 @@ impl Transfer for Seedbox {
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
         let remote = RemoteRef::try_from(request.into_inner()).map_err(status_from_convert)?;
-        let entry = self.allowlist.entry(&remote).map_err(status_from_walker)?;
+        let allowlist = self.allowlist.clone();
+        let entry = tokio::task::spawn_blocking(move || allowlist.entry(&remote))
+            .await
+            .map_err(status_from_join)?
+            .map_err(status_from_walker)?;
         Ok(Response::new(StatResponse {
             entry: Some(WireEntry::try_from(&entry).map_err(status_from_convert)?),
         }))
@@ -156,19 +175,20 @@ impl Transfer for Seedbox {
             let mut file = allowlist.open(&remote).map_err(|err| err.to_string())?;
             file.seek(SeekFrom::Start(offset))
                 .map_err(|err| err.to_string())?;
-            let want = usize::try_from(len).unwrap_or(usize::MAX);
-            let mut buf = vec![0_u8; want];
-            let n = file.read(&mut buf).map_err(|err| err.to_string())?;
-            buf.truncate(n);
+            let remain = file
+                .metadata()
+                .map_err(|err| err.to_string())?
+                .len()
+                .saturating_sub(offset);
+            let want_u64 = len.min(remain).min(64 * 1024 * 1024);
+            let mut buf = Vec::new();
+            file.take(want_u64)
+                .read_to_end(&mut buf)
+                .map_err(|err| err.to_string())?;
             Ok(buf)
         })
         .await
-        .map_err(|err| {
-            status_from_error_detail(&ErrorDetail::from(ControlError {
-                exit_code: ExitCode::Runtime,
-                message: err.to_string(),
-            }))
-        })?
+        .map_err(status_from_join)?
         .map_err(|message| {
             status_from_error_detail(&ErrorDetail::from(ControlError {
                 exit_code: ExitCode::Runtime,
@@ -176,10 +196,15 @@ impl Transfer for Seedbox {
             }))
         })?;
 
-        let chunks = data.chunks(64 * 1024).map(|c| c.to_vec()).collect::<Vec<_>>();
-        let stream = tokio_stream::iter(chunks.into_iter().map(|bytes| {
-            Ok(GetRangeResponse { data: bytes.into() })
-        }));
+        let chunks = data
+            .chunks(64 * 1024)
+            .map(|c| c.to_vec())
+            .collect::<Vec<_>>();
+        let stream = tokio_stream::iter(
+            chunks
+                .into_iter()
+                .map(|bytes| Ok(GetRangeResponse { data: bytes.into() })),
+        );
         Ok(Response::new(Box::pin(stream)))
     }
 }
