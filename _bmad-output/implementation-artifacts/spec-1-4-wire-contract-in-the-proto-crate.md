@@ -82,6 +82,13 @@ Read-only evidence: epic-1-context Wire paragraph; AD-3, AD-4 (no Plan RPC; Skip
 - Given `core::ControlPort`, when the canonical impl is used, then it lives in proto over generated clients, and adding a field inside `mediaops.v1` remains the evolution rule (no new package).
 - Given default-feature tests, when they run, then they pass offline, binaries still match the 1.1 CLI matrix, core has no tonic/tokio, and neither binary links proto yet.
 
+### Review Findings
+
+- [x] [Review][Patch] ADV-8 walker skips `crates/arch-tests`, not only `crates/proto` [crates/arch-tests/src/lib.rs:258]
+- [x] [Review][Patch] ADV-8 detector test only exercises fully-qualified `tonic::Status::` [crates/arch-tests/src/lib.rs:527]
+- [x] [Review][Patch] ADV-8 scan IO-failure path is never asserted [crates/arch-tests/src/lib.rs:261]
+- [x] [Review][Patch] `control_error_from_status` Runtime fallback has no test [crates/proto/src/lib.rs:252]
+
 ## Spec Change Log
 
 - 2026-08-30 — Review pass 1 (bad_spec): `DeleteRemoteResult DELETED = 0` made an omitted proto3 field mean successful unlink. Code Map and Design Notes now require `UNSPECIFIED = 0`, `DELETED = 1`, `SKIPPED_SEEDING = 2`, and `TryFrom` that rejects 0/unknown; nested `RemoteRef`/`RemoteEntry` fields are required at conversion. Avoids freezing a default-delete inside additive-only `mediaops.v1`. KEEP: repo-root `proto/mediaops.proto` + `tonic-prost-build` from `crates/proto`; field-for-field `RemoteRef`/`RemoteEntry` via `from_wire_parts`; `ErrorDetail` in `Status::details` with `Code::Unknown`; I/O-matrix tests in `mediaops-proto`; `ControlPort` in core / `ControlPortClient` in proto; no bin link to proto; ADV-8 Status scan; CI `protobuf-compiler`; `DfResponse.free_bytes` → `Bytes`; `TitleId::render` on Unmonitor; `DeleteRemoteOutcome {Deleted, SkippedSeeding}` in core.

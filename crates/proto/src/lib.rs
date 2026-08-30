@@ -478,6 +478,21 @@ mod tests {
     }
 
     #[test]
+    fn unparseable_status_maps_to_runtime_on_the_control_path() {
+        let err = control_error_from_status(tonic::Status::unknown("no details"));
+        assert_eq!(err.exit_code, ExitCode::Runtime);
+        assert_eq!(err.message, "no details");
+
+        let err = control_error_from_status(tonic::Status::with_details(
+            tonic::Code::Unknown,
+            "x",
+            tonic::codegen::Bytes::from_static(&[0xff, 0xff]),
+        ));
+        assert_eq!(err.exit_code, ExitCode::Runtime);
+        assert_eq!(err.message, "x");
+    }
+
+    #[test]
     fn bad_exit_code_does_not_map_to_a_default() {
         let detail = ErrorDetail {
             exit_code: 99,

@@ -196,45 +196,49 @@ pub fn core_io_violations(core_src: &std::path::Path) -> Vec<String> {
     found
 }
 
+// Needles are split so this crate's source does not match itself (ADV-8 walks us too).
 const STATUS_CONSTRUCTORS: &[&str] = &[
-    "Status::new(",
-    "Status::ok(",
-    "Status::cancelled(",
-    "Status::unknown(",
-    "Status::invalid_argument(",
-    "Status::deadline_exceeded(",
-    "Status::not_found(",
-    "Status::already_exists(",
-    "Status::permission_denied(",
-    "Status::resource_exhausted(",
-    "Status::failed_precondition(",
-    "Status::aborted(",
-    "Status::out_of_range(",
-    "Status::unimplemented(",
-    "Status::internal(",
-    "Status::unavailable(",
-    "Status::data_loss(",
-    "Status::unauthenticated(",
-    "Status::with_details",
-    "Status::with_metadata",
-    "Status::with_details_and_metadata",
-    "Status::from_error(",
-    "Status::try_from_error(",
-    "Status::from_header_map(",
-    "Status::from(",
+    concat!("Status::", "new("),
+    concat!("Status::", "ok("),
+    concat!("Status::", "cancelled("),
+    concat!("Status::", "unknown("),
+    concat!("Status::", "invalid_argument("),
+    concat!("Status::", "deadline_exceeded("),
+    concat!("Status::", "not_found("),
+    concat!("Status::", "already_exists("),
+    concat!("Status::", "permission_denied("),
+    concat!("Status::", "resource_exhausted("),
+    concat!("Status::", "failed_precondition("),
+    concat!("Status::", "aborted("),
+    concat!("Status::", "out_of_range("),
+    concat!("Status::", "unimplemented("),
+    concat!("Status::", "internal("),
+    concat!("Status::", "unavailable("),
+    concat!("Status::", "data_loss("),
+    concat!("Status::", "unauthenticated("),
+    concat!("Status::", "with_details"),
+    concat!("Status::", "with_metadata"),
+    concat!("Status::", "with_details_and_metadata"),
+    concat!("Status::", "from_error("),
+    concat!("Status::", "try_from_error("),
+    concat!("Status::", "from_header_map("),
+    concat!("Status::", "from("),
 ];
+const TONIC_STATUS_FQ: &str = concat!("tonic::", "Status::");
+const USE_TONIC_STATUS: &str = concat!("use tonic::", "Status");
+const USE_TONIC_BRACE: &str = concat!("use tonic::", "{");
 
 fn imports_tonic_status(source: &str) -> bool {
-    source.contains("use tonic::Status")
+    source.contains(USE_TONIC_STATUS)
         || source.lines().any(|line| {
             let line = line.trim();
-            line.starts_with("use tonic::{") && line.contains("Status")
+            line.starts_with(USE_TONIC_BRACE) && line.contains("Status")
         })
 }
 
 /// Whether `source` constructs a tonic Status (ADV-8).
 pub fn constructs_tonic_status(source: &str) -> bool {
-    source.contains("tonic::Status::")
+    source.contains(TONIC_STATUS_FQ)
         || (imports_tonic_status(source) && STATUS_CONSTRUCTORS.iter().any(|c| source.contains(c)))
 }
 
@@ -255,7 +259,6 @@ fn walk_status_violations(
     found: &mut Vec<String>,
 ) {
     let proto_root = workspace_root.join("crates/proto");
-    let arch_tests_root = workspace_root.join("crates/arch-tests");
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => {
@@ -273,10 +276,7 @@ fn walk_status_violations(
         };
         let path = entry.path();
         if path.is_dir() {
-            if path.file_name().and_then(|n| n.to_str()) == Some("target")
-                || path == proto_root
-                || path == arch_tests_root
-            {
+            if path.file_name().and_then(|n| n.to_str()) == Some("target") || path == proto_root {
                 continue;
             }
             walk_status_violations(&path, workspace_root, found);
@@ -528,16 +528,40 @@ mod tests {
         let tmp = scratch_dir("status");
         std::fs::write(
             tmp.join("evil.rs"),
-            "fn f() { let _ = tonic::Status::unknown(\"x\"); }\n",
+            concat!("fn f() { let _ = tonic::", "Status::unknown(\"x\"); }\n"),
         )
         .expect("write violation");
+        std::fs::write(
+            tmp.join("imported.rs"),
+            concat!(
+                "use tonic::",
+                "Status;\nfn f() { let _ = Status",
+                "::unknown(\"x\"); }\n"
+            ),
+        )
+        .expect("write imported violation");
         std::fs::write(tmp.join("ok.rs"), "fn f() { let _ = 1; }\n").expect("write ok");
         let mut found = Vec::new();
         walk_status_violations(&tmp, &tmp, &mut found);
         let _ = std::fs::remove_dir_all(&tmp);
 
-        assert_eq!(found.len(), 1, "got {found:?}");
-        assert!(found[0].contains("evil.rs"), "got {found:?}");
+        assert_eq!(found.len(), 2, "got {found:?}");
+        assert!(found.iter().any(|f| f.contains("evil.rs")), "got {found:?}");
+        assert!(
+            found.iter().any(|f| f.contains("imported.rs")),
+            "got {found:?}"
+        );
+    }
+
+    #[test]
+    fn status_scan_io_failure_is_a_violation() {
+        let missing = std::path::Path::new("/nonexistent/mediaops-archtest-status-scan");
+        let mut found = Vec::new();
+        walk_status_violations(missing, missing, &mut found);
+        assert!(
+            found.iter().any(|f| f.contains("cannot read")),
+            "got {found:?}"
+        );
     }
 
     #[test]
