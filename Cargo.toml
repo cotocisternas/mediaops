@@ -21,7 +21,7 @@ edition = "2024"
 rust-version = "1.98.0"
 
 [workspace.dependencies]
-tonic = "=0.14.6"
+tonic = { version = "=0.14.6", default-features = false }
 tonic-prost = "=0.14.6"
 tonic-prost-build = "=0.14.6"
 prost = "=0.14.4"

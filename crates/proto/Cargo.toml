@@ -6,3 +6,10 @@ rust-version.workspace = true
 
 [dependencies]
 mediaops-core.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tonic = { workspace = true, features = ["codegen", "transport"] }
+tonic-prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

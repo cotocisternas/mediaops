@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+package mediaops.v1;
+
+message RemoteRef {
+  string root_id = 1;
+  string rel_path = 2;
+}
+
+message RemoteEntry {
+  RemoteRef ref = 1;
+  uint64 len = 2;
+  int64 mtime = 3;
+  uint64 nlink = 4;
+}
+
+message ErrorDetail {
+  int32 exit_code = 1;
+  string reason = 2;
+  string message = 3;
+}
+
+service Transfer {
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc GetRange(GetRangeRequest) returns (stream GetRangeResponse);
+}
+
+message ListRequest {}
+
+message ListResponse {
+  repeated RemoteEntry entries = 1;
+}
+
+message StatRequest {
+  RemoteRef ref = 1;
+}
+
+message StatResponse {
+  RemoteEntry entry = 1;
+}
+
+message GetRangeRequest {
+  RemoteRef ref = 1;
+  uint64 offset = 2;
+  uint64 len = 3;
+}
+
+message GetRangeResponse {
+  bytes data = 1;
+}
+
+service Control {
+  rpc Df(DfRequest) returns (DfResponse);
+  rpc Unmonitor(UnmonitorRequest) returns (UnmonitorResponse);
+  rpc DeleteRemote(DeleteRemoteRequest) returns (DeleteRemoteResponse);
+  rpc GrabApply(GrabApplyRequest) returns (GrabApplyResponse);
+  rpc EdgeCheck(EdgeCheckRequest) returns (EdgeCheckResponse);
+  rpc KeyDiscovery(KeyDiscoveryRequest) returns (KeyDiscoveryResponse);
+  rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
+}
+
+message DfRequest {}
+
+message DfResponse {
+  string semver = 1;
+  string proto_package = 2;
+  uint64 free_bytes = 3;
+}
+
+message UnmonitorRequest {
+  string title_id = 1;
+}
+
+message UnmonitorResponse {
+  string semver = 1;
+  string proto_package = 2;
+}
+
+message DeleteRemoteRequest {
+  RemoteRef ref = 1;
+}
+
+enum DeleteRemoteResult {
+  DELETE_REMOTE_RESULT_UNSPECIFIED = 0;
+  DELETED = 1;
+  SKIPPED_SEEDING = 2;
+}
+
+message DeleteRemoteResponse {
+  string semver = 1;
+  string proto_package = 2;
+  DeleteRemoteResult result = 3;
+}
+
+message GrabApplyRequest {}
+
+message GrabApplyResponse {
+  string semver = 1;
+  string proto_package = 2;
+}
+
+message EdgeCheckRequest {}
+
+message EdgeCheckResponse {
+  string semver = 1;
+  string proto_package = 2;
+}
+
+message KeyDiscoveryRequest {}
+
+message KeyDiscoveryResponse {
+  string semver = 1;
+  string proto_package = 2;
+}
+
+message GuardPreviewRequest {}
+
+message GuardPreviewResponse {
+  string semver = 1;
+  string proto_package = 2;
+}

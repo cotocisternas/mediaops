@@ -4,9 +4,11 @@
 //! [`Plan`], and [`Action`] are also pure: no filesystem I/O. [`walker`] and [`install`]
 //! are the only modules permitted to touch the filesystem, and only through
 //! caller-supplied roots -- `crates/arch-tests` enforces that boundary the way
-//! it enforces AD-2. There is still no tokio runtime, no rusqlite, and no network.
+//! it enforces AD-2. [`ControlPort`] is a port (async signatures, no I/O types).
+//! There is still no tokio runtime, no tonic, no rusqlite, and no network.
 
 pub mod bytes;
+pub mod control_port;
 pub mod desired_state;
 pub mod install;
 pub mod pathschema;
@@ -15,6 +17,7 @@ pub mod title_id;
 pub mod walker;
 
 pub use bytes::Bytes;
+pub use control_port::{ControlError, ControlPort, DeleteRemoteOutcome};
 pub use desired_state::{DesiredState, DesiredStateError};
 pub use install::{
     InstallError, VerifiedConvertingHandle, VerifiedStagingHandle, install, replace,

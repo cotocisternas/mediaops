@@ -143,6 +143,8 @@ fn closure_contains(graph: &HashMap<String, Vec<String>>, start: &str, needle: &
 /// I/O)" law so they could use caller-supplied roots. That carve-out lived only
 /// in a doc comment, which meant any future `core` module could quietly widen
 /// it. This keeps it enforced, the same way AD-2 is.
+///
+/// `control_port.rs` is a port, not I/O, and stays off this list.
 pub const CORE_IO_MODULES: &[&str] = &["walker.rs", "install.rs"];
 
 /// Paths under `crates/core/src` that reference `std::fs` outside the carve-out.
@@ -192,6 +194,110 @@ pub fn core_io_violations(core_src: &std::path::Path) -> Vec<String> {
     }
     found.sort();
     found
+}
+
+const STATUS_CONSTRUCTORS: &[&str] = &[
+    "Status::new(",
+    "Status::ok(",
+    "Status::cancelled(",
+    "Status::unknown(",
+    "Status::invalid_argument(",
+    "Status::deadline_exceeded(",
+    "Status::not_found(",
+    "Status::already_exists(",
+    "Status::permission_denied(",
+    "Status::resource_exhausted(",
+    "Status::failed_precondition(",
+    "Status::aborted(",
+    "Status::out_of_range(",
+    "Status::unimplemented(",
+    "Status::internal(",
+    "Status::unavailable(",
+    "Status::data_loss(",
+    "Status::unauthenticated(",
+    "Status::with_details",
+    "Status::with_metadata",
+    "Status::with_details_and_metadata",
+    "Status::from_error(",
+    "Status::try_from_error(",
+    "Status::from_header_map(",
+    "Status::from(",
+];
+
+fn imports_tonic_status(source: &str) -> bool {
+    source.contains("use tonic::Status")
+        || source.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("use tonic::{") && line.contains("Status")
+        })
+}
+
+/// Whether `source` constructs a tonic Status (ADV-8).
+pub fn constructs_tonic_status(source: &str) -> bool {
+    source.contains("tonic::Status::")
+        || (imports_tonic_status(source) && STATUS_CONSTRUCTORS.iter().any(|c| source.contains(c)))
+}
+
+/// Workspace `.rs` files outside `crates/proto` that construct a tonic Status.
+pub fn status_construction_violations(workspace_root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for tree in ["crates", "bins"] {
+        let root = workspace_root.join(tree);
+        walk_status_violations(&root, workspace_root, &mut found);
+    }
+    found.sort();
+    found
+}
+
+fn walk_status_violations(
+    dir: &std::path::Path,
+    workspace_root: &std::path::Path,
+    found: &mut Vec<String>,
+) {
+    let proto_root = workspace_root.join("crates/proto");
+    let arch_tests_root = workspace_root.join("crates/arch-tests");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            found.push(format!("cannot read {}", dir.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                found.push(format!("cannot read entry in {}", dir.display()));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) == Some("target")
+                || path == proto_root
+                || path == arch_tests_root
+            {
+                continue;
+            }
+            walk_status_violations(&path, workspace_root, found);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(_) => {
+                let rel = path.strip_prefix(workspace_root).unwrap_or(&path);
+                found.push(format!("cannot read {}", rel.display()));
+                continue;
+            }
+        };
+        if constructs_tonic_status(&source) {
+            let rel = path.strip_prefix(workspace_root).unwrap_or(&path);
+            found.push(rel.display().to_string());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +507,37 @@ mod tests {
 
         assert_eq!(violations.len(), 1, "got {violations:?}");
         assert!(violations[0].starts_with("pathschema.rs"));
+    }
+
+    #[test]
+    fn tonic_status_is_constructed_only_in_proto() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .parent()
+            .expect("workspace root");
+        let violations = status_construction_violations(root);
+        assert!(
+            violations.is_empty(),
+            "tonic Status construction must live in crates/proto; found: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn status_construction_outside_proto_is_detected() {
+        let tmp = scratch_dir("status");
+        std::fs::write(
+            tmp.join("evil.rs"),
+            "fn f() { let _ = tonic::Status::unknown(\"x\"); }\n",
+        )
+        .expect("write violation");
+        std::fs::write(tmp.join("ok.rs"), "fn f() { let _ = 1; }\n").expect("write ok");
+        let mut found = Vec::new();
+        walk_status_violations(&tmp, &tmp, &mut found);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert!(found[0].contains("evil.rs"), "got {found:?}");
     }
 
     #[test]
