@@ -1,42 +1,48 @@
 //! Domain types for mediaops.
 //!
 //! [`TitleId`] and [`pathschema`] are pure functions. [`Bytes`], [`DesiredState`],
-//! [`Plan`], and [`Action`] are also pure: no filesystem I/O. [`walker`] and [`install`]
-//! are the only modules permitted to touch the filesystem, and only through
-//! caller-supplied roots -- `crates/arch-tests` enforces that boundary the way
-//! it enforces AD-2. [`ControlPort`] is a port (async signatures, no I/O types).
-//! [`ExecPort`] is the same kind of port for subprocesses. There is still no
-//! tokio runtime, no tonic, no rusqlite, and no network.
+//! [`Plan`], [`Action`], and [`jobs`] are also pure: no filesystem I/O. [`walker`]
+//! and [`install`] are the only modules permitted to touch the filesystem, and
+//! only through caller-supplied roots -- `crates/arch-tests` enforces that
+//! boundary the way it enforces AD-2. [`ControlPort`], [`ExecPort`],
+//! [`JobsRepo`], [`ProbeRepo`], and [`TitleIndexRepo`] are ports (async
+//! signatures, no I/O types). There is still no tokio runtime, no tonic, no
+//! rusqlite, and no network.
 
 pub mod bytes;
 pub mod control_port;
 pub mod desired_state;
 pub mod exec;
 pub mod install;
+pub mod jobs;
 pub mod pathschema;
 pub mod plan;
 pub mod probe;
 pub mod provider;
 pub mod title_id;
+pub mod title_index;
 pub mod walker;
 
 pub use bytes::Bytes;
 pub use control_port::{ControlError, ControlPort, DeleteRemoteOutcome};
-pub use desired_state::{
-    DesiredState, DesiredStateError, Grabber, TlsIdentity, upsert_tls_table,
-};
+pub use desired_state::{DesiredState, DesiredStateError, Grabber, TlsIdentity, upsert_tls_table};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};
 pub use install::{
     InstallError, VerifiedConvertingHandle, VerifiedStagingHandle, install, replace,
+};
+pub use jobs::{
+    EncodeEvent, EncodeState, HoldEvent, HoldState, Job, JobError, JobEvent, JobId, JobKind,
+    JobState, JobsRepo, PullEvent, PullState, WantEvent, WantState, advance, encode_ready,
 };
 pub use pathschema::{
     GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, parse, render, staging_path,
     strip_scene_tags,
 };
 pub use plan::{Action, Plan, PlanError};
-pub use probe::{Probe, ProbeError, UnderlayMode, endpoint_fingerprint, plateau_n};
+pub use probe::{Probe, ProbeError, ProbeRepo, UnderlayMode, endpoint_fingerprint, plateau_n};
 pub use provider::{ProviderError, ProviderKind, already_there_install};
 pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource};
+pub use title_index::{TitleIndexEntry, TitleIndexError, TitleIndexRepo};
 pub use walker::{Allowlist, RemoteEntry, RemoteRef, WalkerError};
 
 use std::process::{ExitCode as ProcessExitCode, Termination};

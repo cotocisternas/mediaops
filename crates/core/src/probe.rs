@@ -1,4 +1,5 @@
-//! Range-concurrency probe types. Persistence lives in `store`; hashing is pure.
+//! Range-concurrency probe types. Persistence lives in `store` behind
+//! [`ProbeRepo`]; hashing is pure.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +48,18 @@ pub fn endpoint_fingerprint(address: &str, underlay: UnderlayMode) -> String {
 pub struct Probe {
     pub endpoint_fingerprint: String,
     pub range_concurrency: u32,
+}
+
+/// Probes repository port (AD-8). Adapter lives in `store`.
+///
+/// A trait, not I/O: async signatures only. Bootstrap keeps calling the
+/// inherent `Store` methods; this trait is the type the composition root injects.
+#[allow(async_fn_in_trait)]
+pub trait ProbeRepo: Send + Sync {
+    type Error;
+
+    async fn get_probe(&self, fingerprint: &str) -> Result<Option<Probe>, Self::Error>;
+    async fn put_probe(&self, probe: &Probe) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
