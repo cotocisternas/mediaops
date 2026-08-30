@@ -1,15 +1,21 @@
 //! Domain types for mediaops.
 //!
-//! [`TitleId`] and [`pathschema`] are pure functions. [`walker`] and [`install`]
+//! [`TitleId`] and [`pathschema`] are pure functions. [`Bytes`], [`DesiredState`],
+//! [`Plan`], and [`Action`] are also pure: no filesystem I/O. [`walker`] and [`install`]
 //! are the only modules permitted to touch the filesystem, and only through
 //! caller-supplied roots -- `crates/arch-tests` enforces that boundary the way
-//! it enforces AD-2. There is still no tokio runtime and no network.
+//! it enforces AD-2. There is still no tokio runtime, no rusqlite, and no network.
 
+pub mod bytes;
+pub mod desired_state;
 pub mod install;
 pub mod pathschema;
+pub mod plan;
 pub mod title_id;
 pub mod walker;
 
+pub use bytes::Bytes;
+pub use desired_state::{DesiredState, DesiredStateError};
 pub use install::{
     InstallError, VerifiedConvertingHandle, VerifiedStagingHandle, install, replace,
 };
@@ -17,6 +23,7 @@ pub use pathschema::{
     GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, parse, render, staging_path,
     strip_scene_tags,
 };
+pub use plan::{Action, Plan, PlanError};
 pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource};
 pub use walker::{Allowlist, RemoteEntry, RemoteRef, WalkerError};
 
