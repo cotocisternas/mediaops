@@ -60,6 +60,36 @@ service Control {
   rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
 }
 
+// Home UDS only. Seedbox mediaopsd does not serve this.
+service Gateway {
+  rpc ConfigurePool(ConfigurePoolRequest) returns (ConfigurePoolResponse);
+  rpc PoolStatus(PoolStatusRequest) returns (PoolStatusResponse);
+  rpc ProbeRange(ProbeRangeRequest) returns (ProbeRangeResponse);
+}
+
+message ConfigurePoolRequest {
+  uint32 n = 1;
+}
+
+message ConfigurePoolResponse {
+  uint32 n = 1;
+}
+
+message PoolStatusRequest {}
+
+message PoolStatusResponse {
+  string endpoint_fingerprint = 1;
+  uint32 n = 2;
+}
+
+message ProbeRangeRequest {
+  uint32 max_n = 1;
+}
+
+message ProbeRangeResponse {
+  uint32 n = 1;
+}
+
 message DfRequest {}
 
 message DfResponse {

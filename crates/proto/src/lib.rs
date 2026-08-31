@@ -240,13 +240,30 @@ impl TryFrom<ErrorDetail> for ControlError {
     }
 }
 
+/// `ErrorDetail.reason` that maps to gRPC `ResourceExhausted` (AD-12 pool pin).
+pub const REASON_RESOURCE_EXHAUSTED: &str = "resource_exhausted";
+
 /// Pack a serialized [`ErrorDetail`] into `Status::details` (ADV-8 Construction A).
+///
+/// Pool exhaustion is the one case that is not `Code::Unknown`: it uses
+/// `ResourceExhausted` so a naive gateway cannot silently queue onto a shared
+/// channel. Every other domain error stays Unknown + details.
 pub fn status_from_error_detail(detail: &ErrorDetail) -> tonic::Status {
-    tonic::Status::with_details(
-        tonic::Code::Unknown,
-        detail.message.clone(),
-        detail.encode_to_vec().into(),
-    )
+    let code = if detail.reason == REASON_RESOURCE_EXHAUSTED {
+        tonic::Code::ResourceExhausted
+    } else {
+        tonic::Code::Unknown
+    };
+    tonic::Status::with_details(code, detail.message.clone(), detail.encode_to_vec().into())
+}
+
+/// Domain detail for a refused N+1th concurrent Range stream.
+pub fn resource_exhausted_detail(message: impl Into<String>) -> ErrorDetail {
+    ErrorDetail {
+        exit_code: i32::from(ExitCode::Runtime),
+        reason: REASON_RESOURCE_EXHAUSTED.to_string(),
+        message: message.into(),
+    }
 }
 
 /// Parse a serialized [`ErrorDetail`] from `Status::details`. Missing or unknown fail.
@@ -473,6 +490,17 @@ mod tests {
             assert_eq!(back.message, message);
             assert_eq!(back.exit_code.error_code(), detail.reason);
         }
+    }
+
+    #[test]
+    fn resource_exhausted_reason_is_the_grpc_code() {
+        let detail = resource_exhausted_detail("channel pool exhausted");
+        let status = status_from_error_detail(&detail);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(status.message(), "channel pool exhausted");
+        let parsed = error_detail_from_status(&status).expect("parse");
+        assert_eq!(parsed, detail);
+        assert_eq!(parsed.reason, REASON_RESOURCE_EXHAUSTED);
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! sqlite adapter (AD-8). Schema `user_version` 3: `probes` (v1), `title_index` /
-//! `jobs` (v2) with `jobs.title_id` (v3). `holds_decisions` waits on Epic 6.
+//! sqlite adapter (AD-8). Schema `user_version` 4: `probes` (v1), `title_index` /
+//! `jobs` (v2) with `jobs.title_id` (v3), `machine` kv (v4). `holds_decisions`
+//! waits on Epic 6.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,10 +12,11 @@ use mediaops_core::{
 use rusqlite::Connection;
 
 mod jobs;
+mod machine;
 mod probes;
 mod title_index;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const JOBS_DDL: &str = "CREATE TABLE jobs (
                 id INTEGER PRIMARY KEY NOT NULL,
@@ -144,6 +146,18 @@ impl Store {
         self.with(move |conn| jobs::advance_job(conn, id, event))
             .await
     }
+
+    pub async fn get_machine(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let key = key.to_string();
+        self.with(move |conn| machine::get(conn, &key)).await
+    }
+
+    pub async fn put_machine(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let key = key.to_string();
+        let value = value.to_string();
+        self.with(move |conn| machine::put(conn, &key, &value))
+            .await
+    }
 }
 
 impl ProbeRepo for Store {
@@ -251,8 +265,18 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 3 {
         ensure_jobs_title_id(conn)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        conn.pragma_update(None, "user_version", 3)
             .map_err(sqlite)?;
+    }
+    if version < 4 {
+        conn.execute_batch(
+            "CREATE TABLE machine (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+            PRAGMA user_version = 4;",
+        )
+        .map_err(sqlite)?;
     }
     Ok(())
 }
@@ -344,7 +368,7 @@ mod tests {
         let dir = scratch("future");
         let path = dir.join("state.db");
         let conn = Connection::open(&path).expect("raw");
-        conn.pragma_update(None, "user_version", 4)
+        conn.pragma_update(None, "user_version", 99)
             .expect("user_version");
         drop(conn);
         let err = Store::open(&path).await.expect_err("future schema");
@@ -365,11 +389,15 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         conn.query_row("SELECT COUNT(*) FROM title_index", [], |row| {
             row.get::<_, i64>(0)
         })
         .expect("title_index exists");
+        conn.query_row("SELECT COUNT(*) FROM machine", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("machine exists");
         conn.prepare("SELECT title_id FROM jobs")
             .expect("jobs.title_id exists");
         drop(conn);
@@ -404,7 +432,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -423,6 +451,22 @@ mod tests {
         drop(conn);
         let err = Store::open(&path).await.expect_err("blocked");
         assert!(err.to_string().contains("no title_id"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn machine_kv_round_trips() {
+        let dir = scratch("machine");
+        let store = Store::open(dir.join("state.db")).await.expect("open");
+        assert!(store.get_machine("library_root").await.expect("get").is_none());
+        store
+            .put_machine("library_root", "/data/media")
+            .await
+            .expect("put");
+        assert_eq!(
+            store.get_machine("library_root").await.expect("get").as_deref(),
+            Some("/data/media")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,11 +1,13 @@
 //! rustls identity, channel pool, UDS/TCP serve (AD-12, AD-14).
 
+mod gateway;
 mod listen;
 mod mint;
 mod pool;
 mod seedbox;
 
-pub use listen::{connect_tcp, connect_unix, serve_tcp, serve_unix};
+pub use gateway::HomeGateway;
+pub use listen::{connect_tcp, connect_unix, serve_home_unix, serve_tcp, serve_unix, tcp_connect_count};
 pub use mint::{IdentityBundle, SERVER_NAME, mint};
 pub use pool::{ChannelPool, SlotGuard};
 pub use seedbox::Seedbox;
@@ -64,7 +66,7 @@ impl DaemonRole {
     }
 }
 
-fn check_pool_n(n: usize) -> Result<(), NetError> {
+pub(crate) fn check_pool_n(n: usize) -> Result<(), NetError> {
     if n == 0 || n > 64 {
         Err(NetError::Pool(format!(
             "channel pool N must be 1..=64, got {n}"

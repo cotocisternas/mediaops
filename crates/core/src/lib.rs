@@ -30,7 +30,8 @@ pub use desired_state::{DesiredState, DesiredStateError, Grabber, TlsIdentity, u
 pub use digest::{Blake3Hex, DigestError};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};
 pub use install::{
-    InstallError, VerifiedConvertingHandle, VerifiedStagingHandle, install, replace,
+    InstallError, InstallOutcome, VerifiedConvertingHandle, VerifiedStagingHandle, free_bytes,
+    install, replace,
 };
 pub use jobs::{
     EncodeEvent, EncodeState, HoldEvent, HoldState, Job, JobError, JobEvent, JobId, JobKind,

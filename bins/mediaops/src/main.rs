@@ -8,6 +8,9 @@ use mediaops_core::{ExitCode, ProviderKind};
 use mediaops_ssh::SystemExec;
 
 mod bootstrap;
+mod home;
+mod library;
+mod run;
 
 const BIN_NAME: &str = "mediaops";
 
@@ -24,12 +27,85 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Seedbox(SeedboxArgs),
+    /// List allowlisted remotes through the home unix-socket gateway.
+    List {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
+    /// Pull one remote file into `_incoming/` with `.partial` resume.
+    Pull {
+        #[arg(long)]
+        root: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        title_id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        install: bool,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        year: Option<u16>,
+        #[arg(long)]
+        season: Option<u8>,
+        #[arg(long)]
+        episode: Option<u8>,
+    },
+    Library(LibraryArgs),
+    /// Fails closed until Epic 4 plan/apply. Still takes the flock (exit 3 on conflict).
+    Run {
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
 struct SeedboxArgs {
     #[command(subcommand)]
     command: SeedboxCommand,
+}
+
+#[derive(Args, Debug)]
+struct LibraryArgs {
+    #[command(subcommand)]
+    command: LibraryCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommand {
+    /// Create schema dirs, lock, sqlite, NVENC probe, systemd-user units.
+    Bootstrap {
+        #[arg(long)]
+        library_root: PathBuf,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        enable_timer: bool,
+        #[arg(long)]
+        unit_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -59,7 +135,7 @@ enum SeedboxCommand {
     },
 }
 
-enum AppError {
+pub(crate) enum AppError {
     Usage(String),
     Runtime(anyhow::Error),
     Policy(String),
@@ -234,6 +310,79 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     Err(mapped)
                 }
             }
+        }
+        Some(Command::List {
+            socket,
+            tls_dir,
+            config_dir,
+        }) => {
+            let line = home::list(cli.json, socket, tls_dir, config_dir).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Pull {
+            root,
+            path,
+            title_id,
+            name,
+            library_root,
+            socket,
+            tls_dir,
+            config_dir,
+            state_db,
+            desired_state,
+            install,
+            title,
+            year,
+            season,
+            episode,
+        }) => {
+            let line = home::pull(
+                cli.json,
+                root,
+                path,
+                title_id,
+                name,
+                library_root,
+                socket,
+                tls_dir,
+                config_dir,
+                state_db,
+                desired_state,
+                install,
+                title,
+                year,
+                season,
+                episode,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Library(LibraryArgs {
+            command:
+                LibraryCommand::Bootstrap {
+                    library_root,
+                    desired_state,
+                    config_dir,
+                    state_db,
+                    enable_timer,
+                    unit_dir,
+                },
+        })) => {
+            let line = library::bootstrap_library(
+                cli.json,
+                library_root,
+                desired_state,
+                config_dir,
+                state_db,
+                enable_timer,
+                unit_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Run { state_db }) => {
+            let line = run::run_stub(state_db)?;
+            write_stdout(&line)
         }
     }
 }

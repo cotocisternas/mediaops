@@ -29,6 +29,20 @@ impl Blake3Hex {
         Self(blake3::hash(bytes).to_hex().to_string())
     }
 
+    /// Hash a reader. Does not touch the filesystem itself.
+    pub fn of_reader(mut reader: impl std::io::Read) -> Result<Self, std::io::Error> {
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = [0_u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Self(hasher.finalize().to_hex().to_string()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

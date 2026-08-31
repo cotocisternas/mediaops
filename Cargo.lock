@@ -904,8 +904,10 @@ dependencies = [
  "directories",
  "fs4",
  "mediaops-core",
+ "mediaops-encode",
  "mediaops-ssh",
  "mediaops-store",
+ "mediaops-sync",
  "mediaops-transfer",
  "serde",
  "serde_json",
@@ -940,6 +942,11 @@ dependencies = [
 [[package]]
 name = "mediaops-encode"
 version = "0.1.0"
+dependencies = [
+ "mediaops-core",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "mediaops-net"
@@ -996,6 +1003,10 @@ dependencies = [
 [[package]]
 name = "mediaops-sync"
 version = "0.1.0"
+dependencies = [
+ "mediaops-core",
+ "thiserror",
+]
 
 [[package]]
 name = "mediaops-transfer"
@@ -1004,6 +1015,11 @@ dependencies = [
  "mediaops-core",
  "mediaops-net",
  "mediaops-proto",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1012,6 +1028,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "directories",
  "mediaops-core",
  "mediaops-net",
  "serde_json",

@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,9 @@ use mediaops_ssh::{
     systemd_user_unit,
 };
 use mediaops_store::Store;
-use mediaops_transfer::{IdentityBundle, mint, probe_range_n};
+use mediaops_transfer::{
+    IdentityBundle, connect_home, mint, probe_range, probe_range_n,
+};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -189,13 +192,29 @@ pub async fn bootstrap(
     let n = match probe_plan {
         ProbePlan::Reuse(n) => n,
         ProbePlan::Sweep => {
-            let sock = resolve_socket_addr(&address)?;
-            let client = bundle
-                .client_config()
-                .map_err(|err| BootstrapError::Io(err.to_string()))?;
-            let n = probe_range_n(sock, client, 32)
-                .await
-                .map_err(|err| BootstrapError::Io(err.to_string()))?;
+            let n = match connect_home(&default_socket(), &tls_dir).await {
+                Ok(channel) => match probe_range(channel, 32).await {
+                    Ok(n) => n,
+                    Err(_) => {
+                        let sock = resolve_socket_addr(&address)?;
+                        let client = bundle
+                            .client_config()
+                            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+                        probe_range_n(sock, client, 32)
+                            .await
+                            .map_err(|err| BootstrapError::Io(err.to_string()))?
+                    }
+                },
+                Err(_) => {
+                    let sock = resolve_socket_addr(&address)?;
+                    let client = bundle
+                        .client_config()
+                        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+                    probe_range_n(sock, client, 32)
+                        .await
+                        .map_err(|err| BootstrapError::Io(err.to_string()))?
+                }
+            };
             store
                 .put_probe(&Probe {
                     endpoint_fingerprint: fingerprint.clone(),
@@ -423,6 +442,72 @@ pub fn default_desired_state(config_dir: &Path) -> PathBuf {
     config_dir.join("desired-state.toml")
 }
 
+pub fn default_tls_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("tls")
+}
+
+pub fn default_state_dir() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|b| {
+            b.state_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| b.home_dir().join(".local").join("state"))
+                .join("mediaops")
+        })
+        .unwrap_or_else(|| PathBuf::from(".mediaops-state"))
+}
+
+pub fn default_socket() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|dir| PathBuf::from(dir).join("mediaopsd.sock"))
+        .unwrap_or_else(|| default_state_dir().join("mediaopsd.sock"))
+}
+
+pub fn default_unit_dir() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|b| b.config_dir().join("systemd").join("user"))
+        .unwrap_or_else(|| PathBuf::from(".config/systemd/user"))
+}
+
+pub fn exclusive_lock(path: &Path) -> Result<File, BootstrapError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    }
+    let mut file = File::create(path).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => {
+            write_lock_holder(&mut file)?;
+            Ok(file)
+        }
+        Err(fs4::TryLockError::WouldBlock) => Err(BootstrapError::LockConflict),
+        Err(err) => Err(BootstrapError::Io(err.to_string())),
+    }
+}
+
+fn write_lock_holder(file: &mut File) -> Result<(), BootstrapError> {
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let record = serde_json::json!({
+        "pid": std::process::id(),
+        "started_at": started_at,
+        "command": command,
+    });
+    file.set_len(0)
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    file.write_all(record.to_string().as_bytes())
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    file.write_all(b"\n")
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    file.sync_all()
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,5 +708,23 @@ mod tests {
             !rendered.contains("/.local/share/"),
             "AD-7 is ~/.local/state not share: {rendered}"
         );
+    }
+
+    #[test]
+    fn exclusive_lock_records_pid_and_command() {
+        let dir = scratch("lock");
+        let path = dir.join("mediaops.lock");
+        let _file = exclusive_lock(&path).expect("lock");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let value: serde_json::Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(value["pid"], std::process::id());
+        assert!(value["started_at"].as_u64().is_some());
+        assert!(
+            value["command"]
+                .as_str()
+                .is_some_and(|c| !c.is_empty()),
+            "command: {value}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

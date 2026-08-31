@@ -1,6 +1,6 @@
 //! Install gate: the only library-path writers.
 //!
-//! `install(TitleId, verified staging handle) -> installed path`
+//! `install(TitleId, verified staging handle) -> installed path + whole-file BLAKE3`
 //! `replace(TitleId, verified .converting handle, backup destination) -> installed path`
 //!
 //! Destination is always via PathSchema. This gate is filesystem-only and
@@ -13,8 +13,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::digest::Blake3Hex;
 use crate::pathschema::{self, PathSchemaError, Placement};
 use crate::title_id::TitleId;
+
+/// Result of [`install`]: schema path plus the digest hashed at this gate (AD-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallOutcome {
+    pub path: PathBuf,
+    pub whole_file_b3: Blake3Hex,
+}
+
+impl AsRef<Path> for InstallOutcome {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
 
 /// Verified file under `_incoming/<TitleId>/…`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,16 +105,15 @@ impl InstallError {
 }
 
 impl VerifiedStagingHandle {
-    /// Accept a staged file only when it is the exact `staging_path` tail for `title_id`.
+    /// Accept a staged file only when it is `library_root` plus the exact
+    /// `staging_path` tail for `title_id`. A matching tail outside the library
+    /// root is not staging.
     pub fn verify(
+        library_root: impl AsRef<Path>,
         title_id: &TitleId,
         source: PathBuf,
         placement: &Placement,
     ) -> Result<Self, InstallError> {
-        reject_symlink_file(
-            &source,
-            InstallError::NotStaging(source.display().to_string()),
-        )?;
         let dest_rel = pathschema::render(title_id, placement)?;
         if pathschema::parse(&dest_rel)? != *title_id {
             return Err(InstallError::TitleMismatch);
@@ -110,9 +123,16 @@ impl VerifiedStagingHandle {
             .and_then(|n| n.to_str())
             .ok_or_else(|| InstallError::NotStaging(source.display().to_string()))?;
         let expected_tail = pathschema::staging_path(title_id, final_name)?;
-        if !source.ends_with(&expected_tail) {
+        let Ok(rel) = source.strip_prefix(library_root.as_ref()) else {
+            return Err(InstallError::NotStaging(source.display().to_string()));
+        };
+        if rel != expected_tail.as_path() || !is_under(library_root.as_ref(), &source) {
             return Err(InstallError::NotStaging(source.display().to_string()));
         }
+        reject_symlink_file(
+            &source,
+            InstallError::NotStaging(source.display().to_string()),
+        )?;
         Ok(Self { source, dest_rel })
     }
 
@@ -157,6 +177,60 @@ impl VerifiedConvertingHandle {
     }
 }
 
+/// `candidate` is under `root` without walking out via `..`.
+fn is_under(root: &Path, candidate: &Path) -> bool {
+    let Ok(rel) = candidate.strip_prefix(root) else {
+        return false;
+    };
+    let mut depth = 0_i32;
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Free bytes on the filesystem that holds `path` (watermark checks).
+pub fn free_bytes(path: &Path) -> Result<u64, InstallError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            InstallError::Io {
+                path: path.display().to_string(),
+                kind: std::io::ErrorKind::InvalidInput,
+                message: "path contains NUL".into(),
+            }
+        })?;
+        let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let rc = unsafe { libc::statvfs(cstr.as_ptr(), vfs.as_mut_ptr()) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(InstallError::io(path, &err));
+        }
+        let vfs = unsafe { vfs.assume_init() };
+        Ok(vfs.f_bavail as u64 * vfs.f_frsize as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(InstallError::Io {
+            path: path.display().to_string(),
+            kind: std::io::ErrorKind::Unsupported,
+            message: "df is unix-only in v1".into(),
+        })
+    }
+}
+
 fn reject_symlink_file(path: &Path, on_symlink: InstallError) -> Result<(), InstallError> {
     let meta = fs::symlink_metadata(path).map_err(|err| match err.kind() {
         // Only a genuine absence is "not found"; permissions and symlink loops
@@ -178,7 +252,7 @@ pub fn install(
     library_root: impl AsRef<Path>,
     title_id: &TitleId,
     handle: &VerifiedStagingHandle,
-) -> Result<PathBuf, InstallError> {
+) -> Result<InstallOutcome, InstallError> {
     let dest = library_root.as_ref().join(&handle.dest_rel);
     if pathschema::parse(&handle.dest_rel)? != *title_id {
         return Err(InstallError::TitleMismatch);
@@ -188,11 +262,17 @@ pub fn install(
     if fs::symlink_metadata(&dest).is_ok() {
         return Err(InstallError::DestinationExists(dest.display().to_string()));
     }
+    let file = fs::File::open(&handle.source).map_err(|err| InstallError::io(&handle.source, &err))?;
+    let whole_file_b3 =
+        Blake3Hex::of_reader(file).map_err(|err| InstallError::io(&handle.source, &err))?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
     }
     fs::rename(&handle.source, &dest).map_err(|err| InstallError::io(&handle.source, &err))?;
-    Ok(dest)
+    Ok(InstallOutcome {
+        path: dest,
+        whole_file_b3,
+    })
 }
 
 /// Move the live schema file to `backup_destination`, then place the converting file.
@@ -306,20 +386,21 @@ mod tests {
             staged_rel.to_str().expect("utf8"),
             "_incoming/movie-tmdb-603/The.Matrix.(1999).mkv"
         );
-        let staged = tmp.path.join(&staged_rel);
+        let lib = tmp.path.join("library");
+        let staged = lib.join(&staged_rel);
         write_file(&staged, b"matrix-bytes");
 
-        let lib = tmp.path.join("library");
-        let handle = VerifiedStagingHandle::verify(&title_id, staged.clone(), &placement)
+        let handle = VerifiedStagingHandle::verify(&lib, &title_id, staged.clone(), &placement)
             .expect("verify staging");
         let installed = install(&lib, &title_id, &handle).expect("install");
         let expected = lib.join(render(&title_id, &placement).expect("render"));
-        assert_eq!(installed, expected);
-        assert!(installed.starts_with(&lib));
-        assert_eq!(fs::read(&installed).expect("read"), b"matrix-bytes");
+        assert_eq!(installed.path, expected);
+        assert!(installed.path.starts_with(&lib));
+        assert_eq!(fs::read(&installed.path).expect("read"), b"matrix-bytes");
+        assert_eq!(installed.whole_file_b3, crate::Blake3Hex::of_bytes(b"matrix-bytes"));
         assert!(!staged.exists());
         assert_eq!(
-            pathschema::parse(installed.strip_prefix(&lib).expect("strip")).expect("parse"),
+            pathschema::parse(installed.path.strip_prefix(&lib).expect("strip")).expect("parse"),
             title_id
         );
     }
@@ -329,12 +410,11 @@ mod tests {
         let tmp = TempTree::new();
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let staged = tmp
-            .path
-            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
-        write_file(&staged, b"original");
         let lib = tmp.path.join("library");
-        let handle = VerifiedStagingHandle::verify(&title_id, staged, &placement).expect("verify");
+        let staged = lib.join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        write_file(&staged, b"original");
+        let handle =
+            VerifiedStagingHandle::verify(&lib, &title_id, staged, &placement).expect("verify");
         let installed = install(&lib, &title_id, &handle).expect("install");
 
         let converting = tmp
@@ -348,7 +428,7 @@ mod tests {
         let backup = tmp.path.join("backup").join("The.Matrix.(1999).mkv");
         let replaced = replace(&lib, &title_id, &converting_handle, &backup).expect("replace");
 
-        assert_eq!(replaced, installed);
+        assert_eq!(replaced, installed.path);
         assert_eq!(fs::read(&replaced).expect("new"), b"encoded");
         assert_eq!(fs::read(&backup).expect("backup"), b"original");
         assert!(!converting.exists());
@@ -363,10 +443,44 @@ mod tests {
         let tmp = TempTree::new();
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let lib = tmp.path.join("library");
         let rogue = tmp.path.join("movies").join("rogue.mkv");
         write_file(&rogue, b"nope");
         assert!(matches!(
-            VerifiedStagingHandle::verify(&title_id, rogue, &placement),
+            VerifiedStagingHandle::verify(&lib, &title_id, rogue, &placement),
+            Err(InstallError::NotStaging(_))
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_matching_tail_outside_library_root() {
+        let tmp = TempTree::new();
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let lib = tmp.path.join("library");
+        let impostor = tmp
+            .path
+            .join("elsewhere")
+            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        write_file(&impostor, b"nope");
+        assert!(matches!(
+            VerifiedStagingHandle::verify(&lib, &title_id, impostor, &placement),
+            Err(InstallError::NotStaging(_))
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_parent_dir_escape_with_matching_staging_tail() {
+        let tmp = TempTree::new();
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let lib = tmp.path.join("library");
+        fs::create_dir_all(&lib).expect("lib");
+        let tail = staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging");
+        let impostor = lib.join("..").join("elsewhere").join(&tail);
+        write_file(&impostor, b"nope");
+        assert!(matches!(
+            VerifiedStagingHandle::verify(&lib, &title_id, impostor, &placement),
             Err(InstallError::NotStaging(_))
         ));
     }
@@ -377,12 +491,11 @@ mod tests {
         let title_id = TitleId::movie("603").expect("id");
         let other = TitleId::movie("604").expect("other");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let staged = tmp
-            .path
-            .join(staging_path(&other, "The.Matrix.(1999).mkv").expect("staging"));
+        let lib = tmp.path.join("library");
+        let staged = lib.join(staging_path(&other, "The.Matrix.(1999).mkv").expect("staging"));
         write_file(&staged, b"wrong-id");
         assert!(matches!(
-            VerifiedStagingHandle::verify(&title_id, staged, &placement),
+            VerifiedStagingHandle::verify(&lib, &title_id, staged, &placement),
             Err(InstallError::NotStaging(_))
         ));
     }
@@ -395,13 +508,12 @@ mod tests {
         let target = tmp.path.join("target.mkv");
         write_file(&target, b"bytes");
 
-        let staged = tmp
-            .path
-            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        let lib = tmp.path.join("library");
+        let staged = lib.join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
         fs::create_dir_all(staged.parent().expect("parent")).expect("mkdir");
         std::os::unix::fs::symlink(&target, &staged).expect("staging symlink");
         assert!(matches!(
-            VerifiedStagingHandle::verify(&title_id, staged, &placement),
+            VerifiedStagingHandle::verify(&lib, &title_id, staged, &placement),
             Err(InstallError::NotStaging(_))
         ));
 
@@ -423,21 +535,22 @@ mod tests {
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
         let staged_rel = staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging");
-        let staged = tmp.path.join(&staged_rel);
-        write_file(&staged, b"original");
         let lib = tmp.path.join("library");
-        let handle = VerifiedStagingHandle::verify(&title_id, staged, &placement).expect("verify");
+        let staged = lib.join(&staged_rel);
+        write_file(&staged, b"original");
+        let handle =
+            VerifiedStagingHandle::verify(&lib, &title_id, staged, &placement).expect("verify");
         let installed = install(&lib, &title_id, &handle).expect("install");
 
-        write_file(&tmp.path.join(&staged_rel), b"other-bytes");
+        write_file(&lib.join(&staged_rel), b"other-bytes");
         let again =
-            VerifiedStagingHandle::verify(&title_id, tmp.path.join(&staged_rel), &placement)
+            VerifiedStagingHandle::verify(&lib, &title_id, lib.join(&staged_rel), &placement)
                 .expect("verify again");
         let err = install(&lib, &title_id, &again).expect_err("second");
         assert!(matches!(err, InstallError::DestinationExists(_)));
-        assert_eq!(fs::read(&installed).expect("read"), b"original");
+        assert_eq!(fs::read(&installed.path).expect("read"), b"original");
         assert_eq!(
-            fs::read(tmp.path.join(&staged_rel)).expect("staging remains"),
+            fs::read(lib.join(&staged_rel)).expect("staging remains"),
             b"other-bytes"
         );
     }
@@ -447,12 +560,11 @@ mod tests {
         let tmp = TempTree::new();
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let staged = tmp
-            .path
-            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
-        write_file(&staged, b"original");
         let lib = tmp.path.join("library");
-        let handle = VerifiedStagingHandle::verify(&title_id, staged, &placement).expect("verify");
+        let staged = lib.join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        write_file(&staged, b"original");
+        let handle =
+            VerifiedStagingHandle::verify(&lib, &title_id, staged, &placement).expect("verify");
         let installed = install(&lib, &title_id, &handle).expect("install");
 
         let converting = tmp
@@ -482,7 +594,7 @@ mod tests {
 
     /// Build a verified staging handle for `title_id` under `tmp`.
     fn staged_handle(
-        tmp: &TempTree,
+        lib: &Path,
         title_id: &TitleId,
         placement: &Placement,
     ) -> VerifiedStagingHandle {
@@ -492,11 +604,9 @@ mod tests {
             .and_then(|n| n.to_str())
             .expect("name")
             .to_string();
-        let staged = tmp
-            .path
-            .join(staging_path(title_id, &name).expect("staging"));
+        let staged = lib.join(staging_path(title_id, &name).expect("staging"));
         write_file(&staged, b"bytes");
-        VerifiedStagingHandle::verify(title_id, staged, placement).expect("verify")
+        VerifiedStagingHandle::verify(lib, title_id, staged, placement).expect("verify")
     }
 
     #[test]
@@ -507,14 +617,15 @@ mod tests {
         let title_603 = TitleId::movie("603").expect("id");
         let title_604 = TitleId::movie("604").expect("other");
 
-        let handle = staged_handle(&tmp, &title_603, &placement);
+        let handle = staged_handle(&lib, &title_603, &placement);
         assert!(matches!(
             install(&lib, &title_604, &handle),
             Err(InstallError::TitleMismatch)
         ));
+        let dest = lib.join(render(&title_603, &placement).expect("render"));
         assert!(
-            !lib.exists(),
-            "a refused install must not create anything under the library root"
+            !dest.exists(),
+            "a refused install must not create the schema path"
         );
 
         let converting = tmp
@@ -568,11 +679,10 @@ mod tests {
         let tmp = TempTree::new();
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let absent = tmp
-            .path
-            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        let lib = tmp.path.join("library");
+        let absent = lib.join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
         assert!(matches!(
-            VerifiedStagingHandle::verify(&title_id, absent, &placement),
+            VerifiedStagingHandle::verify(&lib, &title_id, absent, &placement),
             Err(InstallError::MissingSource(_))
         ));
     }
@@ -583,14 +693,13 @@ mod tests {
         let tmp = TempTree::new();
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let staged = tmp
-            .path
-            .join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
+        let lib = tmp.path.join("library");
+        let staged = lib.join(staging_path(&title_id, "The.Matrix.(1999).mkv").expect("staging"));
         write_file(&staged, b"bytes");
         let parent = staged.parent().expect("parent").to_path_buf();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).expect("chmod");
 
-        let got = VerifiedStagingHandle::verify(&title_id, staged, &placement);
+        let got = VerifiedStagingHandle::verify(&lib, &title_id, staged, &placement);
         let _ = fs::set_permissions(&parent, fs::Permissions::from_mode(0o755));
 
         let err = got.expect_err("unreadable");
@@ -638,7 +747,7 @@ mod tests {
         let lib = tmp.path.join("library");
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let handle = staged_handle(&tmp, &title_id, &placement);
+        let handle = staged_handle(&lib, &title_id, &placement);
 
         let dest = lib.join(render(&title_id, &placement).expect("render"));
         fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
@@ -664,7 +773,7 @@ mod tests {
         let lib = tmp.path.join("library");
         let title_id = TitleId::movie("603").expect("id");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let handle = staged_handle(&tmp, &title_id, &placement);
+        let handle = staged_handle(&lib, &title_id, &placement);
         let installed = install(&lib, &title_id, &handle).expect("install");
 
         let converting = tmp

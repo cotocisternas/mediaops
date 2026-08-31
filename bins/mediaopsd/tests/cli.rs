@@ -217,6 +217,32 @@ fn serve_reverse_connect_exits_usage() {
 }
 
 #[test]
-fn serve_home_exits_usage() {
-    unused_role_exits_usage("home");
+fn serve_home_without_upstream_exits_usage() {
+    let dir = std::env::temp_dir().join(format!(
+        "mediaopsd-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let output = bin()
+        .args([
+            "serve",
+            "--role",
+            "home",
+            "--tls-dir",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run home without upstream");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "home without --upstream/--desired-state must exit usage, status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

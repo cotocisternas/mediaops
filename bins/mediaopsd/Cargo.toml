@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
+directories.workspace = true
 mediaops-core.workspace = true
 mediaops-net.workspace = true
 tokio = { workspace = true, default-features = false, features = ["macros", "net", "rt-multi-thread"] }

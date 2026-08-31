@@ -10,8 +10,10 @@ clap = { workspace = true, features = ["derive"] }
 directories.workspace = true
 fs4.workspace = true
 mediaops-core.workspace = true
+mediaops-encode.workspace = true
 mediaops-ssh.workspace = true
 mediaops-store.workspace = true
+mediaops-sync.workspace = true
 mediaops-transfer.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

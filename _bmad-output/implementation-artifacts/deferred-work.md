@@ -13,7 +13,7 @@ Story 1.2 review is **closed** (2026-08-30). Spec `followup_review_recommended: 
 - **Non-unix builds fabricate `nlink = 1`** (`crates/core/src/walker.rs:229`) — the `#[cfg(not(unix))]` branch returns a literal `1`, so hardlink detection silently always reports "not linked". Both test modules also call `std::os::unix::fs::symlink` without a cfg gate, so the crate claims a non-unix build its own tests cannot compile. Deferred: there is no non-unix target today.
 - **Legitimate titles containing "Proper" or "Repack" are unrenderable** (`crates/core/src/pathschema.rs:377`) — `is_scene_tag` matches case-insensitively on any dot/dash/underscore-separated token, and `validate_display_token` turns a match into a hard `LeftoverSceneTag` failure. A film titled `A.Proper.Violence` can never enter the library. Deferred: the spec mandates stripping these tags; making the match positional (trailing release segment only) is a product call.
 - **No `fsync` of the parent directory after rename** (`crates/core/src/install.rs:146`) — `install` is documented as atomic placement, but without syncing the parent dir the rename can be lost on power failure. Deferred as beyond a story scoped to types and offline tests.
-- **Nothing constrains the staged source to a staging root** (`crates/core/src/install.rs:76`) — `VerifiedStagingHandle::verify` only checks `source.ends_with(staging_path(...))`, and `Path::ends_with` matches trailing components, so any directory on disk ending in `_incoming/<TitleId>/<final name>` verifies. `library_root` is not a parameter of `verify`, and `install` never compares the source against it. Deferred: adding a staging-root parameter changes the install-gate signature that stories 1.3 and Epic 3 will bind to.
+- **Nothing constrains the staged source to a staging root** — closed 2026-08-31: `VerifiedStagingHandle::verify` takes `library_root` and refuses a matching tail that is not under that root.
 - **`REPACJ` is frozen into a public const, doc comment, and test** (`crates/core/src/pathschema.rs:15`) — it reads as a typo of `REPACK`, but both the 1.2 spec and epic-1-context list it explicitly, so the implementation is faithful. Deferred: confirm upstream whether real releases carry the misspelling, and add a comment either way. Common tags (`INTERNAL`, `RERIP`, `REAL`) are absent with no note on why the list stops here.
 
 ## Deferred from: spec split of spec-1-3-desiredstate-plan-jobs-and-store (2026-08-29)
@@ -32,7 +32,7 @@ Explored 2026-08-30 (after PR #4). Implemented 2026-08-30 (`0fb6869` + review fo
 
 ## Deferred from: code review of PR #4 / SPEC.md (2026-08-30)
 
-- **Home gateway owns the WAN pool and the CLI never contains a seedbox address** (`bins/mediaops/src/bootstrap.rs:123`) — AD-4 / NFR3 / Epic 3. Bootstrap today calls `probe_range_n` from the CLI. Long-term the home unix-socket gateway is the only process that knows the seedbox address; moving the probe is Epic 3 work, not a silent Epic 2 rewrite.
+- **Home gateway owns the WAN pool and the CLI never contains a seedbox address** — closed 2026-08-31: `mediaopsd --role home` binds UDS, owns `ChannelPool`, exposes `ConfigurePool` / `PoolStatus` / `ProbeRange`. `list` / `pull` talk only to the socket. Seedbox bootstrap still probes directly when the home socket is down (chicken-egg).
 - **`store` repository traits live in `core`** — closed 2026-08-30: `ProbeRepo`, `TitleIndexRepo`, and `JobsRepo` are in `core`; `store` is the adapter.
 - **`parse_ssh_config` does not honor `Include`, `Host *`, or `Match`** (`crates/ssh/src/lib.rs:34`) — v1 imports `Host seedbox` as an exact block. Full OpenSSH semantics can wait until a real config fails.
 - **GetRange is not a streaming disk pipe** (`crates/net/src/seedbox.rs:146`) — after a size cap and a full read, true chunked `AsyncRead` with client-cancel backpressure is still missing. Deferred as a follow-up to the cap/read fix.
@@ -40,3 +40,11 @@ Explored 2026-08-30 (after PR #4). Implemented 2026-08-30 (`0fb6869` + review fo
 - **`upsert_tls_table` round-trips TOML and drops comments** (`crates/core/src/desired_state.rs:227`) — AD-6 wants a diff before rewriting user-edited desired-state. Comment-preserving splice is a larger TOML-edit problem than this review should invent.
 - **`ControlPort::df` returns only `Bytes` and drops daemon semver** (`crates/proto/src/lib.rs:292`) — Story 2.2 wants the CLI to see semver + proto package. The Epic 1 `ControlPort` trait shape only returns free bytes; changing it is a contract story, not a net-crate patch.
 - **musl-static `mediaopsd` vs `tls-aws-lc` / `.cargo/config.toml`** (`crates/net/Cargo.toml:20`) — Story 2.3 / AD-22 require `x86_64-unknown-linux-musl`. Whether aws-lc-sys links on that target is unproven here; pin the target and crypto backend when the first musl build is actually run.
+
+## Deferred from: code review of epics.md (2026-08-31)
+
+Uncommitted Epic 3 working tree (home gateway, pull/resume, library bootstrap).
+
+- **`prune_dir` recursion is unbounded** (`crates/transfer/src/prune.rs:33`) — same class as the deferred walker depth issue. `_incoming` is operator-local and currently one title-id level deep.
+- **No systemd-user unit for `mediaopsd --role home`** — Story 3.3 only writes `mediaops-run.{service,timer}`. Overlay `list`/`pull` still assume the operator started the gateway by hand.
+- **NVENC stored cap is encoder presence (0/1), not a live session cap** (`crates/encode/src/lib.rs`) — keep 0/1 from `ffmpeg -encoders`; real GPU concurrency probe waits for Epic 4 encode.

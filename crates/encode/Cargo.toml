@@ -3,3 +3,10 @@ name = "mediaops-encode"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+mediaops-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, default-features = false, features = ["macros", "rt"] }

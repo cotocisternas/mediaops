@@ -275,6 +275,74 @@ fn seedbox_bootstrap_git_work_tree_is_policy_refusal() {
 }
 
 #[test]
+fn library_bootstrap_creates_schema_dirs() {
+    let dir = std::env::temp_dir().join(format!(
+        "mediaops-cli-lib-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let ds = dir.join("desired-state.toml");
+    std::fs::write(
+        &ds,
+        "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
+    )
+    .expect("ds");
+    let lib = dir.join("library");
+    let units = dir.join("units");
+    let output = bin()
+        .args([
+            "--json",
+            "library",
+            "bootstrap",
+            "--library-root",
+            lib.to_str().unwrap(),
+            "--desired-state",
+            ds.to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+            "--unit-dir",
+            units.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run library bootstrap");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "library bootstrap failed: {stderr}"
+    );
+    for name in ["movies", "series", "music", "_ops", "_incoming"] {
+        assert!(lib.join(name).is_dir(), "{name}");
+    }
+    assert!(units.join("mediaops-run.service").is_file());
+    assert!(units.join("mediaops-run.timer").is_file());
+    let timer = std::fs::read_to_string(units.join("mediaops-run.timer")).expect("timer");
+    assert!(timer.contains("OnUnitInactiveSec="));
+    assert!(timer.contains("OnBootSec="));
+    assert!(!timer.contains("OnCalendar"));
+    let service = std::fs::read_to_string(units.join("mediaops-run.service")).expect("service");
+    assert!(
+        service.contains("--state-db"),
+        "ExecStart must pin --state-db, got {service}"
+    );
+    assert!(service.contains("TimeoutStartSec=infinity"));
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], true);
+    let root = value["data"]["library_root"].as_str().expect("library_root");
+    assert!(
+        std::path::Path::new(root).is_absolute(),
+        "library_root must be canonical, got {root}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn version_exits_ok() {
     let output = bin()
         .arg("--version")
@@ -319,4 +387,33 @@ fn usage_json_equals_false_stays_human() {
         "human usage must not print a result envelope on stdout: {stdout}"
     );
     assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn run_is_policy_refusal_until_epic_4() {
+    let dir = std::env::temp_dir().join(format!(
+        "mediaops-cli-run-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let output = bin()
+        .args([
+            "--json",
+            "run",
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("run");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("Epic 4"), "got {message}");
 }
