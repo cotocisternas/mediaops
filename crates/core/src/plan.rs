@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::desired_state::{DesiredState, DesiredStateError};
+use crate::digest::Blake3Hex;
 
 /// Exhaustive plan action. Match every variant; do not add a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -23,7 +24,7 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     desired_state_toml: Vec<u8>,
-    desired_state_b3: String,
+    desired_state_b3: Blake3Hex,
     actions: Vec<Action>,
 }
 
@@ -55,7 +56,7 @@ impl Plan {
         let text = std::str::from_utf8(&desired_state_toml).map_err(|_| PlanError::InvalidUtf8)?;
         DesiredState::from_toml(text)?;
         Ok(Self {
-            desired_state_b3: blake3_hex(&desired_state_toml),
+            desired_state_b3: Blake3Hex::of_bytes(&desired_state_toml),
             desired_state_toml,
             actions: Vec::new(),
         })
@@ -70,7 +71,7 @@ impl Plan {
         &self.desired_state_toml
     }
 
-    pub fn desired_state_b3(&self) -> &str {
+    pub fn desired_state_b3(&self) -> &Blake3Hex {
         &self.desired_state_b3
     }
 
@@ -85,7 +86,7 @@ impl Plan {
 
     /// Bytes-hash vs bytes-hash. Does not parse `active_toml`.
     pub fn matches_snapshot(&self, active_toml: &[u8]) -> bool {
-        blake3_hex(active_toml) == self.desired_state_b3
+        Blake3Hex::of_bytes(active_toml) == self.desired_state_b3
     }
 }
 
@@ -95,7 +96,7 @@ impl Serialize for Plan {
             std::str::from_utf8(&self.desired_state_toml).map_err(serde::ser::Error::custom)?;
         PlanJson {
             desired_state_toml: desired_state_toml.to_string(),
-            desired_state_b3: self.desired_state_b3.clone(),
+            desired_state_b3: self.desired_state_b3.as_str().to_string(),
             actions: self.actions.clone(),
         }
         .serialize(serializer)
@@ -127,27 +128,18 @@ impl Plan {
     /// `SCHEMA_VERSION` bump must not make old plans unreadable. Call
     /// [`Plan::desired_state`] when the parsed document is actually needed.
     fn from_json(json: PlanJson) -> Result<Self, PlanError> {
-        if !is_lowercase_b3_hex(&json.desired_state_b3) {
-            return Err(PlanError::InvalidDigest);
-        }
+        let desired_state_b3 =
+            Blake3Hex::parse(&json.desired_state_b3).map_err(|_| PlanError::InvalidDigest)?;
         let desired_state_toml = json.desired_state_toml.into_bytes();
-        if blake3_hex(&desired_state_toml) != json.desired_state_b3 {
+        if Blake3Hex::of_bytes(&desired_state_toml) != desired_state_b3 {
             return Err(PlanError::DigestMismatch);
         }
         Ok(Self {
             desired_state_toml,
-            desired_state_b3: json.desired_state_b3,
+            desired_state_b3,
             actions: json.actions,
         })
     }
-}
-
-fn blake3_hex(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex().to_string()
-}
-
-fn is_lowercase_b3_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -170,7 +162,7 @@ mod tests {
             .expect("snapshot")
             .with_actions(vec![Action::Copy, Action::Encode]);
         assert_eq!(plan.desired_state_toml(), bytes.as_slice());
-        assert_eq!(plan.desired_state_b3(), expected_digest);
+        assert_eq!(plan.desired_state_b3().as_str(), expected_digest);
 
         let json = serde_json::to_string(&plan).expect("serialize");
         let value: serde_json::Value = serde_json::from_str(&json).expect("value");
@@ -179,7 +171,7 @@ mod tests {
 
         let decoded: Plan = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.desired_state_toml(), bytes.as_slice());
-        assert_eq!(decoded.desired_state_b3(), expected_digest);
+        assert_eq!(decoded.desired_state_b3().as_str(), expected_digest);
         assert_eq!(decoded.actions(), &[Action::Copy, Action::Encode]);
         assert_eq!(decoded, plan);
 
@@ -382,7 +374,7 @@ mod tests {
 
         let plan = serde_json::from_value::<Plan>(value).expect("archived plan still loads");
         assert_eq!(plan.desired_state_toml(), snapshot.as_bytes());
-        assert_eq!(plan.desired_state_b3(), digest);
+        assert_eq!(plan.desired_state_b3().as_str(), digest);
         assert_eq!(plan.actions(), &[Action::Copy, Action::DeleteRemote]);
         // Only interpreting the snapshot as the current schema fails, and it
         // fails where the caller asked for it.

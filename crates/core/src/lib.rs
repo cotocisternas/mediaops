@@ -12,6 +12,7 @@
 pub mod bytes;
 pub mod control_port;
 pub mod desired_state;
+pub mod digest;
 pub mod exec;
 pub mod install;
 pub mod jobs;
@@ -26,6 +27,7 @@ pub mod walker;
 pub use bytes::Bytes;
 pub use control_port::{ControlError, ControlPort, DeleteRemoteOutcome};
 pub use desired_state::{DesiredState, DesiredStateError, Grabber, TlsIdentity, upsert_tls_table};
+pub use digest::{Blake3Hex, DigestError};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};
 pub use install::{
     InstallError, VerifiedConvertingHandle, VerifiedStagingHandle, install, replace,

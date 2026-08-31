@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use crate::title_id::TitleId;
+
 /// Stable row id. Assigned by the jobs repository; never zero or negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct JobId(i64);
@@ -54,6 +56,16 @@ impl JobKind {
             "encode" => Ok(Self::Encode),
             "hold" => Ok(Self::Hold),
             other => Err(JobError::UnknownKind(other.to_string())),
+        }
+    }
+
+    /// Kind the parent row must have when a parent is set. Encode always
+    /// requires a parent; Pull may omit one; Want and Hold must not have one.
+    pub fn required_parent_kind(self) -> Option<JobKind> {
+        match self {
+            Self::Pull => Some(Self::Want),
+            Self::Encode => Some(Self::Pull),
+            Self::Want | Self::Hold => None,
         }
     }
 }
@@ -326,22 +338,39 @@ impl fmt::Display for JobEvent {
     }
 }
 
-/// One jobs row. [`parent_job_id`] links an action job to the job it waits on
-/// (a Copy/Pull job for Encode; the originating want for Pull).
+/// One jobs row. [`title_id`] is the subject. [`parent_job_id`] links an action
+/// job to the job it waits on (a Copy/Pull job for Encode; the originating
+/// want for Pull).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     id: JobId,
+    title_id: TitleId,
     state: JobState,
     parent_job_id: Option<JobId>,
 }
 
 impl Job {
-    pub fn new(id: JobId, state: JobState, parent_job_id: Option<JobId>) -> Result<Self, JobError> {
+    pub fn new(
+        id: JobId,
+        title_id: TitleId,
+        state: JobState,
+        parent_job_id: Option<JobId>,
+    ) -> Result<Self, JobError> {
         if parent_job_id == Some(id) {
             return Err(JobError::SelfParent(id));
         }
+        match state.kind() {
+            JobKind::Want | JobKind::Hold if parent_job_id.is_some() => {
+                return Err(JobError::UnexpectedParent { kind: state.kind() });
+            }
+            JobKind::Encode if parent_job_id.is_none() => {
+                return Err(JobError::EncodeNeedsParent);
+            }
+            JobKind::Want | JobKind::Hold | JobKind::Pull | JobKind::Encode => {}
+        }
         Ok(Self {
             id,
+            title_id,
             state,
             parent_job_id,
         })
@@ -349,6 +378,10 @@ impl Job {
 
     pub fn id(&self) -> JobId {
         self.id
+    }
+
+    pub fn title_id(&self) -> &TitleId {
+        &self.title_id
     }
 
     pub fn kind(&self) -> JobKind {
@@ -362,6 +395,16 @@ impl Job {
     pub fn parent_job_id(&self) -> Option<JobId> {
         self.parent_job_id
     }
+
+    /// Apply [`advance`] and keep id / title / parent.
+    pub fn advance(&self, event: JobEvent) -> Result<Self, JobError> {
+        Ok(Self {
+            id: self.id,
+            title_id: self.title_id.clone(),
+            state: crate::jobs::advance(&self.state, event)?,
+            parent_job_id: self.parent_job_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -370,6 +413,16 @@ pub enum JobError {
     InvalidId(i64),
     #[error("job {0} cannot be its own parent")]
     SelfParent(JobId),
+    #[error("encode job requires a parent pull job")]
+    EncodeNeedsParent,
+    #[error("{kind} job cannot have a parent")]
+    UnexpectedParent { kind: JobKind },
+    #[error("parent job {parent} is {actual}, expected {expected}")]
+    ParentKindMismatch {
+        parent: JobId,
+        expected: JobKind,
+        actual: JobKind,
+    },
     #[error("unknown job kind `{0}`")]
     UnknownKind(String),
     #[error("unknown job state `{state}` for kind {kind}")]
@@ -524,8 +577,12 @@ pub trait JobsRepo: Send + Sync {
     type Error;
 
     async fn get(&self, id: JobId) -> Result<Option<Job>, Self::Error>;
-    async fn create(&self, kind: JobKind, parent_job_id: Option<JobId>)
-    -> Result<Job, Self::Error>;
+    async fn create(
+        &self,
+        kind: JobKind,
+        title_id: &TitleId,
+        parent_job_id: Option<JobId>,
+    ) -> Result<Job, Self::Error>;
     async fn advance(&self, id: JobId, event: JobEvent) -> Result<Job, Self::Error>;
 }
 
@@ -537,8 +594,12 @@ mod tests {
         JobId::new(n).expect("id")
     }
 
+    fn title() -> TitleId {
+        TitleId::movie("603").expect("title")
+    }
+
     fn job(n: i64, state: JobState, parent: Option<i64>) -> Job {
-        Job::new(id(n), state, parent.map(id)).expect("job")
+        Job::new(id(n), title(), state, parent.map(id)).expect("job")
     }
 
     #[test]
@@ -630,15 +691,51 @@ mod tests {
         let child = job(2, JobState::Encode(EncodeState::Queued), Some(1));
         assert_eq!(child.parent_job_id(), Some(id(1)));
         assert_eq!(child.kind(), JobKind::Encode);
+        assert_eq!(child.title_id(), &title());
         let root = job(1, JobState::Want(WantState::Open), None);
         assert_eq!(root.parent_job_id(), None);
+        assert_eq!(root.title_id(), &title());
     }
 
     #[test]
     fn job_cannot_parent_itself() {
-        let err =
-            Job::new(id(1), JobState::Want(WantState::Open), Some(id(1))).expect_err("self parent");
+        let err = Job::new(
+            id(1),
+            title(),
+            JobState::Pull(PullState::Queued),
+            Some(id(1)),
+        )
+        .expect_err("self parent");
         assert!(matches!(err, JobError::SelfParent(_)), "{err}");
+    }
+
+    #[test]
+    fn encode_requires_a_parent_and_want_forbids_one() {
+        let err = Job::new(id(1), title(), JobState::Encode(EncodeState::Queued), None)
+            .expect_err("encode parent");
+        assert!(matches!(err, JobError::EncodeNeedsParent), "{err}");
+        let err = Job::new(id(1), title(), JobState::Want(WantState::Open), Some(id(2)))
+            .expect_err("want parent");
+        assert!(
+            matches!(
+                err,
+                JobError::UnexpectedParent {
+                    kind: JobKind::Want
+                }
+            ),
+            "{err}"
+        );
+        let err = Job::new(id(1), title(), JobState::Hold(HoldState::Open), Some(id(2)))
+            .expect_err("hold parent");
+        assert!(
+            matches!(
+                err,
+                JobError::UnexpectedParent {
+                    kind: JobKind::Hold
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]

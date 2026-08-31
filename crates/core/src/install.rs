@@ -3,10 +3,12 @@
 //! `install(TitleId, verified staging handle) -> installed path`
 //! `replace(TitleId, verified .converting handle, backup destination) -> installed path`
 //!
-//! Destination is always via PathSchema. `install` writes both `install_b3`
-//! (immutable) and `current_b3` through [`crate::TitleIndexRepo::record_install`].
-//! `replace` is encode's path and the only later writer of `current_b3`, via
-//! [`crate::TitleIndexRepo::record_replace`]. This gate returns the installed path.
+//! Destination is always via PathSchema. This gate is filesystem-only and
+//! returns the installed path. Callers record digests through
+//! [`crate::TitleIndexRepo`] after a successful place: `record_install` on
+//! first install (`install_b3` and `current_b3`), `record_replace` after
+//! encode's [`replace`] (the only later writer of `current_b3`). The gate
+//! does not take a repository and does not touch sqlite.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -195,8 +197,8 @@ pub fn install(
 
 /// Move the live schema file to `backup_destination`, then place the converting file.
 ///
-/// This is encode's path and the only later writer of `current_b3`
-/// ([`crate::TitleIndexRepo::record_replace`]; the return value is the installed path).
+/// Encode's path. Callers persist the new `current_b3` through
+/// [`crate::TitleIndexRepo::record_replace`] after this returns.
 pub fn replace(
     library_root: impl AsRef<Path>,
     title_id: &TitleId,

@@ -1,16 +1,29 @@
-//! sqlite adapter (AD-8). Schema `user_version` 2: `probes` (v1) plus
-//! `title_index` / `jobs`. `holds_decisions` waits on Epic 6.
+//! sqlite adapter (AD-8). Schema `user_version` 3: `probes` (v1), `title_index` /
+//! `jobs` (v2) with `jobs.title_id` (v3). `holds_decisions` waits on Epic 6.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mediaops_core::{
-    Job, JobError, JobEvent, JobId, JobKind, JobState, JobsRepo, Probe, ProbeRepo, TitleId,
-    TitleIndexEntry, TitleIndexError, TitleIndexRepo, advance,
+    Blake3Hex, Job, JobEvent, JobId, JobKind, JobsRepo, Probe, ProbeRepo, TitleId, TitleIndexEntry,
+    TitleIndexRepo,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
 
-const SCHEMA_VERSION: i64 = 2;
+mod jobs;
+mod probes;
+mod title_index;
+
+const SCHEMA_VERSION: i64 = 3;
+
+const JOBS_DDL: &str = "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY NOT NULL,
+                title_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                parent_job_id INTEGER,
+                FOREIGN KEY (parent_job_id) REFERENCES jobs(id)
+            );";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -19,11 +32,17 @@ pub enum StoreError {
     #[error("join: {0}")]
     Join(String),
     #[error(transparent)]
-    Job(#[from] JobError),
+    Job(#[from] mediaops_core::JobError),
     #[error(transparent)]
-    TitleIndex(#[from] TitleIndexError),
+    TitleIndex(#[from] mediaops_core::TitleIndexError),
+    #[error(transparent)]
+    Digest(#[from] mediaops_core::DigestError),
+    #[error(transparent)]
+    TitleId(#[from] mediaops_core::TitleIdError),
     #[error("job {0} not found")]
     JobNotFound(JobId),
+    #[error("job {0} state changed during advance")]
+    JobConflict(JobId),
 }
 
 #[derive(Debug, Clone)]
@@ -50,12 +69,12 @@ impl Store {
     async fn with<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_conn(&path)?;
-            f(&conn)
+            let mut conn = open_conn(&path)?;
+            f(&mut conn)
         })
         .await
         .map_err(|err| StoreError::Join(err.to_string()))?
@@ -63,18 +82,16 @@ impl Store {
 
     pub async fn get_probe(&self, fingerprint: &str) -> Result<Option<Probe>, StoreError> {
         let fingerprint = fingerprint.to_string();
-        self.with(move |conn| get_probe(conn, &fingerprint)).await
+        self.with(move |conn| probes::get_probe(conn, &fingerprint))
+            .await
     }
 
     pub async fn put_probe(&self, probe: &Probe) -> Result<(), StoreError> {
-        if probe.range_concurrency == 0 {
-            return Err(StoreError::Sqlite(
-                "range_concurrency must be greater than zero".into(),
-            ));
-        }
+        probes::reject_zero_concurrency(probe.range_concurrency)?;
         let fingerprint = probe.endpoint_fingerprint.clone();
         let n = i64::from(probe.range_concurrency);
-        self.with(move |conn| put_probe(conn, &fingerprint, n)).await
+        self.with(move |conn| probes::put_probe(conn, &fingerprint, n))
+            .await
     }
 
     pub async fn get_title(
@@ -82,42 +99,50 @@ impl Store {
         title_id: &TitleId,
     ) -> Result<Option<TitleIndexEntry>, StoreError> {
         let title_id = title_id.clone();
-        self.with(move |conn| get_title(conn, &title_id)).await
+        self.with(move |conn| title_index::get_title(conn, &title_id))
+            .await
     }
 
-    pub async fn record_install(&self, title_id: &TitleId, digest: &str) -> Result<(), StoreError> {
+    pub async fn record_install(
+        &self,
+        title_id: &TitleId,
+        digest: &Blake3Hex,
+    ) -> Result<(), StoreError> {
         let title_id = title_id.clone();
-        let digest = digest.to_string();
-        self.with(move |conn| record_install(conn, &title_id, &digest))
+        let digest = digest.clone();
+        self.with(move |conn| title_index::record_install(conn, &title_id, &digest))
             .await
     }
 
     pub async fn record_replace(
         &self,
         title_id: &TitleId,
-        current_b3: &str,
+        current_b3: &Blake3Hex,
     ) -> Result<(), StoreError> {
         let title_id = title_id.clone();
-        let current_b3 = current_b3.to_string();
-        self.with(move |conn| record_replace(conn, &title_id, &current_b3))
+        let current_b3 = current_b3.clone();
+        self.with(move |conn| title_index::record_replace(conn, &title_id, &current_b3))
             .await
     }
 
     pub async fn get_job(&self, id: JobId) -> Result<Option<Job>, StoreError> {
-        self.with(move |conn| get_job(conn, id)).await
+        self.with(move |conn| jobs::get_job(conn, id)).await
     }
 
     pub async fn create_job(
         &self,
         kind: JobKind,
+        title_id: &TitleId,
         parent_job_id: Option<JobId>,
     ) -> Result<Job, StoreError> {
-        self.with(move |conn| create_job(conn, kind, parent_job_id))
+        let title_id = title_id.clone();
+        self.with(move |conn| jobs::create_job(conn, kind, title_id, parent_job_id))
             .await
     }
 
     pub async fn advance(&self, id: JobId, event: JobEvent) -> Result<Job, StoreError> {
-        self.with(move |conn| advance_job(conn, id, event)).await
+        self.with(move |conn| jobs::advance_job(conn, id, event))
+            .await
     }
 }
 
@@ -140,11 +165,19 @@ impl TitleIndexRepo for Store {
         Store::get_title(self, title_id).await
     }
 
-    async fn record_install(&self, title_id: &TitleId, digest: &str) -> Result<(), StoreError> {
+    async fn record_install(
+        &self,
+        title_id: &TitleId,
+        digest: &Blake3Hex,
+    ) -> Result<(), StoreError> {
         Store::record_install(self, title_id, digest).await
     }
 
-    async fn record_replace(&self, title_id: &TitleId, current_b3: &str) -> Result<(), StoreError> {
+    async fn record_replace(
+        &self,
+        title_id: &TitleId,
+        current_b3: &Blake3Hex,
+    ) -> Result<(), StoreError> {
         Store::record_replace(self, title_id, current_b3).await
     }
 }
@@ -159,9 +192,10 @@ impl JobsRepo for Store {
     async fn create(
         &self,
         kind: JobKind,
+        title_id: &TitleId,
         parent_job_id: Option<JobId>,
     ) -> Result<Job, StoreError> {
-        Store::create_job(self, kind, parent_job_id).await
+        Store::create_job(self, kind, title_id, parent_job_id).await
     }
 
     async fn advance(&self, id: JobId, event: JobEvent) -> Result<Job, StoreError> {
@@ -170,28 +204,20 @@ impl JobsRepo for Store {
 }
 
 fn open_conn(path: &Path) -> Result<Connection, StoreError> {
-    let conn = Connection::open(path).map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|err| StoreError::Sqlite(err.to_string()))?;
+    let conn = Connection::open(path).map_err(sqlite)?;
+    conn.busy_timeout(Duration::from_secs(5)).map_err(sqlite)?;
     conn.pragma_update(None, "foreign_keys", true)
-        .map_err(|err| StoreError::Sqlite(err.to_string()))?;
+        .map_err(sqlite)?;
     Ok(conn)
 }
 
-fn range_concurrency_from_i64(n: i64) -> Result<u32, StoreError> {
-    let n = u32::try_from(n)
-        .map_err(|_| StoreError::Sqlite(format!("range_concurrency {n} is out of range")))?;
-    if n == 0 {
-        return Err(StoreError::Sqlite(
-            "range_concurrency must be greater than zero".into(),
-        ));
-    }
-    Ok(n)
+pub(crate) fn sqlite(err: impl ToString) -> StoreError {
+    StoreError::Sqlite(err.to_string())
 }
 
 fn user_version(conn: &Connection) -> Result<i64, StoreError> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|err| StoreError::Sqlite(err.to_string()))
+        .map_err(sqlite)
 }
 
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
@@ -209,9 +235,92 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             );
             PRAGMA user_version = 1;",
         )
-        .map_err(|err| StoreError::Sqlite(err.to_string()))?;
+        .map_err(sqlite)?;
     }
     if version < 2 {
+        conn.execute_batch(&format!(
+            "CREATE TABLE title_index (
+                title_id TEXT PRIMARY KEY NOT NULL,
+                install_b3 TEXT NOT NULL,
+                current_b3 TEXT NOT NULL
+            );
+            {JOBS_DDL}
+            PRAGMA user_version = 2;"
+        ))
+        .map_err(sqlite)?;
+    }
+    if version < 3 {
+        ensure_jobs_title_id(conn)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(sqlite)?;
+    }
+    Ok(())
+}
+
+fn jobs_has_title_id(conn: &Connection) -> Result<bool, StoreError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(jobs)").map_err(sqlite)?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite)?;
+    for col in cols {
+        if col.map_err(sqlite)? == "title_id" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_jobs_title_id(conn: &Connection) -> Result<(), StoreError> {
+    if jobs_has_title_id(conn)? {
+        return Ok(());
+    }
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
+        .map_err(sqlite)?;
+    if n > 0 {
+        return Err(StoreError::Sqlite(
+            "cannot migrate jobs rows that have no title_id".into(),
+        ));
+    }
+    conn.execute_batch(&format!("DROP TABLE jobs; {JOBS_DDL}"))
+        .map_err(sqlite)
+}
+
+#[cfg(test)]
+pub(crate) fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "mediaops-store-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    dir
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mediaops_core::{JobKind, TitleId, WantState};
+
+    fn write_v1(path: &Path) {
+        let conn = Connection::open(path).expect("raw");
+        conn.execute_batch(
+            "CREATE TABLE probes (
+                endpoint_fingerprint TEXT PRIMARY KEY NOT NULL,
+                range_concurrency INTEGER NOT NULL
+            );
+            INSERT INTO probes (endpoint_fingerprint, range_concurrency) VALUES ('abc', 4);
+            PRAGMA user_version = 1;",
+        )
+        .expect("v1");
+    }
+
+    fn write_v2_anonymous_jobs(path: &Path) {
+        write_v1(path);
+        let conn = Connection::open(path).expect("raw");
         conn.execute_batch(
             "CREATE TABLE title_index (
                 title_id TEXT PRIMARY KEY NOT NULL,
@@ -227,260 +336,7 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
             );
             PRAGMA user_version = 2;",
         )
-        .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    }
-    Ok(())
-}
-
-fn get_probe(conn: &Connection, fingerprint: &str) -> Result<Option<Probe>, StoreError> {
-    let row = conn
-        .query_row(
-            "SELECT endpoint_fingerprint, range_concurrency FROM probes WHERE endpoint_fingerprint = ?1",
-            params![fingerprint],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    match row {
-        None => Ok(None),
-        Some((endpoint_fingerprint, n)) => Ok(Some(Probe {
-            endpoint_fingerprint,
-            range_concurrency: range_concurrency_from_i64(n)?,
-        })),
-    }
-}
-
-fn put_probe(conn: &Connection, fingerprint: &str, n: i64) -> Result<(), StoreError> {
-    conn.execute(
-        "INSERT INTO probes (endpoint_fingerprint, range_concurrency)
-         VALUES (?1, ?2)
-         ON CONFLICT(endpoint_fingerprint) DO UPDATE SET range_concurrency = excluded.range_concurrency",
-        params![fingerprint, n],
-    )
-    .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    Ok(())
-}
-
-fn get_title(conn: &Connection, title_id: &TitleId) -> Result<Option<TitleIndexEntry>, StoreError> {
-    let key = title_id.render();
-    let row = conn
-        .query_row(
-            "SELECT title_id, install_b3, current_b3 FROM title_index WHERE title_id = ?1",
-            params![key],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    match row {
-        None => Ok(None),
-        Some((raw_id, install_b3, current_b3)) => {
-            let parsed = TitleId::parse(&raw_id)
-                .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-            Ok(Some(TitleIndexEntry::new(parsed, install_b3, current_b3)?))
-        }
-    }
-}
-
-fn record_install(conn: &Connection, title_id: &TitleId, digest: &str) -> Result<(), StoreError> {
-    let entry = TitleIndexEntry::new(title_id.clone(), digest, digest)?;
-    match get_title(conn, title_id)? {
-        None => {
-            conn.execute(
-                "INSERT INTO title_index (title_id, install_b3, current_b3) VALUES (?1, ?2, ?3)",
-                params![
-                    entry.title_id().render(),
-                    entry.install_b3(),
-                    entry.current_b3()
-                ],
-            )
-            .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-            Ok(())
-        }
-        Some(existing) if existing.install_b3() == digest => Ok(()),
-        Some(_) => Err(StoreError::TitleIndex(
-            TitleIndexError::InstallDigestImmutable,
-        )),
-    }
-}
-
-fn record_replace(conn: &Connection, title_id: &TitleId, current_b3: &str) -> Result<(), StoreError> {
-    let _ = TitleIndexEntry::new(title_id.clone(), current_b3, current_b3)?;
-    let Some(existing) = get_title(conn, title_id)? else {
-        return Err(StoreError::TitleIndex(TitleIndexError::NotInstalled));
-    };
-    conn.execute(
-        "UPDATE title_index SET current_b3 = ?1 WHERE title_id = ?2",
-        params![current_b3, existing.title_id().render()],
-    )
-    .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    Ok(())
-}
-
-fn get_job(conn: &Connection, id: JobId) -> Result<Option<Job>, StoreError> {
-    let row = conn
-        .query_row(
-            "SELECT id, kind, state, parent_job_id FROM jobs WHERE id = ?1",
-            params![id.get()],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    match row {
-        None => Ok(None),
-        Some((raw_id, kind, state, parent)) => Ok(Some(job_from_row(raw_id, &kind, &state, parent)?)),
-    }
-}
-
-fn job_from_row(
-    raw_id: i64,
-    kind: &str,
-    state: &str,
-    parent: Option<i64>,
-) -> Result<Job, StoreError> {
-    let id = JobId::new(raw_id)?;
-    let kind = JobKind::parse(kind)?;
-    let state = JobState::parse(kind, state)?;
-    let parent_job_id = match parent {
-        None => None,
-        Some(raw) => Some(JobId::new(raw)?),
-    };
-    Ok(Job::new(id, state, parent_job_id)?)
-}
-
-fn create_job(
-    conn: &Connection,
-    kind: JobKind,
-    parent_job_id: Option<JobId>,
-) -> Result<Job, StoreError> {
-    let state = JobState::initial(kind);
-    let parent = parent_job_id.map(JobId::get);
-    conn.execute(
-        "INSERT INTO jobs (kind, state, parent_job_id) VALUES (?1, ?2, ?3)",
-        params![kind.as_str(), state.as_str(), parent],
-    )
-    .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    let id = JobId::new(conn.last_insert_rowid())?;
-    Ok(Job::new(id, state, parent_job_id)?)
-}
-
-fn advance_job(conn: &Connection, id: JobId, event: JobEvent) -> Result<Job, StoreError> {
-    let job = get_job(conn, id)?.ok_or(StoreError::JobNotFound(id))?;
-    let next = advance(&job.state(), event)?;
-    conn.execute(
-        "UPDATE jobs SET kind = ?1, state = ?2 WHERE id = ?3",
-        params![next.kind().as_str(), next.as_str(), id.get()],
-    )
-    .map_err(|err| StoreError::Sqlite(err.to_string()))?;
-    Ok(Job::new(id, next, job.parent_job_id())?)
-}
-
-/// Open a throwaway file-backed store for tests.
-pub async fn open_file(path: &Path) -> Result<Store, StoreError> {
-    Store::open(path).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mediaops_core::{EncodeEvent, EncodeState, PullEvent, PullState, WantState, encode_ready};
-
-    const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mediaops-store-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        dir
-    }
-
-    fn write_v1(path: &Path) {
-        let conn = Connection::open(path).expect("raw");
-        conn.execute_batch(
-            "CREATE TABLE probes (
-                endpoint_fingerprint TEXT PRIMARY KEY NOT NULL,
-                range_concurrency INTEGER NOT NULL
-            );
-            INSERT INTO probes (endpoint_fingerprint, range_concurrency) VALUES ('abc', 4);
-            PRAGMA user_version = 1;",
-        )
-        .expect("v1");
-    }
-
-    #[tokio::test]
-    async fn probes_round_trip_and_fingerprint_is_the_key() {
-        let dir = scratch("round-trip");
-        let store = Store::open(dir.join("state.db")).await.expect("open");
-        let probe = Probe {
-            endpoint_fingerprint: "abc".into(),
-            range_concurrency: 4,
-        };
-        assert!(store.get_probe("abc").await.expect("get").is_none());
-        store.put_probe(&probe).await.expect("put");
-        assert_eq!(
-            store.get_probe("abc").await.expect("get").as_ref(),
-            Some(&probe)
-        );
-        store
-            .put_probe(&Probe {
-                endpoint_fingerprint: "abc".into(),
-                range_concurrency: 8,
-            })
-            .await
-            .expect("update");
-        assert_eq!(
-            store
-                .get_probe("abc")
-                .await
-                .expect("get")
-                .unwrap()
-                .range_concurrency,
-            8
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn range_concurrency_zero_is_rejected() {
-        let dir = scratch("zero");
-        let store = Store::open(dir.join("state.db")).await.expect("open");
-        let err = store
-            .put_probe(&Probe {
-                endpoint_fingerprint: "abc".into(),
-                range_concurrency: 0,
-            })
-            .await
-            .expect_err("zero");
-        assert!(err.to_string().contains("range_concurrency"));
-        let conn = Connection::open(dir.join("state.db")).expect("raw");
-        conn.execute(
-            "INSERT INTO probes (endpoint_fingerprint, range_concurrency) VALUES ('abc', 0)",
-            [],
-        )
-        .expect("insert 0");
-        drop(conn);
-        let err = store.get_probe("abc").await.expect_err("get zero");
-        assert!(err.to_string().contains("range_concurrency"));
-        let _ = std::fs::remove_dir_all(dir);
+        .expect("v2");
     }
 
     #[tokio::test]
@@ -488,7 +344,7 @@ mod tests {
         let dir = scratch("future");
         let path = dir.join("state.db");
         let conn = Connection::open(&path).expect("raw");
-        conn.pragma_update(None, "user_version", 3)
+        conn.pragma_update(None, "user_version", 4)
             .expect("user_version");
         drop(conn);
         let err = Store::open(&path).await.expect_err("future schema");
@@ -497,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v1_probes_migrate_to_v2_and_keep_working() {
+    async fn v1_probes_migrate_to_v3_and_keep_working() {
         let dir = scratch("v1-migrate");
         let path = dir.join("state.db");
         write_v1(&path);
@@ -509,137 +365,64 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 2);
-        conn.query_row("SELECT COUNT(*) FROM title_index", [], |row| row.get::<_, i64>(0))
-            .expect("title_index exists");
-        conn.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))
-            .expect("jobs exists");
+        assert_eq!(version, 3);
+        conn.query_row("SELECT COUNT(*) FROM title_index", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("title_index exists");
+        conn.prepare("SELECT title_id FROM jobs")
+            .expect("jobs.title_id exists");
         drop(conn);
 
         let title = TitleId::movie("603").expect("title");
-        store.record_install(&title, DIGEST_A).await.expect("install");
-        let job = store
-            .create_job(JobKind::Want, None)
-            .await
-            .expect("create");
-        assert_eq!(job.state(), JobState::Want(WantState::Open));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn title_index_install_b3_is_immutable_and_replace_updates_current() {
-        let dir = scratch("title-index");
-        let store = Store::open(dir.join("state.db")).await.expect("open");
-        let title = TitleId::movie("603").expect("title");
-        assert!(store.get_title(&title).await.expect("get").is_none());
-        store.record_install(&title, DIGEST_A).await.expect("install");
-        store.record_install(&title, DIGEST_A).await.expect("idempotent");
-        let err = store
-            .record_install(&title, DIGEST_B)
-            .await
-            .expect_err("immutable");
-        assert!(err.to_string().contains("immutable"), "{err}");
-        store.record_replace(&title, DIGEST_B).await.expect("replace");
-        let entry = store.get_title(&title).await.expect("get").expect("row");
-        assert_eq!(entry.install_b3(), DIGEST_A);
-        assert_eq!(entry.current_b3(), DIGEST_B);
-        let other = TitleId::movie("604").expect("other");
-        let err = store
-            .record_replace(&other, DIGEST_B)
-            .await
-            .expect_err("missing");
-        assert!(err.to_string().contains("no title_index row"), "{err}");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn jobs_advance_is_the_sole_state_write_and_illegal_is_a_repo_error() {
-        let dir = scratch("jobs");
-        let store = Store::open(dir.join("state.db")).await.expect("open");
-        let want = store
-            .create_job(JobKind::Want, None)
-            .await
-            .expect("want");
-        let pull = store
-            .create_job(JobKind::Pull, Some(want.id()))
-            .await
-            .expect("pull");
-        assert_eq!(pull.parent_job_id(), Some(want.id()));
-        assert_eq!(pull.state(), JobState::Pull(PullState::Queued));
-
-        let err = store
-            .advance(pull.id(), JobEvent::Pull(PullEvent::Install))
-            .await
-            .expect_err("illegal");
-        assert!(err.to_string().contains("illegal"), "{err}");
-        let still = store.get_job(pull.id()).await.expect("get").expect("row");
-        assert_eq!(still.state(), JobState::Pull(PullState::Queued));
-
-        let pulling = store
-            .advance(pull.id(), JobEvent::Pull(PullEvent::Start))
-            .await
-            .expect("start");
-        assert_eq!(pulling.state(), JobState::Pull(PullState::Pulling));
         store
-            .advance(pull.id(), JobEvent::Pull(PullEvent::FinishRanges))
-            .await
-            .expect("ranges");
-        let installed = store
-            .advance(pull.id(), JobEvent::Pull(PullEvent::Install))
+            .record_install(&title, &Blake3Hex::parse(&"a".repeat(64)).expect("d"))
             .await
             .expect("install");
-        assert_eq!(installed.state(), JobState::Pull(PullState::Installed));
-
-        let encode = store
-            .create_job(JobKind::Encode, Some(pull.id()))
+        let job = store
+            .create_job(JobKind::Want, &title, None)
             .await
-            .expect("encode");
-        let parent = store.get_job(pull.id()).await.expect("get").expect("parent");
-        assert!(encode_ready(&encode, Some(&parent)));
-        store
-            .advance(encode.id(), JobEvent::Encode(EncodeEvent::Start))
-            .await
-            .expect("enc start");
-        let started = store.get_job(encode.id()).await.expect("get").expect("row");
-        assert_eq!(started.state(), JobState::Encode(EncodeState::Encoding));
-        assert!(!encode_ready(&started, Some(&parent)));
+            .expect("create");
+        assert_eq!(job.state(), mediaops_core::JobState::Want(WantState::Open));
+        assert_eq!(job.title_id(), &title);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn missing_parent_job_is_a_foreign_key_error() {
-        let dir = scratch("fk");
-        let store = Store::open(dir.join("state.db")).await.expect("open");
-        let dangling = JobId::new(99).expect("id");
-        let err = store
-            .create_job(JobKind::Pull, Some(dangling))
+    async fn v2_anonymous_jobs_table_is_rebuilt_when_empty() {
+        let dir = scratch("v2-repair");
+        let path = dir.join("state.db");
+        write_v2_anonymous_jobs(&path);
+        let store = Store::open(&path).await.expect("open");
+        let title = TitleId::movie("603").expect("title");
+        let job = store
+            .create_job(JobKind::Want, &title, None)
             .await
-            .expect_err("fk");
-        assert!(err.to_string().contains("sqlite"), "{err}");
+            .expect("create");
+        assert_eq!(job.title_id(), &title);
+        let conn = Connection::open(&path).expect("raw");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 3);
+        drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn probe_repo_trait_is_implemented() {
-        let dir = scratch("trait");
-        let store = Store::open(dir.join("state.db")).await.expect("open");
-        ProbeRepo::put_probe(
-            &store,
-            &Probe {
-                endpoint_fingerprint: "fp".into(),
-                range_concurrency: 2,
-            },
+    async fn v2_anonymous_jobs_with_rows_cannot_be_migrated() {
+        let dir = scratch("v2-blocked");
+        let path = dir.join("state.db");
+        write_v2_anonymous_jobs(&path);
+        let conn = Connection::open(&path).expect("raw");
+        conn.execute(
+            "INSERT INTO jobs (kind, state, parent_job_id) VALUES ('want', 'open', NULL)",
+            [],
         )
-        .await
-        .expect("put");
-        assert_eq!(
-            ProbeRepo::get_probe(&store, "fp")
-                .await
-                .expect("get")
-                .expect("row")
-                .range_concurrency,
-            2
-        );
+        .expect("row");
+        drop(conn);
+        let err = Store::open(&path).await.expect_err("blocked");
+        assert!(err.to_string().contains("no title_id"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

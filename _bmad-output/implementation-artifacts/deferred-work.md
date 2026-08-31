@@ -18,22 +18,22 @@ Story 1.2 review is **closed** (2026-08-30). Spec `followup_review_recommended: 
 
 ## Deferred from: spec split of spec-1-3-desiredstate-plan-jobs-and-store (2026-08-29)
 
-Explored 2026-08-30 (after PR #4). Proposed follow-ons: slice A `core::jobs` (pure), then slice B store v2 (traits + `title_index`/`jobs`, migrate `user_version` 1→2). See spec-1-3 "Split remainder". Do not greenfield sqlite: Epic 2 already owns `probes` at version 1.
+Explored 2026-08-30 (after PR #4). Implemented 2026-08-30 (`0fb6869` + review follow-up): slice A `core::jobs`, slice B store schema v3 (`title_index` / `jobs.title_id`, traits in `core`). Do not greenfield sqlite: Epic 2 already owns `probes` at version 1.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
-  summary: `core::jobs` state machines — JobKind, per-kind states, `advance`, and Encode-ready-when-parent-Installed.
-  evidence: Split from 1.3 so this spec can stay inside the token budget; AD-10 types are independently shippable from DesiredState/Plan and were inflating the I/O matrix and Design Notes. Still unbuilt. Can land before sqlite (Epic 4 is the first consumer).
+  summary: `core::jobs` state machines — JobKind, per-kind states, `advance`, Encode-ready-when-parent-Installed, `title_id` on the job.
+  evidence: Closed. Follow-up to `0fb6869` added the subject (`title_id`) so crash recovery can find `_incoming/<TitleId>/…`.
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
-  summary: `store` v2 persistence — rusqlite adapter already exists for `probes`; add `title_index`/`jobs` tables and repository traits in `core`.
-  evidence: Split from 1.3; AD-8. Epic 2 inverted the original "do not create probes yet" AC. Next story migrates 1→2, wraps probes in the same trait family, keeps mediaopsd store-free.
+  summary: `store` v3 persistence — rusqlite adapter for `probes` / `title_index` / `jobs`; repository traits in `core`; CAS `advance` and upsert `record_install`.
+  evidence: Closed. `user_version` 1→2 creates tables; 2→3 repairs a v2 `jobs` table that lacked `title_id` (empty only). mediaopsd stays store-free.
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-desiredstate-plan-jobs-and-store.md`
-  summary: `install.rs` still says digest persistence is story 1.3, but this slice deferred `title_index`/`store`.
-  evidence: `crates/core/src/install.rs` crate docs still claim replace is the only writer of `current_b3` and that persistence is story 1.3. Fold the comment (and the persistence door) into slice B.
+  summary: `install.rs` crate docs vs TitleIndexRepo.
+  evidence: Closed. The gate is filesystem-only; callers persist through `TitleIndexRepo` after `install` / `replace` (Epic 3).
 
 ## Deferred from: code review of PR #4 / SPEC.md (2026-08-30)
 
 - **Home gateway owns the WAN pool and the CLI never contains a seedbox address** (`bins/mediaops/src/bootstrap.rs:123`) — AD-4 / NFR3 / Epic 3. Bootstrap today calls `probe_range_n` from the CLI. Long-term the home unix-socket gateway is the only process that knows the seedbox address; moving the probe is Epic 3 work, not a silent Epic 2 rewrite.
-- **`store` repository traits live in `core`** (`crates/store/src/lib.rs:21`) — AD-8. This slice added a concrete `Store` and `probes` table; the 1.3 split already deferred the trait + `title_index`/`jobs`.
+- **`store` repository traits live in `core`** — closed 2026-08-30: `ProbeRepo`, `TitleIndexRepo`, and `JobsRepo` are in `core`; `store` is the adapter.
 - **`parse_ssh_config` does not honor `Include`, `Host *`, or `Match`** (`crates/ssh/src/lib.rs:34`) — v1 imports `Host seedbox` as an exact block. Full OpenSSH semantics can wait until a real config fails.
 - **GetRange is not a streaming disk pipe** (`crates/net/src/seedbox.rs:146`) — after a size cap and a full read, true chunked `AsyncRead` with client-cancel backpressure is still missing. Deferred as a follow-up to the cap/read fix.
 - **TLS accept is sequential (`.then`)** (`crates/net/src/listen.rs:28`) — a handshake timeout is the important guard; concurrent accept is a later listen-loop refinement.
