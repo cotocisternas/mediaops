@@ -185,6 +185,34 @@ pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
     ExecCommand::new("ssh", args)
 }
 
+/// Bootstrap/upgrade install step: musl `mediaopsd` copy + unit restart. Never apt/panel.
+pub async fn copy_binary_and_restart_unit(
+    exec: &impl ExecPort,
+    local_binary: &Path,
+    ssh_config: &Path,
+) -> Result<(), SshError> {
+    exec.run(&musl_build_command()).await?;
+    exec.run(&ssh_exec(ssh_config, &["mkdir", "-p", ".local/bin"]))
+        .await?;
+    exec.run(&scp_file_command(
+        local_binary,
+        ".local/bin/mediaopsd",
+        ssh_config,
+    ))
+    .await?;
+    exec.run(&ssh_exec(
+        ssh_config,
+        &["systemctl", "--user", "daemon-reload"],
+    ))
+    .await?;
+    exec.run(&ssh_exec(
+        ssh_config,
+        &["systemctl", "--user", "restart", "mediaopsd.service"],
+    ))
+    .await?;
+    Ok(())
+}
+
 pub async fn install_provider(
     exec: &impl ExecPort,
     kind: ProviderKind,
@@ -407,6 +435,45 @@ mod tests {
         assert!(conf.contains("Host $host"));
         assert!(conf.contains("127.0.0.1:8989/sonarr"));
         assert!(!conf.contains("Host 127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_copies_binary_and_restarts_never_apt_or_panel() {
+        let exec = TranscriptExec::new().reply(
+            "cargo",
+            ExecOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+        copy_binary_and_restart_unit(&exec, Path::new("/tmp/mediaopsd"), Path::new("/tmp/ssh"))
+            .await
+            .expect("upgrade");
+        let calls = exec.recorded();
+        assert!(
+            calls.iter().any(
+                |c| c.program_name() == "scp" && c.args.iter().any(|a| a.contains("mediaopsd"))
+            ),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.args.iter().any(|a| a == "restart")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.program_name() != "apt" && c.program_name() != "apt-get"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c
+                .args
+                .iter()
+                .any(|a| a.contains("panel") || a.contains("swizzin"))),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test]

@@ -267,6 +267,23 @@ enum LibraryCommand {
 
 #[derive(Subcommand, Debug)]
 enum SeedboxCommand {
+    /// Re-run bootstrap install step: copy musl mediaopsd + restart unit.
+    Upgrade {
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        ssh_config: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+    },
     /// Apply grabber indexer/client sets from desired-state (Control GrabApply).
     Apply {
         #[arg(long)]
@@ -432,6 +449,47 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
 async fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         None => emit_success(cli.json),
+        Some(Command::Seedbox(SeedboxArgs {
+            command:
+                SeedboxCommand::Upgrade {
+                    yes,
+                    config_dir,
+                    desired_state,
+                    ssh_config,
+                    state_db,
+                    socket,
+                    tls_dir,
+                },
+        })) => {
+            let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
+            let args = bootstrap::UpgradeArgs {
+                yes,
+                desired_state: desired_state
+                    .unwrap_or_else(|| bootstrap::default_desired_state(&config_dir)),
+                ssh_config: ssh_config.unwrap_or_else(bootstrap::default_ssh_config),
+                state_db: state_db.unwrap_or_else(bootstrap::default_state_db),
+                socket: socket.unwrap_or_else(bootstrap::default_socket),
+                tls_dir: tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir)),
+                config_dir,
+                skip_edge: false,
+            };
+            match bootstrap::upgrade(args, &SystemExec).await {
+                Ok(report) => {
+                    let line = bootstrap::render_upgrade(cli.json, &report)
+                        .map_err(|e| AppError::Runtime(anyhow!(e)))?;
+                    write_stdout(&line)
+                }
+                Err(err) => {
+                    let mapped = match err.exit_code() {
+                        ExitCode::Usage => AppError::Usage(err.to_string()),
+                        ExitCode::PolicyRefusal => AppError::Policy(err.to_string()),
+                        ExitCode::LockConflict => AppError::LockConflict(err.to_string()),
+                        _ => AppError::Runtime(anyhow!(err.to_string())),
+                    };
+                    Err(mapped)
+                }
+            }
+        }
         Some(Command::Seedbox(SeedboxArgs {
             command:
                 SeedboxCommand::Apply {
@@ -746,6 +804,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 config_dir,
                 state_db,
                 ssh_config,
+                &SystemExec,
             )
             .await?;
             write_stdout(&line)

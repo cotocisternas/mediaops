@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-29-2026 01:26
-last_updated: 09-01-2026 04:50
+last_updated: 09-01-2026 12:00
 project: mediaops
 project_key: NOKEY
 tracking_system: file-system
@@ -61,11 +61,11 @@ development_status:
   4-3-first-demo-on-this-box: done
   epic-4-retrospective: optional
 
-  epic-5: backlog
-  5-1-arr-crate-over-httptransport: backlog
-  5-2-grab-apply-as-set-diff: backlog
-  5-3-edge-apply-doctor-and-repair: backlog
-  5-4-seedbox-upgrade-and-version-pins: backlog
+  epic-5: done
+  5-1-arr-crate-over-httptransport: done
+  5-2-grab-apply-as-set-diff: done
+  5-3-edge-apply-doctor-and-repair: done
+  5-4-seedbox-upgrade-and-version-pins: done
   epic-5-retrospective: optional
 
   epic-6: backlog

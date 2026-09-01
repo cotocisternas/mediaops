@@ -30,6 +30,19 @@ pub fn check_handshake(proto_package: &str) -> Result<(), ControlError> {
     Ok(())
 }
 
+/// Warn when major matches and minor differs. Refuse is package-only.
+pub fn minor_skew_warning(daemon_semver: &str, cli_semver: &str) -> Option<String> {
+    let (d_maj, d_min, _) = mediaops_core::parse_semver(daemon_semver)?;
+    let (c_maj, c_min, _) = mediaops_core::parse_semver(cli_semver)?;
+    if d_maj == c_maj && d_min != c_min {
+        Some(format!(
+            "daemon {daemon_semver} minor-skew vs cli {cli_semver}"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Failure converting a generated wire value to a domain type (or the reverse).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConvertError {
@@ -651,6 +664,28 @@ mod tests {
     }
 
     #[test]
+    fn edge_check_and_apply_reports_from_wire() {
+        let check = EdgeCheckResponse {
+            semver: "0.1.0".into(),
+            proto_package: PROTO_PACKAGE.into(),
+            fingerprint: "abc".into(),
+            invariant_ok: false,
+            drift: "bind-to-star".into(),
+        };
+        let report = EdgeApiReport::from(check);
+        assert!(!report.invariant_ok);
+        assert_eq!(report.fingerprint, "abc");
+        let apply = EdgeApplyResponse {
+            semver: "0.1.0".into(),
+            proto_package: PROTO_PACKAGE.into(),
+            noop: true,
+            diff: String::new(),
+        };
+        let grab = GrabApplyReport::from(apply);
+        assert!(grab.noop);
+    }
+
+    #[test]
     fn df_free_bytes_become_domain_bytes() {
         let response = DfResponse {
             semver: "0.1.0".to_string(),
@@ -762,6 +797,9 @@ mod tests {
     fn handshake_rejects_unknown_package() {
         assert!(check_handshake("mediaops.v2").is_err());
         assert!(check_handshake(PROTO_PACKAGE).is_ok());
+        assert!(minor_skew_warning("0.2.0", "0.1.0").is_some());
+        assert!(minor_skew_warning("0.1.1", "0.1.0").is_none());
+        assert!(minor_skew_warning("0.1.0", "0.1.0").is_none());
     }
 
     #[test]

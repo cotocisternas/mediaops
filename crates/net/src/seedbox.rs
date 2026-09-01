@@ -353,7 +353,7 @@ mod tests {
     use super::*;
     use mediaops_core::{Allowlist, Grabber};
     use mediaops_proto::{
-        DeleteRemoteRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
+        DeleteRemoteRequest, EdgeApplyRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
         GuardPreviewRequest, KeyDiscoveryRequest, PROTO_PACKAGE, RemoteRef as WireRef, StatRequest,
         UnmonitorRequest,
     };
@@ -472,6 +472,12 @@ mod tests {
             .into_inner();
         assert!(repaired.invariant_ok);
         assert_ne!(check.fingerprint, repaired.fingerprint);
+        let apply = seed
+            .edge_apply(Request::new(EdgeApplyRequest::default()))
+            .await
+            .expect("edge apply none")
+            .into_inner();
+        assert!(apply.noop);
         let _ = std::fs::remove_dir_all(root);
     }
 

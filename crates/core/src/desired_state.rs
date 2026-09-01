@@ -166,6 +166,41 @@ pub struct PinMatrixRow {
     pub refuse_above: String,
 }
 
+/// Compare `major.minor.patch` (missing patch = 0).
+pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Exit 5 when a pin is above `refuse_above` (Lidarr glibc trap).
+pub fn pin_matrix_refuse(pins: &Pins) -> Option<String> {
+    for row in &pins.matrix {
+        let current = match row.package.as_str() {
+            "lidarr" => match pins.lidarr.as_deref() {
+                Some(v) => v,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Some(cur) = parse_semver(current) else {
+            continue;
+        };
+        let Some(limit) = parse_semver(&row.refuse_above) else {
+            continue;
+        };
+        if cur > limit {
+            return Some(format!(
+                "Lidarr glibc trap: refusing {} {} above {} on {} (glibc_min {})",
+                row.package, current, row.refuse_above, row.os, row.glibc_min
+            ));
+        }
+    }
+    None
+}
+
 /// Paths + SHA-256-of-DER fingerprints. Never PEMs (AD-14).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -733,5 +768,26 @@ app = "prowlarr"
                 name
             }) if name == "NZBgeek"
         ));
+    }
+
+    #[test]
+    fn lidarr_glibc_trap_refuses_above_pin() {
+        let ok = Pins {
+            lidarr: Some("2.14.5".into()),
+            matrix: vec![PinMatrixRow {
+                package: "lidarr".into(),
+                os: "ubuntu-20.04".into(),
+                glibc_min: "2.31".into(),
+                refuse_above: "2.14.5".into(),
+            }],
+        };
+        assert!(pin_matrix_refuse(&ok).is_none());
+        let trap = Pins {
+            lidarr: Some("2.15.0".into()),
+            matrix: ok.matrix.clone(),
+        };
+        let msg = pin_matrix_refuse(&trap).expect("refuse");
+        assert!(msg.contains("Lidarr glibc trap"), "{msg}");
+        assert!(msg.contains("2.15.0"), "{msg}");
     }
 }

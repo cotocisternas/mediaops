@@ -589,4 +589,24 @@ grabber = "servarr"
             planned.actions
         );
     }
+
+    #[test]
+    fn edge_frozen_emits_edge_apply_first() {
+        let desired = ds();
+        let listings = [entry(&movie_rel("603", 1999), 10)];
+        let planned = plan_actions(PlanRequest {
+            listings: &listings,
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &desired,
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: true,
+        });
+        assert!(
+            matches!(planned.actions.first(), Some(Action::EdgeApply)),
+            "{:?}",
+            planned.actions
+        );
+    }
 }

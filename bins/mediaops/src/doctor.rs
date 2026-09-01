@@ -208,4 +208,28 @@ mod tests {
         };
         assert!(is_frozen(&bad, Some("aaa")));
     }
+
+    #[tokio::test]
+    async fn doctor_read_only_ok_through_home_socket() {
+        let _g = crate::test_support::serial_net();
+        let dir = crate::test_support::scratch("doctor-ok");
+        let lb = crate::test_support::start_pair(None, b"").await;
+        let json = doctor(
+            true,
+            false,
+            false,
+            None,
+            None,
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            Some(dir.clone()),
+            Some(dir.join("state.db")),
+        )
+        .await
+        .expect("doctor");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["read_only"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

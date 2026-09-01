@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use mediaops_core::{ControlPort, Envelope};
+use mediaops_core::{ControlPort, Envelope, ExecPort};
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
-use mediaops_ssh::{SystemExec, desired_nginx_app, write_remote_file};
+use mediaops_ssh::{desired_nginx_app, write_remote_file};
 use mediaops_store::Store;
 use mediaops_transfer::connect_home;
 use serde::Serialize;
@@ -30,6 +30,7 @@ pub async fn repair_edge(
     config_dir: Option<PathBuf>,
     state_db: Option<PathBuf>,
     ssh_config: Option<PathBuf>,
+    exec: &impl ExecPort,
 ) -> Result<String, AppError> {
     if !repair {
         return Err(AppError::Usage(
@@ -85,7 +86,7 @@ pub async fn repair_edge(
             });
         let desired = desired_nginx_app(url_base, port);
         let remote = format!("/etc/nginx/apps/{app}.conf");
-        let diff = write_remote_file(&SystemExec, &ssh_config, &remote, &desired)
+        let diff = write_remote_file(exec, &ssh_config, &remote, &desired)
             .await
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
         if !diff.is_empty() {
@@ -130,12 +131,54 @@ mod tests {
 
     #[tokio::test]
     async fn repair_without_confirm_or_pin_is_refused() {
-        let err = repair_edge(true, true, false, None, None, None, None, None, None, None)
-            .await
-            .expect_err("confirm");
+        let err = repair_edge(
+            true,
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mediaops_ssh::TranscriptExec::new(),
+        )
+        .await
+        .expect_err("confirm");
         assert!(
             matches!(err, AppError::Policy(ref m) if m.contains("confirm") || m.contains("pin")),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn repair_edge_persists_fingerprint_via_control_and_ssh_transcript() {
+        let _g = crate::test_support::serial_net();
+        let dir = crate::test_support::scratch("repair-ok");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let lb = crate::test_support::start_pair(None, b"").await;
+        let ssh = dir.join("ssh_config");
+        std::fs::write(&ssh, "Host seedbox\n  HostName 127.0.0.1\n").expect("ssh");
+        let exec = mediaops_ssh::TranscriptExec::new();
+        let json = repair_edge(
+            true,
+            true,
+            true,
+            None,
+            Some(ds),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            Some(dir.clone()),
+            Some(dir.join("state.db")),
+            Some(ssh),
+            &exec,
+        )
+        .await
+        .expect("repair");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        assert!(exec.recorded().iter().any(|c| c.program_name() == "ssh"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

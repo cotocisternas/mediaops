@@ -771,4 +771,139 @@ kind = "sabnzbd"
         assert!(report.drift.contains("bind-to-star"));
         let _ = fs::remove_dir_all(home);
     }
+
+    #[tokio::test]
+    async fn cf_pack_policy_and_edge_apply_mutate_then_noop() {
+        let home = scratch("cf-edge");
+        write_sonarr_key(&home, "k");
+        let toml = r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 0
+range_len_mib = 1
+max_nvenc = 1
+lock = false
+grabber = "servarr"
+[[grab.custom_format_packs]]
+name = "prefer-h264"
+scores = { "x264" = 100 }
+[grab.policy]
+delay_minutes = 5
+[edge]
+url_bases = { sonarr = "/sonarr" }
+bind = "127.0.0.1"
+auth = "forms"
+"#;
+        let ds = DesiredState::from_toml(toml).expect("ds");
+        let mut t = CassetteTransport::new();
+        t.push("GET", "/sonarr/api/v3/indexer", None, json_ok(json!([])));
+        t.push(
+            "GET",
+            "/sonarr/api/v3/downloadclient",
+            None,
+            json_ok(json!([])),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/customformat",
+            None,
+            json_ok(json!([])),
+        );
+        t.push(
+            "POST",
+            "/sonarr/api/v3/customformat",
+            None,
+            json_ok(json!({"id":1,"name":"x264"})),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/delayprofile",
+            None,
+            json_ok(json!([{"id":1,"delay":0}])),
+        );
+        t.push(
+            "PUT",
+            "/sonarr/api/v3/delayprofile/1",
+            None,
+            json_ok(json!({"id":1,"delay":5})),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/config/host",
+            None,
+            json_ok(json!({
+                "bindAddress": "*",
+                "urlBase": "",
+                "authenticationMethod": "none"
+            })),
+        );
+        t.push(
+            "PUT",
+            "/sonarr/api/v3/config/host",
+            None,
+            json_ok(json!({
+                "bindAddress": "127.0.0.1",
+                "urlBase": "/sonarr",
+                "authenticationMethod": "forms"
+            })),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/config/host",
+            None,
+            json_ok(json!({
+                "bindAddress": "127.0.0.1",
+                "urlBase": "/sonarr",
+                "authenticationMethod": "forms"
+            })),
+        );
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds);
+        let grab = ops.grab_apply(&ds).await.expect("grab");
+        assert!(!grab.noop);
+        let edge = ops.edge_apply(&ds).await.expect("edge");
+        assert!(!edge.noop);
+        let edge2 = ops.edge_apply(&ds).await.expect("edge2");
+        assert!(edge2.noop, "{}", edge2.diff);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn extra_live_indexer_is_deleted() {
+        let home = scratch("del-idx");
+        write_sonarr_key(&home, "k");
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/indexer",
+            None,
+            json_ok(json!([
+                {"id":1,"name":"NZBgeek","priority":25},
+                {"id":2,"name":"Other","priority":1}
+            ])),
+        );
+        t.push(
+            "DELETE",
+            "/sonarr/api/v3/indexer/2",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/downloadclient",
+            None,
+            json_ok(json!([{"id":1,"name":"SABnzbd","priority":1}])),
+        );
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let report = ops.grab_apply(&ds_servarr()).await.expect("apply");
+        assert!(
+            report.diff.contains("-sonarr indexer Other"),
+            "{}",
+            report.diff
+        );
+        let _ = fs::remove_dir_all(home);
+    }
 }
