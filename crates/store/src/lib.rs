@@ -542,4 +542,86 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    fn write_v4_title_without_path(path: &Path) {
+        let conn = Connection::open(path).expect("raw");
+        conn.execute_batch(
+            "CREATE TABLE probes (
+                endpoint_fingerprint TEXT PRIMARY KEY NOT NULL,
+                range_concurrency INTEGER NOT NULL
+            );
+            CREATE TABLE title_index (
+                title_id TEXT PRIMARY KEY NOT NULL,
+                install_b3 TEXT NOT NULL,
+                current_b3 TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY NOT NULL,
+                title_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                parent_job_id INTEGER,
+                FOREIGN KEY (parent_job_id) REFERENCES jobs(id)
+            );
+            CREATE TABLE machine (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+            PRAGMA user_version = 4;",
+        )
+        .expect("v4");
+        let title = TitleId::movie("603").expect("title");
+        let digest = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO title_index (title_id, install_b3, current_b3) VALUES (?1, ?2, ?3)",
+            rusqlite::params![title.render(), digest, digest],
+        )
+        .expect("row");
+    }
+
+    #[tokio::test]
+    async fn v4_title_index_row_migrates_empty_path_and_record_install_backfills() {
+        let dir = scratch("v4-path");
+        let path = dir.join("state.db");
+        write_v4_title_without_path(&path);
+        let store = Store::open(&path).await.expect("open");
+        let title = TitleId::movie("603").expect("title");
+        let entry = store.get_title(&title).await.expect("get").expect("row");
+        assert!(entry.path_missing(), "v4 row must migrate to empty path");
+        let digest = Blake3Hex::parse(&"a".repeat(64)).expect("d");
+        let schema = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        store
+            .record_install(&title, &digest, schema)
+            .await
+            .expect("backfill");
+        let entry = store.get_title(&title).await.expect("get").expect("row");
+        assert_eq!(entry.path(), schema);
+        let listed = store.list_titles().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path(), schema);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn create_want_is_idempotent_for_one_open_row() {
+        let dir = scratch("want-unique");
+        let store = Store::open(dir.join("state.db")).await.expect("open");
+        let title = TitleId::movie("603").expect("title");
+        let a = store
+            .create_job(JobKind::Want, &title, None)
+            .await
+            .expect("first");
+        let b = store
+            .create_job(JobKind::Want, &title, None)
+            .await
+            .expect("second");
+        assert_eq!(a.id(), b.id());
+        let jobs = store.list_jobs_by_title(&title).await.expect("list");
+        let opens = jobs
+            .iter()
+            .filter(|j| matches!(j.state(), mediaops_core::JobState::Want(WantState::Open)))
+            .count();
+        assert_eq!(opens, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

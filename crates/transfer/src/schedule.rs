@@ -84,9 +84,6 @@ mod tests {
             },
         ];
         let slots = take_slots(&mut files, 4);
-        assert_eq!(
-            slots,
-            vec![(0, 0, 8), (1, 0, 4), (0, 8, 8), (0, 16, 8)]
-        );
+        assert_eq!(slots, vec![(0, 0, 8), (1, 0, 4), (0, 8, 8), (0, 16, 8)]);
     }
 }

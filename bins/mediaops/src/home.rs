@@ -319,6 +319,9 @@ fn placement_for(
         if parsed_id == *title_id {
             return Ok(placement);
         }
+        return Err(AppError::Usage(
+            "--path TitleId does not match --title-id".into(),
+        ));
     }
     let ext = name
         .rsplit_once('.')
@@ -361,5 +364,52 @@ fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
         mediaops_core::ExitCode::PolicyRefusal => AppError::Policy(err.to_string()),
         mediaops_core::ExitCode::LockConflict => AppError::LockConflict(err.to_string()),
         _ => AppError::Runtime(anyhow_err(err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn album_install_uses_parse_placement_without_title_year() {
+        let title = TitleId::album("0f82b02e-c6cd-4242-b195-93d4bf3e0d63").expect("album");
+        let path = Path::new(
+            "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.The.Gates.Of.Delirium.(2013).flac",
+        );
+        let placement = placement_for(
+            &title,
+            path,
+            "01.The.Gates.Of.Delirium.(2013).flac",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            placement,
+            Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac")
+        );
+    }
+
+    #[test]
+    fn parse_placement_title_mismatch_is_usage() {
+        let title = TitleId::movie("603").expect("id");
+        let path = Path::new("movies/Other.(2000).{tmdb-604}/Other.(2000).mkv");
+        let err = placement_for(
+            &title,
+            path,
+            "Other.(2000).mkv",
+            Some("Other".into()),
+            Some(2000),
+            None,
+            None,
+        );
+        assert!(
+            matches!(err, Err(AppError::Usage(_))),
+            "mismatched TitleId must be usage, not a silent --title/--year fallback"
+        );
     }
 }

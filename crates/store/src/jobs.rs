@@ -125,6 +125,33 @@ fn parent_kind_matches(
     Ok(())
 }
 
+fn open_want(conn: &Connection, title_id: &TitleId) -> Result<Option<Job>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT id, title_id, kind, state, parent_job_id FROM jobs
+             WHERE title_id = ?1 AND kind = 'want' AND state = 'open'
+             ORDER BY id LIMIT 1",
+            params![title_id.render()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite)?;
+    match row {
+        None => Ok(None),
+        Some((raw_id, title_id, kind, state, parent)) => Ok(Some(job_from_row(
+            raw_id, &title_id, &kind, &state, parent,
+        )?)),
+    }
+}
+
 fn validate_parent(
     conn: &Connection,
     kind: JobKind,
@@ -158,6 +185,12 @@ pub(crate) fn create_job(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sqlite)?;
     validate_parent(&tx, kind, parent_job_id)?;
+    if kind == JobKind::Want {
+        if let Some(existing) = open_want(&tx, &title_id)? {
+            tx.commit().map_err(sqlite)?;
+            return Ok(existing);
+        }
+    }
     let state = JobState::initial(kind);
     tx.execute(
         "INSERT INTO jobs (title_id, kind, state, parent_job_id) VALUES (?1, ?2, ?3, ?4)",

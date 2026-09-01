@@ -13,6 +13,7 @@ pub const SKIP_UPGRADE_NEVER: &str = "upgrade_never";
 pub const SKIP_WATERMARK: &str = "watermark";
 pub const SKIP_MAX_COPY: &str = "max_copy";
 pub const SKIP_LOCK: &str = "lock";
+pub const SKIP_DUPLICATE_TITLE: &str = "duplicate_title";
 
 /// Exhaustive plan action. Match every variant; do not add a `_` arm.
 ///

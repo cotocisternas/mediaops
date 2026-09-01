@@ -42,7 +42,8 @@ pub use pathschema::{
     staging_path, strip_scene_tags,
 };
 pub use plan::{
-    Action, Plan, PlanError, SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK,
+    Action, Plan, PlanError, SKIP_DUPLICATE_TITLE, SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER,
+    SKIP_WATERMARK,
 };
 pub use probe::{Probe, ProbeError, ProbeRepo, UnderlayMode, endpoint_fingerprint, plateau_n};
 pub use provider::{ProviderError, ProviderKind, already_there_install};

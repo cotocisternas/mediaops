@@ -7,7 +7,9 @@ mod pool;
 mod seedbox;
 
 pub use gateway::HomeGateway;
-pub use listen::{connect_tcp, connect_unix, serve_home_unix, serve_tcp, serve_unix, tcp_connect_count};
+pub use listen::{
+    connect_tcp, connect_unix, serve_home_unix, serve_tcp, serve_unix, tcp_connect_count,
+};
 pub use mint::{IdentityBundle, SERVER_NAME, mint};
 pub use pool::{ChannelPool, SlotGuard};
 pub use seedbox::Seedbox;

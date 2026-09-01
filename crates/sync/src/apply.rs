@@ -1,12 +1,13 @@
 //! Apply a Plan artifact in the locked CLI process.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mediaops_core::{
     Action, InstallError, Job, JobEvent, JobId, JobKind, JobState, JobsRepo, PathSchemaError,
-    Placement, Plan, PlanError, PullEvent, PullState, TitleId, TitleIndexRepo,
-    VerifiedStagingHandle, WantEvent, WantState, install, render, staging_path,
+    Placement, Plan, PlanError, PullEvent, PullState, RemoteRef, SKIP_UPGRADE_NEVER, TitleId,
+    TitleIndexRepo, VerifiedStagingHandle, WantEvent, WantState, install, render, staging_path,
 };
 use mediaops_transfer::{PullSpec, RangeSource, pull_file};
 
@@ -102,6 +103,13 @@ where
                 report.copies += 1;
                 report.installed.push(installed);
             }
+            Action::Skip {
+                title_id: Some(id),
+                reason,
+            } if reason == SKIP_UPGRADE_NEVER => {
+                satisfy_open_want(ctx.jobs, id).await?;
+                report.skips += 1;
+            }
             Action::Skip { .. } => report.skips += 1,
             Action::Encode { .. }
             | Action::Review
@@ -156,10 +164,19 @@ where
         .iter()
         .find(|j| matches!(j.state(), JobState::Want(WantState::Open)))
         .cloned();
-    let pull = match existing.iter().find(|j| {
+    let inflight = existing.iter().find(|j| {
         j.kind() == JobKind::Pull && !matches!(j.state(), JobState::Pull(PullState::Installed))
-    }) {
-        Some(job) => job.clone(),
+    });
+    let pull = match inflight {
+        Some(job) if pull_matches(library_root, title_id, remote, file_len, &final_name)? => {
+            job.clone()
+        }
+        Some(job) => {
+            return Err(ApplyError::Jobs(format!(
+                "in-flight pull {} does not match this Copy remote/len/placement",
+                job.id()
+            )));
+        }
         None => jobs
             .create(JobKind::Pull, title_id, want.as_ref().map(Job::id))
             .await
@@ -168,6 +185,7 @@ where
 
     let mut pull = pull;
     if matches!(pull.state(), JobState::Pull(PullState::Queued)) {
+        write_pull_intent(library_root, title_id, remote, file_len, &final_name)?;
         pull = jobs
             .advance(pull.id(), JobEvent::Pull(PullEvent::Start))
             .await
@@ -175,6 +193,7 @@ where
     }
 
     if matches!(pull.state(), JobState::Pull(PullState::Pulling)) {
+        write_pull_intent(library_root, title_id, remote, file_len, &final_name)?;
         let spec = PullSpec {
             library_root: library_root.to_path_buf(),
             title_id: title_id.clone(),
@@ -200,18 +219,18 @@ where
         let path_str = dest_rel
             .to_str()
             .ok_or_else(|| ApplyError::Jobs("schema path is not utf-8".into()))?;
-        titles
-            .record_install(title_id, &outcome.whole_file_b3, path_str)
-            .await
-            .map_err(|err| ApplyError::Titles(err.to_string()))?;
         pull = jobs
             .advance(pull.id(), JobEvent::Pull(PullEvent::Install))
             .await
             .map_err(|err| ApplyError::Jobs(err.to_string()))?;
+        titles
+            .record_install(title_id, &outcome.whole_file_b3, path_str)
+            .await
+            .map_err(|err| ApplyError::Titles(err.to_string()))?;
         if let Some(want) = want {
-            let _ = jobs
-                .advance(want.id(), JobEvent::Want(WantEvent::Satisfy))
-                .await;
+            jobs.advance(want.id(), JobEvent::Want(WantEvent::Satisfy))
+                .await
+                .map_err(|err| ApplyError::Jobs(err.to_string()))?;
         }
         return Ok(InstalledCopy {
             title_id: title_id.clone(),
@@ -228,11 +247,97 @@ where
     )))
 }
 
+async fn satisfy_open_want<J>(jobs: &J, title_id: &TitleId) -> Result<(), ApplyError>
+where
+    J: JobsRepo,
+    J::Error: std::fmt::Display,
+{
+    let existing = jobs
+        .list_by_title(title_id)
+        .await
+        .map_err(|err| ApplyError::Jobs(err.to_string()))?;
+    for want in existing
+        .iter()
+        .filter(|j| matches!(j.state(), JobState::Want(WantState::Open)))
+    {
+        jobs.advance(want.id(), JobEvent::Want(WantEvent::Satisfy))
+            .await
+            .map_err(|err| ApplyError::Jobs(err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn pull_intent_path(library_root: &Path, title_id: &TitleId) -> PathBuf {
+    library_root
+        .join("_incoming")
+        .join(title_id.staging_token())
+        .join("pull-intent.json")
+}
+
+fn write_pull_intent(
+    library_root: &Path,
+    title_id: &TitleId,
+    remote: &RemoteRef,
+    file_len: u64,
+    final_name: &str,
+) -> Result<(), ApplyError> {
+    let path = pull_intent_path(library_root, title_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| ApplyError::Jobs(err.to_string()))?;
+    }
+    let body = format!(
+        "{}\n{}\n{}\n{}\n",
+        remote.root_id(),
+        remote.rel_path().display(),
+        file_len,
+        final_name
+    );
+    fs::write(&path, body).map_err(|err| ApplyError::Jobs(err.to_string()))
+}
+
+fn read_pull_intent(
+    library_root: &Path,
+    title_id: &TitleId,
+) -> Result<Option<(String, PathBuf, u64, String)>, ApplyError> {
+    let path = pull_intent_path(library_root, title_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(|err| ApplyError::Jobs(err.to_string()))?;
+    let mut lines = text.lines();
+    let root_id = lines.next().unwrap_or_default().to_string();
+    let rel_path = PathBuf::from(lines.next().unwrap_or_default());
+    let file_len = lines
+        .next()
+        .unwrap_or_default()
+        .parse::<u64>()
+        .map_err(|err| ApplyError::Jobs(err.to_string()))?;
+    let final_name = lines.next().unwrap_or_default().to_string();
+    Ok(Some((root_id, rel_path, file_len, final_name)))
+}
+
+fn pull_matches(
+    library_root: &Path,
+    title_id: &TitleId,
+    remote: &RemoteRef,
+    file_len: u64,
+    final_name: &str,
+) -> Result<bool, ApplyError> {
+    match read_pull_intent(library_root, title_id)? {
+        Some((root_id, rel_path, intent_len, intent_name)) => Ok(root_id == remote.root_id()
+            && rel_path == remote.rel_path()
+            && intent_len == file_len
+            && intent_name == final_name),
+        None => Ok(true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mediaops_core::{
-        Blake3Hex, JobError, RemoteRef, TitleIndexEntry, TitleIndexError, parse_placement,
+        Blake3Hex, JobError, JobEvent, JobKind, JobState, PullEvent, RemoteRef, SKIP_UPGRADE_NEVER,
+        TitleId, TitleIndexEntry, TitleIndexError, WantState, parse_placement,
     };
     use mediaops_transfer::TransferError;
     use std::collections::HashMap;
@@ -564,6 +669,175 @@ mod tests {
         assert_eq!(report.copies, 1);
         let installed = &report.installed[0].path;
         assert_eq!(fs::read(installed).expect("read"), body);
+        let listed = titles.list().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title_id(), &TitleId::movie("603").expect("id"));
+        assert!(!listed[0].path_missing());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn lock_true_snapshot_does_not_copy() {
+        let locked = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 8\nmax_nvenc = 1\nlock = true\n";
+        let plan = Plan::from_toml_bytes(locked.as_bytes())
+            .expect("plan")
+            .with_actions(vec![movie_copy(4)]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("locked");
+        let report = apply(
+            &plan,
+            locked.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+            },
+        )
+        .await
+        .expect("apply");
+        assert_eq!(report.copies, 0);
+        assert_eq!(report.skips, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn apply_parents_pull_on_open_want_and_satisfies() {
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![movie_copy(4)]);
+        let jobs = MemJobs::new();
+        let title = TitleId::movie("603").expect("id");
+        let want = jobs
+            .create(JobKind::Want, &title, None)
+            .await
+            .expect("want");
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("want-parent");
+        let report = apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+            },
+        )
+        .await
+        .expect("apply");
+        assert_eq!(report.copies, 1);
+        let pull = jobs
+            .get(report.installed[0].pull_job_id)
+            .await
+            .expect("get")
+            .expect("pull");
+        assert_eq!(pull.parent_job_id(), Some(want.id()));
+        let want = jobs.get(want.id()).await.expect("get").expect("want");
+        assert!(matches!(want.state(), JobState::Want(WantState::Satisfied)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn upgrade_never_skip_satisfies_open_want() {
+        let title = TitleId::movie("603").expect("id");
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![Action::Skip {
+                title_id: Some(title.clone()),
+                reason: SKIP_UPGRADE_NEVER.to_string(),
+            }]);
+        let jobs = MemJobs::new();
+        let want = jobs
+            .create(JobKind::Want, &title, None)
+            .await
+            .expect("want");
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("upgrade-satisfy");
+        let report = apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+            },
+        )
+        .await
+        .expect("apply");
+        assert_eq!(report.skips, 1);
+        let want = jobs.get(want.id()).await.expect("get").expect("want");
+        assert!(matches!(want.state(), JobState::Want(WantState::Satisfied)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn in_flight_pull_with_different_remote_is_refused() {
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![movie_copy(4)]);
+        let jobs = MemJobs::new();
+        let title = TitleId::movie("603").expect("id");
+        let pull = jobs
+            .create(JobKind::Pull, &title, None)
+            .await
+            .expect("pull");
+        jobs.advance(pull.id(), JobEvent::Pull(PullEvent::Start))
+            .await
+            .expect("start");
+        let root = scratch("mismatch-pull");
+        write_pull_intent(
+            &root,
+            &title,
+            &RemoteRef::from_wire_parts(
+                "seed".into(),
+                PathBuf::from("movies/Other.(2000).{tmdb-604}/Other.(2000).mkv"),
+            )
+            .expect("ref"),
+            4,
+            "The.Matrix.(1999).mkv",
+        )
+        .expect("intent");
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let err = apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+            },
+        )
+        .await
+        .expect_err("mismatch");
+        assert!(err.to_string().contains("does not match"), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 }

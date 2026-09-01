@@ -30,7 +30,11 @@ pub fn prune_empty_incoming(incoming: &Path) -> Result<Vec<PathBuf>, TransferErr
     Ok(removed)
 }
 
-fn prune_dir(incoming: &Path, dir: &Path, removed: &mut Vec<PathBuf>) -> Result<bool, TransferError> {
+fn prune_dir(
+    incoming: &Path,
+    dir: &Path,
+    removed: &mut Vec<PathBuf>,
+) -> Result<bool, TransferError> {
     if dir_is_sacred(dir)? {
         return Ok(false);
     }

@@ -328,8 +328,14 @@ fn library_bootstrap_creates_schema_dirs() {
     assert!(units.join("mediaopsd-home.service").is_file());
     let home = std::fs::read_to_string(units.join("mediaopsd-home.service")).expect("home");
     assert!(home.contains("Restart=on-failure"), "{home}");
-    assert!(home.contains("--role"), "{home}");
-    assert!(home.contains("home"), "{home}");
+    let exec = home
+        .lines()
+        .find(|l| l.starts_with("ExecStart="))
+        .expect("ExecStart");
+    assert!(
+        exec.contains("mediaopsd") && exec.contains("serve --role home"),
+        "ExecStart must run mediaopsd serve --role home, got {exec}"
+    );
     let timer = std::fs::read_to_string(units.join("mediaops-run.timer")).expect("timer");
     assert!(timer.contains("OnUnitInactiveSec="));
     assert!(timer.contains("OnBootSec="));
@@ -508,6 +514,7 @@ fn why_and_status_json_envelopes() {
     assert_eq!(why_v["ok"], true);
     assert_eq!(why_v["data"]["title_id"], "movie:tmdb:603");
     assert_eq!(why_v["data"]["want"]["state"], "open");
+    assert_eq!(why_v["data"]["want"]["title_id"], "movie:tmdb:603");
     let status = bin()
         .args([
             "--json",
@@ -523,6 +530,107 @@ fn why_and_status_json_envelopes() {
     let status_v = stdout_json(&status);
     assert_eq!(status_v["ok"], true);
     assert_eq!(status_v["data"]["open_wants"][0]["state"], "open");
+    assert_eq!(
+        status_v["data"]["open_wants"][0]["title_id"],
+        "movie:tmdb:603"
+    );
+    assert!(status_v["data"]["watermark"].is_object());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_and_why_report_lock_holder_when_flock_is_held() {
+    let dir = scratch("lock-holder");
+    let db = dir.join("state.db");
+    let lock_path = dir.join("mediaops.lock");
+    std::fs::write(
+        &lock_path,
+        r#"{"pid":4242,"started_at":1,"command":"mediaops run"}
+"#,
+    )
+    .expect("write lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock");
+    fs4::FileExt::try_lock(&file).expect("hold lock");
+    let status = bin()
+        .args([
+            "--json",
+            "status",
+            "--state-db",
+            db.to_str().unwrap(),
+            "--plans-dir",
+            dir.join("plans").to_str().unwrap(),
+        ])
+        .output()
+        .expect("status");
+    assert_eq!(
+        status.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_v = stdout_json(&status);
+    assert_eq!(status_v["ok"], true);
+    assert_eq!(status_v["data"]["lock"]["pid"], 4242);
+    assert_eq!(status_v["data"]["lock"]["command"], "mediaops run");
+    let why = bin()
+        .args([
+            "--json",
+            "why",
+            "movie:tmdb:603",
+            "--state-db",
+            db.to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("why");
+    assert_eq!(
+        why.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&why.stderr)
+    );
+    let why_v = stdout_json(&why);
+    assert_eq!(why_v["data"]["lock"]["pid"], 4242);
+    drop(file);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn watch_second_call_reuses_open_want() {
+    let dir = scratch("watch-idem");
+    let db = dir.join("state.db");
+    let first = bin()
+        .args([
+            "--json",
+            "watch",
+            "movie:tmdb:603",
+            "--state-db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("watch");
+    assert_eq!(first.status.code(), Some(0));
+    let first_v = stdout_json(&first);
+    assert_eq!(first_v["data"]["created"], true);
+    let second = bin()
+        .args([
+            "--json",
+            "watch",
+            "movie:tmdb:603",
+            "--state-db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("watch2");
+    assert_eq!(second.status.code(), Some(0));
+    let second_v = stdout_json(&second);
+    assert_eq!(second_v["data"]["created"], false);
+    assert_eq!(second_v["data"]["job_id"], first_v["data"]["job_id"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

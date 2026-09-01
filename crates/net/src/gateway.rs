@@ -114,9 +114,7 @@ impl Stream for GuardedRange {
 #[tonic::async_trait]
 impl Control for HomeGateway {
     async fn df(&self, request: Request<DfRequest>) -> Result<Response<DfResponse>, Status> {
-        ControlClient::new(self.control.clone())
-            .df(request)
-            .await
+        ControlClient::new(self.control.clone()).df(request).await
     }
 
     async fn unmonitor(
@@ -247,14 +245,16 @@ impl Gateway for HomeGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IdentityBundle, Seedbox, connect_unix, mint, serve_home_unix, serve_tcp, tcp_connect_count};
+    use crate::{
+        IdentityBundle, Seedbox, connect_unix, mint, serve_home_unix, serve_tcp, tcp_connect_count,
+    };
     use mediaops_core::{Allowlist, Grabber, UnderlayMode, endpoint_fingerprint};
     use mediaops_proto::gateway_client::GatewayClient;
     use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
     use std::io::Write;
     use std::path::Path;
-    use tokio::net::{TcpListener, UnixListener};
     use std::sync::Mutex;
+    use tokio::net::{TcpListener, UnixListener};
 
     static NET_TEST: Mutex<()> = Mutex::new(());
 
@@ -319,7 +319,14 @@ mod tests {
         }
     }
 
-    async fn start_pair() -> (SocketAddr, std::path::PathBuf, IdentityBundle, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>, std::path::PathBuf) {
+    async fn start_pair() -> (
+        SocketAddr,
+        std::path::PathBuf,
+        IdentityBundle,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        std::path::PathBuf,
+    ) {
         let root = scratch("tree");
         write_file(&root.join("a.bin"), b"abcdefghij");
         let id = mint().expect("mint");
@@ -436,7 +443,10 @@ mod tests {
             .into_inner();
         assert_eq!(configured.n, 3);
         let opened = tcp_connect_count() - before;
-        assert_eq!(opened, 3, "ConfigurePool(3) must open 3 WAN TCP channels, opened {opened}");
+        assert_eq!(
+            opened, 3,
+            "ConfigurePool(3) must open 3 WAN TCP channels, opened {opened}"
+        );
 
         let before_again = tcp_connect_count();
         let again = gateway
@@ -497,7 +507,10 @@ mod tests {
             })
             .await
             .expect_err("unknown root");
-        assert!(!err.details().is_empty(), "gateway must not strip Status details");
+        assert!(
+            !err.details().is_empty(),
+            "gateway must not strip Status details"
+        );
         seed_task.abort();
         uds_task.abort();
         let _ = std::fs::remove_file(&sock);

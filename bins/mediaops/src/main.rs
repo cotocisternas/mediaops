@@ -131,6 +131,12 @@ enum Command {
         state_db: Option<PathBuf>,
         #[arg(long)]
         plans_dir: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
     },
     Encode(EncodeArgs),
 }
@@ -546,8 +552,19 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Some(Command::Status {
             state_db,
             plans_dir,
+            desired_state,
+            library_root,
+            config_dir,
         }) => {
-            let line = status::status(cli.json, state_db, plans_dir).await?;
+            let line = status::status(
+                cli.json,
+                state_db,
+                plans_dir,
+                desired_state,
+                library_root,
+                config_dir,
+            )
+            .await?;
             write_stdout(&line)
         }
         Some(Command::Encode(EncodeArgs {

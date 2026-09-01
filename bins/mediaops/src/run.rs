@@ -1,9 +1,12 @@
-use std::fs::File;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use mediaops_core::{Action, DesiredState, Envelope, JobState, Plan, Probe, WantState, free_bytes};
+use mediaops_core::{
+    Action, DesiredState, Envelope, JobState, Plan, Probe, TitleId, WantState, free_bytes,
+};
 use mediaops_store::Store;
-use mediaops_sync::{ApplyCtx, ApplyError, PlanRequest, apply, plan_actions};
+use mediaops_sync::{ApplyCtx, ApplyError, PlanRequest, apply, plan_actions, scan_schema_files};
 use mediaops_transfer::{
     HomeChannel, configure_pool, connect_home, grpc_source, list_entries, pool_status, probe_range,
 };
@@ -29,7 +32,6 @@ struct RunData {
 
 struct PreparedPlan {
     _lock: File,
-    plan: Plan,
     planned: mediaops_sync::Planned,
     path: PathBuf,
     library_root: PathBuf,
@@ -99,11 +101,7 @@ pub async fn cmd_run(
         .iter()
         .filter(|a| matches!(a, Action::Copy { .. }))
         .count();
-    if copies == 0 && prepared.planned.first_candidate_breaches {
-        return Err(AppError::Policy(
-            "watermark/max_copy: first candidate alone would breach; refusing empty apply".into(),
-        ));
-    }
+    refuse_empty_apply(copies, prepared.planned.first_candidate_breaches)?;
 
     let channel = connect_home(&prepared.socket, &prepared.tls_dir)
         .await
@@ -111,8 +109,10 @@ pub async fn cmd_run(
     let n = configure_from_probes(&prepared.store, channel.clone()).await?;
     let active =
         std::fs::read(&prepared.desired_state).map_err(|err| AppError::Runtime(err.into()))?;
+    let bytes = std::fs::read(&prepared.path).map_err(|err| AppError::Runtime(err.into()))?;
+    let plan = Plan::from_json_slice(&bytes).map_err(runtime_display)?;
     let report = apply(
-        &prepared.plan,
+        &plan,
         &active,
         ApplyCtx {
             jobs: &prepared.store,
@@ -125,8 +125,7 @@ pub async fn cmd_run(
     .await
     .map_err(map_apply)?;
 
-    let ds = prepared
-        .plan
+    let ds = plan
         .desired_state()
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
     let nvenc_cap = prepared
@@ -241,6 +240,11 @@ async fn prepare(
         .await
         .map_err(runtime_display)?;
     let title_index = store.list_titles().await.map_err(runtime_display)?;
+    let on_disk: Vec<TitleId> = scan_schema_files(&library_root)
+        .map_err(runtime_display)?
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
     let jobs = store.list_jobs().await.map_err(runtime_display)?;
     let open_wants: Vec<_> = jobs
         .into_iter()
@@ -249,6 +253,7 @@ async fn prepare(
     let planned = plan_actions(PlanRequest {
         listings: &listings,
         title_index: &title_index,
+        on_disk: &on_disk,
         open_wants: &open_wants,
         desired: &ds,
         free_bytes: free,
@@ -257,17 +262,9 @@ async fn prepare(
         .map_err(runtime_display)?
         .with_actions(planned.actions.clone());
     std::fs::create_dir_all(&plans_dir).map_err(|err| AppError::Runtime(err.into()))?;
-    let name = format!(
-        "{}-{}.json",
-        bootstrap::utc_compact(),
-        &plan.desired_state_b3().as_str()[..12]
-    );
-    let path = plans_dir.join(name);
-    let json = serde_json::to_vec_pretty(&plan).map_err(|e| AppError::Runtime(e.into()))?;
-    std::fs::write(&path, json).map_err(|err| AppError::Runtime(err.into()))?;
+    let path = unique_plan_path(&plans_dir, &plan)?;
     Ok(PreparedPlan {
         _lock: lock,
-        plan,
         planned,
         path,
         library_root,
@@ -325,4 +322,79 @@ fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
 
 fn runtime_display(err: impl std::fmt::Display) -> AppError {
     AppError::Runtime(anyhow::anyhow!("{err}"))
+}
+
+fn refuse_empty_apply(copies: usize, first_candidate_breaches: bool) -> Result<(), AppError> {
+    if copies == 0 && first_candidate_breaches {
+        Err(AppError::Policy(
+            "watermark/max_copy: first candidate alone would breach; refusing empty apply".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn unique_plan_path(plans_dir: &Path, plan: &Plan) -> Result<PathBuf, AppError> {
+    let stamp = bootstrap::utc_compact();
+    let b3 = &plan.desired_state_b3().as_str()[..12];
+    let pid = std::process::id();
+    let json = serde_json::to_vec_pretty(plan).map_err(|e| AppError::Runtime(e.into()))?;
+    for n in 0u32..1000 {
+        let name = if n == 0 {
+            format!("{stamp}-{b3}-{pid}.json")
+        } else {
+            format!("{stamp}-{b3}-{pid}-{n}.json")
+        };
+        let path = plans_dir.join(name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(&json)
+                    .map_err(|err| AppError::Runtime(err.into()))?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(AppError::Runtime(err.into())),
+        }
+    }
+    Err(AppError::Runtime(anyhow::anyhow!(
+        "plan filename collision"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_apply_with_first_candidate_breach_is_policy_refusal() {
+        assert!(
+            matches!(refuse_empty_apply(0, true), Err(AppError::Policy(_))),
+            "empty apply that breaches must be policy_refusal"
+        );
+        assert!(refuse_empty_apply(0, false).is_ok());
+        assert!(refuse_empty_apply(1, true).is_ok());
+    }
+
+    #[test]
+    fn unique_plan_path_does_not_overwrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-plans-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let plan = Plan::from_toml_bytes(
+            b"schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
+        )
+        .expect("plan");
+        let a = unique_plan_path(&dir, &plan).unwrap_or_else(|e| panic!("{e}"));
+        let b = unique_plan_path(&dir, &plan).unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(a, b);
+        assert!(a.exists());
+        assert!(b.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

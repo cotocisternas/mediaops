@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -518,7 +518,7 @@ pub fn lock_holder_if_contended(path: &Path) -> Result<Option<serde_json::Value>
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(BootstrapError::Io(err.to_string())),
     };
-    match fs4::FileExt::try_lock(&file) {
+    match fs4::FileExt::try_lock_shared(&file) {
         Ok(()) => {
             let _ = fs4::FileExt::unlock(&file);
             Ok(None)
@@ -526,7 +526,14 @@ pub fn lock_holder_if_contended(path: &Path) -> Result<Option<serde_json::Value>
         Err(fs4::TryLockError::WouldBlock) => {
             let text =
                 std::fs::read_to_string(path).map_err(|err| BootstrapError::Io(err.to_string()))?;
-            Ok(serde_json::from_str(text.trim()).ok())
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Ok(Some(serde_json::json!({"unparsed": ""})));
+            }
+            match serde_json::from_str(trimmed) {
+                Ok(value) => Ok(Some(value)),
+                Err(_) => Ok(Some(serde_json::json!({ "unparsed": trimmed }))),
+            }
         }
         Err(err) => Err(BootstrapError::Io(err.to_string())),
     }
@@ -536,7 +543,13 @@ pub fn exclusive_lock(path: &Path) -> Result<File, BootstrapError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| BootstrapError::Io(err.to_string()))?;
     }
-    let mut file = File::create(path).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
     match fs4::FileExt::try_lock(&file) {
         Ok(()) => {
             write_lock_holder(&mut file)?;
@@ -792,6 +805,24 @@ mod tests {
             value["command"].as_str().is_some_and(|c| !c.is_empty()),
             "command: {value}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exclusive_lock_conflict_does_not_truncate_holder() {
+        let dir = scratch("lock-trunc");
+        let path = dir.join("mediaops.lock");
+        let _held = exclusive_lock(&path).expect("first");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let err = exclusive_lock(&path).expect_err("conflict");
+        assert!(matches!(err, BootstrapError::LockConflict));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            before, after,
+            "conflicting locker must not wipe holder JSON"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(after.trim()).expect("json");
+        assert_eq!(parsed["pid"], std::process::id());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

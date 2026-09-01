@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mediaops_core::{DesiredState, Envelope, JobKind, JobState, TitleId, WantState, free_bytes};
 use mediaops_store::Store;
@@ -22,6 +22,7 @@ struct WhyData {
 #[derive(Debug, Serialize)]
 struct JobView {
     job_id: i64,
+    title_id: String,
     kind: String,
     state: String,
 }
@@ -31,12 +32,13 @@ struct LibraryView {
     path: String,
     install_b3: String,
     current_b3: String,
+    present: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct WatermarkView {
-    free: u64,
-    min_free: u64,
+    free: Option<u64>,
+    min_free: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +47,7 @@ struct StatusData {
     open_wants: Vec<JobView>,
     in_flight: Vec<JobView>,
     last_plan: Option<String>,
+    watermark: WatermarkView,
 }
 
 pub async fn why(
@@ -69,7 +72,14 @@ pub async fn why(
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
     let want = jobs
         .iter()
-        .find(|j| j.kind() == JobKind::Want)
+        .filter(|j| j.kind() == JobKind::Want)
+        .filter(|j| matches!(j.state(), JobState::Want(WantState::Open)))
+        .max_by_key(|j| j.id().get())
+        .or_else(|| {
+            jobs.iter()
+                .filter(|j| j.kind() == JobKind::Want)
+                .max_by_key(|j| j.id().get())
+        })
         .map(job_view);
     let pull = jobs
         .iter()
@@ -90,42 +100,8 @@ pub async fn why(
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
             .map(PathBuf::from),
     };
-    let mut library = None;
-    if let Some(entry) = store
-        .get_title(&title_id)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-    {
-        let path = if entry.path_missing() {
-            if let Some(root) = library_root.as_ref() {
-                scan_schema_files(root)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|(id, _, _)| id == &title_id)
-                    .map(|(_, p, _)| p.display().to_string())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            }
-        } else {
-            entry.path().to_string()
-        };
-        library = Some(LibraryView {
-            path,
-            install_b3: entry.install_b3().to_string(),
-            current_b3: entry.current_b3().to_string(),
-        });
-    }
-
-    let min_free = std::fs::read_to_string(&desired_state)
-        .ok()
-        .and_then(|t| DesiredState::from_toml(&t).ok())
-        .map(|ds| ds.min_free().get())
-        .unwrap_or(0);
-    let free = library_root
-        .as_ref()
-        .and_then(|root| free_bytes(root).ok())
-        .unwrap_or(0);
+    let library = library_view(&store, &title_id, library_root.as_deref()).await?;
+    let watermark = watermark_view(library_root.as_deref(), &desired_state);
     let lock = bootstrap::lock_holder_if_contended(&bootstrap::lock_path(&state_db))
         .map_err(map_bootstrap)?;
 
@@ -135,14 +111,14 @@ pub async fn why(
         library,
         pull,
         encode,
-        watermark: WatermarkView { free, min_free },
+        watermark,
         lock,
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         Ok(format!(
-            "why {} want {:?} pull {:?} encode {:?} free {} min_free {}",
+            "why {} want {:?} pull {:?} encode {:?} free {:?} min_free {:?}",
             data.title_id,
             data.want.as_ref().map(|j| j.state.as_str()),
             data.pull.as_ref().map(|j| j.state.as_str()),
@@ -157,9 +133,15 @@ pub async fn status(
     json: bool,
     state_db: Option<PathBuf>,
     plans_dir: Option<PathBuf>,
+    desired_state: Option<PathBuf>,
+    library_root: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
+    let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
     let plans_dir = plans_dir.unwrap_or_else(bootstrap::default_plans_dir);
+    let desired_state =
+        desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
     let lock = bootstrap::lock_holder_if_contended(&bootstrap::lock_path(&state_db))
         .map_err(map_bootstrap)?;
     let store = Store::open(&state_db)
@@ -180,11 +162,21 @@ pub async fn status(
         .map(job_view)
         .collect();
     let last_plan = latest_plan_name(&plans_dir);
+    let library_root = match library_root {
+        Some(p) => Some(p),
+        None => store
+            .get_machine("library_root")
+            .await
+            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
+            .map(PathBuf::from),
+    };
+    let watermark = watermark_view(library_root.as_deref(), &desired_state);
     let data = StatusData {
         lock,
         open_wants,
         in_flight,
         last_plan,
+        watermark,
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
@@ -201,9 +193,69 @@ pub async fn status(
 fn job_view(job: &mediaops_core::Job) -> JobView {
     JobView {
         job_id: job.id().get(),
+        title_id: job.title_id().render(),
         kind: job.kind().as_str().to_string(),
         state: job.state().as_str().to_string(),
     }
+}
+
+fn watermark_view(library_root: Option<&Path>, desired_state: &Path) -> WatermarkView {
+    let min_free = std::fs::read_to_string(desired_state)
+        .ok()
+        .and_then(|t| DesiredState::from_toml(&t).ok())
+        .map(|ds| ds.min_free().get());
+    let free = library_root.and_then(|root| {
+        if !root.exists() {
+            return None;
+        }
+        free_bytes(root).ok()
+    });
+    WatermarkView { free, min_free }
+}
+
+async fn library_view(
+    store: &Store,
+    title_id: &TitleId,
+    library_root: Option<&Path>,
+) -> Result<Option<LibraryView>, AppError> {
+    let Some(entry) = store
+        .get_title(title_id)
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
+    else {
+        return Ok(None);
+    };
+    let (path, present) = if entry.path_missing() {
+        let Some(root) = library_root else {
+            return Ok(Some(LibraryView {
+                path: String::new(),
+                install_b3: entry.install_b3().to_string(),
+                current_b3: entry.current_b3().to_string(),
+                present: false,
+            }));
+        };
+        let files =
+            scan_schema_files(root).map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+        match files.into_iter().find(|(id, _, _)| id == title_id) {
+            Some((_, rel, _)) => {
+                let present = root.join(&rel).is_file();
+                (rel.display().to_string(), present)
+            }
+            None => (String::new(), false),
+        }
+    } else {
+        let path = entry.path().to_string();
+        let present = library_root
+            .map(|root| root.join(&path).is_file())
+            .unwrap_or(false);
+        (path, present)
+    };
+    Ok(Some(LibraryView {
+        path,
+        install_b3: entry.install_b3().to_string(),
+        current_b3: entry.current_b3().to_string(),
+        present,
+    }))
 }
 
 fn is_in_flight(state: JobState) -> bool {
