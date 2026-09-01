@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
+use mediaops_arr as _;
 use mediaops_core::{
     Allowlist, DesiredState, ExitCode, Grabber, UnderlayMode, endpoint_fingerprint,
 };

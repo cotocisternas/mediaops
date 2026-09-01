@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/sonarr/api/v3/indexer"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": [
+      {
+        "id": 1,
+        "name": "NZBgeek",
+        "priority": 25
+      }
+    ]
+  }
+}

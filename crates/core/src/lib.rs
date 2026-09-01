@@ -25,7 +25,10 @@ pub mod title_index;
 pub mod walker;
 
 pub use bytes::Bytes;
-pub use control_port::{ControlError, ControlPort, DeleteRemoteOutcome};
+pub use control_port::{
+    ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, EdgeApiReport, GrabApplyReport,
+    GrabOps, KeyPresence,
+};
 pub use desired_state::{DesiredState, DesiredStateError, Grabber, TlsIdentity, upsert_tls_table};
 pub use digest::{Blake3Hex, DigestError};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};

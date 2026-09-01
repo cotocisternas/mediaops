@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/sonarr/api/v3/indexer/test",
+    "body_json": {
+      "name": "NZBgeek",
+      "apiKey": "********"
+    }
+  },
+  "response": {
+    "status": 401,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "message": "Unauthorized"
+    }
+  }
+}
