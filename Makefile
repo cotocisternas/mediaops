@@ -44,7 +44,7 @@ test-live: ## Compile the live-box gate (does not run it; does not SSH/encode)
 	$(CARGO) test -p $(PKG_CLI) --features live-box $(CARGO_FLAGS) --test live --no-run
 
 coverage: ## Line/region coverage (needs cargo-llvm-cov + rustup component llvm-tools-preview)
-	$(CARGO) llvm-cov --workspace $(CARGO_FLAGS) --summary-only --ignore-filename-regex='(/tests/|target/)'
+	$(CARGO) llvm-cov --workspace $(CARGO_FLAGS) --summary-only --ignore-filename-regex='(/tests/|target/)' --fail-under-lines 87
 
 clippy: ## Lint the workspace
 	$(CARGO) clippy --workspace --all-targets $(CARGO_FLAGS)

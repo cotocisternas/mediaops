@@ -86,3 +86,97 @@ pub fn save(path: &Path, sidecar: &Sidecar) -> Result<(), TransferError> {
     fs::rename(&tmp, path).map_err(|err| TransferError::io(path, err))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-sidecar-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn load_missing_path_is_none() {
+        let dir = scratch("missing");
+        let path = dir.join("a.partial.b3");
+        assert!(load(&path).expect("load").is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_bad_json_is_sidecar_error() {
+        let dir = scratch("bad");
+        let path = dir.join("a.partial.b3");
+        fs::write(&path, "not-json").expect("write");
+        let err = load(&path).expect_err("bad json");
+        assert!(matches!(err, TransferError::Sidecar(_)), "{err:?}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_unsupported_version_is_sidecar_error() {
+        let dir = scratch("ver");
+        let path = dir.join("a.partial.b3");
+        fs::write(
+            &path,
+            r#"{"version":99,"file_len":10,"range_len":4,"ranges":[]}"#,
+        )
+        .expect("write");
+        let err = load(&path).expect_err("version");
+        match err {
+            TransferError::Sidecar(message) => {
+                assert!(
+                    message.contains("unsupported sidecar version 99"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Sidecar, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_zero_range_len_is_sidecar_error() {
+        let dir = scratch("zero");
+        let path = dir.join("a.partial.b3");
+        fs::write(
+            &path,
+            r#"{"version":1,"file_len":10,"range_len":0,"ranges":[]}"#,
+        )
+        .expect("write");
+        let err = load(&path).expect_err("range_len");
+        match err {
+            TransferError::Sidecar(message) => {
+                assert!(message.contains("range_len must be > 0"), "{message}");
+            }
+            other => panic!("expected Sidecar, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_load_round_trip_and_record_is_idempotent() {
+        let dir = scratch("round");
+        let path = dir.join("nested").join("a.partial.b3");
+        let mut sidecar = Sidecar::new(10, 4);
+        sidecar.record(0, 4, "abc".into());
+        sidecar.record(0, 4, "abc".into());
+        assert_eq!(sidecar.ranges.len(), 1);
+        assert!(sidecar.has(0, 4));
+        assert!(!sidecar.has(4, 4));
+        save(&path, &sidecar).expect("save");
+        let loaded = load(&path).expect("load").expect("some");
+        assert_eq!(loaded, sidecar);
+        let _ = fs::remove_dir_all(dir);
+    }
+}

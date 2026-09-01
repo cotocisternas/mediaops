@@ -15,4 +15,4 @@ tokio = { workspace = true, default-features = false, features = ["fs", "io-util
 tonic = { workspace = true, default-features = false, features = ["codegen", "transport"] }
 
 [dev-dependencies]
-tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "net", "time"] }

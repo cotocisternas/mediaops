@@ -294,3 +294,136 @@ fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
         _ => AppError::Runtime(anyhow::anyhow!("{err}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mediaops_core::{Blake3Hex, JobEvent, JobKind, PullEvent, WantEvent};
+
+    #[tokio::test]
+    async fn why_invalid_title_is_usage() {
+        let err = why(true, "not-a-title".into(), None, None, None, None)
+            .await
+            .expect_err("usage");
+        assert!(matches!(err, AppError::Usage(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn why_prefers_open_want_and_stats_library_file() {
+        let dir = crate::test_support::scratch("why");
+        let library = crate::test_support::library_root(&dir);
+        let db = dir.join("state.db");
+        let store = Store::open(&db).await.expect("store");
+        let title = TitleId::movie("603").expect("id");
+        let old = store
+            .create_job(JobKind::Want, &title, None)
+            .await
+            .expect("old");
+        store
+            .advance(old.id(), JobEvent::Want(WantEvent::Satisfy))
+            .await
+            .expect("satisfy");
+        let open = store
+            .create_job(JobKind::Want, &title, None)
+            .await
+            .expect("open");
+        store
+            .record_install(
+                &title,
+                &Blake3Hex::of_bytes(b"orig"),
+                crate::test_support::MOVIE_REL,
+            )
+            .await
+            .expect("index");
+        let movie = library.join(crate::test_support::MOVIE_REL);
+        std::fs::create_dir_all(movie.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&movie, b"orig").expect("file");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = why(
+            true,
+            "movie:tmdb:603".into(),
+            Some(db.clone()),
+            Some(ds.clone()),
+            Some(library.clone()),
+            Some(dir.clone()),
+        )
+        .await
+        .expect("why");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["data"]["want"]["job_id"], open.id().get());
+        assert_eq!(value["data"]["want"]["state"], "open");
+        assert_eq!(value["data"]["library"]["present"], true);
+
+        std::fs::remove_file(&movie).expect("unlink");
+        let json = why(
+            true,
+            "movie:tmdb:603".into(),
+            Some(db),
+            Some(ds),
+            Some(library),
+            Some(dir.clone()),
+        )
+        .await
+        .expect("missing file");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["data"]["library"]["present"], false);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn status_watermark_last_plan_and_in_flight() {
+        let dir = crate::test_support::scratch("status");
+        let library = crate::test_support::library_root(&dir);
+        let db = dir.join("state.db");
+        let store = Store::open(&db).await.expect("store");
+        store
+            .put_machine("library_root", &library.display().to_string())
+            .await
+            .expect("root");
+        let title = TitleId::movie("603").expect("id");
+        store
+            .create_job(JobKind::Want, &title, None)
+            .await
+            .expect("want");
+        let pull = store
+            .create_job(JobKind::Pull, &title, None)
+            .await
+            .expect("pull");
+        store
+            .advance(pull.id(), JobEvent::Pull(PullEvent::Start))
+            .await
+            .expect("start");
+        let plans = dir.join("plans");
+        std::fs::create_dir_all(&plans).expect("plans");
+        std::fs::write(plans.join("aaa.json"), "{}").expect("a");
+        std::fs::write(plans.join("zzz.json"), "{}").expect("z");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = status(
+            true,
+            Some(db),
+            Some(plans),
+            Some(ds),
+            Some(library),
+            Some(dir.clone()),
+        )
+        .await
+        .expect("status");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(
+            value["data"]["open_wants"].as_array().expect("wants").len(),
+            1
+        );
+        assert!(
+            value["data"]["in_flight"]
+                .as_array()
+                .expect("flight")
+                .iter()
+                .any(|j| j["kind"] == "pull"),
+            "{json}"
+        );
+        assert_eq!(value["data"]["last_plan"], "zzz.json");
+        assert_eq!(value["data"]["watermark"]["min_free"], 0);
+        assert!(value["data"]["watermark"]["free"].as_u64().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use mediaops_core::{
     Action, DesiredState, Envelope, JobState, Plan, Probe, TitleId, WantState, free_bytes,
 };
+use mediaops_ssh::SystemExec;
 use mediaops_store::Store;
 use mediaops_sync::{ApplyCtx, ApplyError, PlanRequest, apply, plan_actions, scan_schema_files};
 use mediaops_transfer::{
@@ -158,6 +159,7 @@ pub async fn cmd_run(
             .map_err(runtime_display)?
         {
             let _ = crate::encode_cmd::after_install(
+                &SystemExec,
                 &prepared.store,
                 &prepared.library_root,
                 &inst.title_id,
@@ -395,6 +397,105 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.exists());
         assert!(b.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cmd_plan_writes_artifact_and_lock_skips_copy() {
+        let _serial = crate::test_support::serial_net();
+        let lb =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"abcdefghij")
+                .await;
+        let dir = crate::test_support::scratch("plan");
+        let library = crate::test_support::library_root(&dir);
+        let _store = crate::test_support::open_store(&dir).await;
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = cmd_plan(
+            true,
+            Some(dir.join("state.db")),
+            Some(ds),
+            Some(library.clone()),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect("plan");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        assert!(
+            value["data"]["actions"]
+                .as_array()
+                .expect("actions")
+                .iter()
+                .any(|a| a["type"] == "copy"),
+            "plan should copy schema listing: {}",
+            value["data"]["actions"]
+        );
+        let path = value["data"]["path"].as_str().expect("path");
+        assert!(std::path::Path::new(path).is_file());
+
+        let locked = crate::test_support::write_ds(&dir, crate::test_support::DS_LOCKED);
+        let json = cmd_plan(
+            true,
+            Some(dir.join("state.db")),
+            Some(locked),
+            Some(library),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect("locked plan");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let actions = value["data"]["actions"].as_array().expect("actions");
+        assert!(
+            actions
+                .iter()
+                .any(|a| a["type"] == "skip" && a["reason"] == "lock"),
+            "{actions:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cmd_run_copies_through_home_socket_and_installs() {
+        let _serial = crate::test_support::serial_net();
+        let lb =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"abcdefghij")
+                .await;
+        let dir = crate::test_support::scratch("run");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = cmd_run(
+            true,
+            Some(dir.join("state.db")),
+            Some(ds),
+            Some(library.clone()),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect("run");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true, "{json}");
+        assert_eq!(value["data"]["copies"], 1);
+        let installed = value["data"]["installed"].as_array().expect("installed");
+        assert_eq!(installed.len(), 1);
+        let path = installed[0].as_str().expect("path");
+        assert!(std::path::Path::new(path).is_file(), "{path}");
+        let title = store
+            .get_title(&TitleId::movie("603").expect("id"))
+            .await
+            .expect("title")
+            .expect("indexed");
+        assert!(!title.path_missing());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

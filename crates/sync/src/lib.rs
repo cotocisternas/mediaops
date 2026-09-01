@@ -283,4 +283,75 @@ mod tests {
         assert_eq!(warns.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn media_server_warnings_skip_missing_wrong_ext_large_and_deep() {
+        let missing = PathBuf::from("/no/such/mediaops-jelly-root");
+        assert!(media_server_warnings(&[missing]).is_empty());
+
+        let root = scratch("warn-skip");
+        fs::write(root.join("notes.txt"), "_incoming").expect("txt");
+        fs::write(root.join("tiny.conf"), "ok").expect("conf");
+        let big = vec![b'x'; 1_000_001];
+        let mut big_xml = b"<Library>_ops</Library>".to_vec();
+        big_xml.extend(big);
+        fs::write(root.join("huge.xml"), big_xml).expect("huge");
+        let deep = root.join("a").join("b").join("c").join("d");
+        fs::create_dir_all(&deep).expect("deep");
+        fs::write(deep.join("system.xml"), "<Library>_incoming</Library>").expect("deep xml");
+        assert!(
+            media_server_warnings(std::slice::from_ref(&root)).is_empty(),
+            "txt/huge/deep must be skipped"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_user_units_and_home_unit_use_expected_names() {
+        let dir = scratch("units");
+        write_user_units(&dir, "/opt/mediaops run").expect("run units");
+        write_home_unit(&dir, "/opt/mediaopsd serve --role home").expect("home unit");
+        let service = fs::read_to_string(dir.join("mediaops-run.service")).expect("service");
+        let timer = fs::read_to_string(dir.join("mediaops-run.timer")).expect("timer");
+        let home = fs::read_to_string(dir.join("mediaopsd-home.service")).expect("home");
+        assert!(service.contains("ExecStart=/opt/mediaops run"));
+        assert!(timer.contains("OnUnitInactiveSec="));
+        assert!(!timer.contains("OnCalendar"));
+        assert!(home.contains("ExecStart=/opt/mediaopsd serve --role home"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scan_schema_files_finds_movie_series_album_and_skips_junk() {
+        let root = scratch("scan");
+        ensure_layout(&root).expect("layout");
+        let movie = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let series =
+            PathBuf::from("series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.mkv");
+        let album = PathBuf::from(
+            "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.The.Gates.Of.Delirium.(2013).flac",
+        );
+        for rel in [&movie, &series, &album] {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(&path, b"x").expect("write");
+        }
+        fs::write(root.join("movies/not-schema.mkv"), b"x").expect("loose file");
+        fs::create_dir_all(root.join("movies/The.Matrix.(1999).{tmdb-603}/extra")).expect("nested");
+        fs::write(
+            root.join("movies/The.Matrix.(1999).{tmdb-603}/extra/note.txt"),
+            b"x",
+        )
+        .expect("nested file");
+        let scanned = scan_schema_files(&root).expect("scan");
+        let ids: Vec<String> = scanned.iter().map(|(id, _, _)| id.render()).collect();
+        assert!(ids.contains(&"movie:tmdb:603".to_string()), "{ids:?}");
+        assert!(ids.contains(&"series:tvdb:79126".to_string()), "{ids:?}");
+        assert!(
+            ids.contains(&"album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63".to_string()),
+            "{ids:?}"
+        );
+        assert_eq!(scanned.len(), 3, "junk files must not parse as schema");
+        let _ = fs::remove_dir_all(root);
+    }
 }

@@ -61,6 +61,7 @@ fn parse_root(raw: &str) -> Result<(String, PathBuf), String> {
     Ok((id.to_string(), PathBuf::from(path)))
 }
 
+#[derive(Debug)]
 enum AppError {
     Usage(String),
     Runtime(anyhow::Error),
@@ -350,5 +351,84 @@ mod tests {
             ("seedbox".into(), PathBuf::from("/data/media"))
         );
         assert!(parse_root("nopath").is_err());
+        assert!(parse_root("=/tmp").is_err());
+    }
+
+    fn serve_args() -> ServeArgs {
+        ServeArgs {
+            role: "seedbox".into(),
+            bind: "127.0.0.1:0".into(),
+            socket: None,
+            tls_dir: PathBuf::from("/tmp"),
+            upstream: None,
+            desired_state: None,
+            roots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_grpc_addr_happy_and_garbage() {
+        assert_eq!(
+            parse_grpc_addr("127.0.0.1:50051").expect("addr"),
+            "127.0.0.1:50051".parse().expect("parse")
+        );
+        assert!(matches!(
+            parse_grpc_addr("not-an-address"),
+            Err(AppError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_upstream_from_flag_or_desired_state() {
+        let mut args = serve_args();
+        args.upstream = Some("127.0.0.1:50051".into());
+        let (raw, addr, underlay) = resolve_upstream(&args).expect("upstream");
+        assert_eq!(raw, "127.0.0.1:50051");
+        assert_eq!(addr, "127.0.0.1:50051".parse().expect("parse"));
+        assert_eq!(underlay, UnderlayMode::Direct);
+
+        let err = resolve_upstream(&serve_args()).expect_err("missing");
+        assert!(
+            matches!(err, AppError::Usage(ref m) if m.contains("upstream")),
+            "{err}"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "mediaopsd-ds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ds = dir.join("desired-state.toml");
+        std::fs::write(
+            &ds,
+            "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\nseedbox_address = \"127.0.0.1:9\"\n",
+        )
+        .expect("ds");
+        args.upstream = None;
+        args.desired_state = Some(ds);
+        let (raw, _, _) = resolve_upstream(&args).expect("from ds");
+        assert_eq!(raw, "127.0.0.1:9");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn serve_reverse_connect_and_seedbox_without_root_are_usage() {
+        let mut args = serve_args();
+        args.role = "reverse-connect".into();
+        let err = serve(args).await.expect_err("reverse");
+        assert!(
+            matches!(err, AppError::Usage(ref m) if m.contains("reverse-connect")),
+            "{err}"
+        );
+
+        let err = serve(serve_args()).await.expect_err("no root");
+        assert!(
+            matches!(err, AppError::Usage(ref m) if m.contains("--root")),
+            "{err}"
+        );
     }
 }

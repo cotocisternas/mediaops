@@ -412,4 +412,219 @@ mod tests {
             "mismatched TitleId must be usage, not a silent --title/--year fallback"
         );
     }
+
+    #[tokio::test]
+    async fn list_json_and_human_empty_and_one_file() {
+        let _serial = crate::test_support::serial_net();
+        let empty = crate::test_support::start_pair(None, b"").await;
+        let human = list(
+            false,
+            Some(empty.sock.clone()),
+            Some(empty.tls_dir.clone()),
+            None,
+        )
+        .await
+        .expect("empty human");
+        assert_eq!(human, "(empty listing)");
+        drop(empty);
+
+        let lb = crate::test_support::start_pair(Some("a.bin"), b"abcdefghij").await;
+        let json = list(true, Some(lb.sock.clone()), Some(lb.tls_dir.clone()), None)
+            .await
+            .expect("list json");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["entries"].as_array().expect("arr").len(), 1);
+        assert_eq!(value["data"]["entries"][0]["rel_path"], "a.bin");
+        assert_eq!(value["data"]["entries"][0]["len"], 10);
+        let human = list(false, Some(lb.sock.clone()), Some(lb.tls_dir.clone()), None)
+            .await
+            .expect("list human");
+        assert!(human.contains("seedbox a.bin"), "{human}");
+        assert!(human.contains("10"), "{human}");
+    }
+
+    #[tokio::test]
+    async fn pull_stages_without_install_and_records_job() {
+        let _serial = crate::test_support::serial_net();
+        let lb = crate::test_support::start_pair(Some("a.bin"), b"abcdefghij").await;
+        let dir = crate::test_support::scratch("pull-stage");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = pull(
+            true,
+            "seedbox".into(),
+            PathBuf::from("a.bin"),
+            "movie:tmdb:603".into(),
+            "The.Matrix.(1999).mkv".into(),
+            Some(library.clone()),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("state.db")),
+            Some(ds),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("pull");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        assert!(value["data"]["installed"].is_null());
+        let staged = value["data"]["staged"].as_str().expect("staged");
+        assert!(staged.contains("_incoming"), "{staged}");
+        assert!(std::path::Path::new(staged).is_file());
+        let jobs = store.list_jobs().await.expect("jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind(), mediaops_core::JobKind::Pull);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pull_install_uses_schema_path_parse_placement() {
+        let _serial = crate::test_support::serial_net();
+        let lb =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"abcdefghij")
+                .await;
+        let dir = crate::test_support::scratch("pull-install");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = pull(
+            true,
+            "seedbox".into(),
+            PathBuf::from(crate::test_support::MOVIE_REL),
+            "movie:tmdb:603".into(),
+            "The.Matrix.(1999).mkv".into(),
+            Some(library.clone()),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("state.db")),
+            Some(ds),
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("install");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        let installed = value["data"]["installed"].as_str().expect("installed");
+        assert!(installed.contains("The.Matrix.(1999).mkv"), "{installed}");
+        assert!(std::path::Path::new(installed).is_file());
+        let title = store
+            .get_title(&TitleId::movie("603").expect("id"))
+            .await
+            .expect("title")
+            .expect("indexed");
+        assert!(!title.path_missing());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pull_lock_true_is_policy_refusal() {
+        let dir = crate::test_support::scratch("pull-lock");
+        let library = crate::test_support::library_root(&dir);
+        let _store = crate::test_support::open_store(&dir).await;
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_LOCKED);
+        let err = pull(
+            true,
+            "seedbox".into(),
+            PathBuf::from("a.bin"),
+            "movie:tmdb:603".into(),
+            "The.Matrix.(1999).mkv".into(),
+            Some(library),
+            Some(dir.join("missing.sock")),
+            Some(dir.join("tls")),
+            None,
+            Some(dir.join("state.db")),
+            Some(ds),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("lock");
+        assert!(
+            matches!(err, AppError::Policy(ref m) if m.contains("lock")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pull_over_max_copy_is_policy() {
+        let _serial = crate::test_support::serial_net();
+        let lb = crate::test_support::start_pair(Some("a.bin"), b"abcdefghij").await;
+        let dir = crate::test_support::scratch("pull-max");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_MAX_COPY_ZERO);
+        let err = pull(
+            true,
+            "seedbox".into(),
+            PathBuf::from("a.bin"),
+            "movie:tmdb:603".into(),
+            "The.Matrix.(1999).mkv".into(),
+            Some(library),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("state.db")),
+            Some(ds),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("max_copy");
+        assert!(
+            matches!(err, AppError::Policy(ref m) if m.contains("max_copy")),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pull_without_library_root_is_usage() {
+        let dir = crate::test_support::scratch("pull-usage");
+        let _store = crate::test_support::open_store(&dir).await;
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let err = pull(
+            true,
+            "seedbox".into(),
+            PathBuf::from("a.bin"),
+            "movie:tmdb:603".into(),
+            "The.Matrix.(1999).mkv".into(),
+            None,
+            Some(dir.join("missing.sock")),
+            Some(dir.join("tls")),
+            None,
+            Some(dir.join("state.db")),
+            Some(ds),
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("usage");
+        assert!(matches!(err, AppError::Usage(_)), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -214,4 +214,149 @@ mod tests {
             ]
         );
     }
+
+    async fn probe(stdout: &str, status: i32) -> Result<ProbeMedia, EncodeError> {
+        let exec = Transcript {
+            calls: Mutex::new(Vec::new()),
+            stdout: stdout.into(),
+            status,
+        };
+        probe_media(&exec, Path::new("/lib/movies/x.mkv")).await
+    }
+
+    fn video_json(
+        codec: &str,
+        bits: Option<&str>,
+        pix_fmt: &str,
+        height: u32,
+        color_transfer: &str,
+        extra: &str,
+        format_name: &str,
+    ) -> String {
+        let bits_field = match bits {
+            Some(b) => format!(r#""bits_per_raw_sample": "{b}","#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+                "streams": [{{
+                    "codec_type": "video",
+                    "codec_name": "{codec}",
+                    {bits_field}
+                    "width": 1920,
+                    "height": {height},
+                    "pix_fmt": "{pix_fmt}",
+                    "color_transfer": "{color_transfer}"
+                    {extra}
+                }}],
+                "format": {{ "format_name": "{format_name}" }}
+            }}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn ffprobe_nonzero_exit_is_exec_error() {
+        let err = probe("{}", 1).await.expect_err("exit");
+        assert!(err.to_string().contains("ffprobe exited 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn no_video_stream_is_probe_error() {
+        let err = probe(r#"{"streams":[{"codec_type":"audio"}],"format":{}}"#, 0)
+            .await
+            .expect_err("no video");
+        assert!(err.to_string().contains("no video stream"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn h264_and_avc1_are_h264_other_codec_is_other() {
+        let h264 = probe(
+            &video_json("h264", Some("8"), "yuv420p", 1080, "bt709", "", "mp4"),
+            0,
+        )
+        .await
+        .expect("h264");
+        assert_eq!(h264.codec, VideoCodec::H264);
+        assert_eq!(h264.container, Container::Mp4);
+
+        let avc1 = probe(
+            &video_json("avc1", Some("8"), "yuv420p", 1080, "bt709", "", "mov"),
+            0,
+        )
+        .await
+        .expect("avc1");
+        assert_eq!(avc1.codec, VideoCodec::H264);
+
+        let other = probe(
+            &video_json(
+                "vp9",
+                Some("8"),
+                "yuv420p",
+                1080,
+                "bt709",
+                "",
+                "matroska,webm",
+            ),
+            0,
+        )
+        .await
+        .expect("other");
+        assert_eq!(other.codec, VideoCodec::Other);
+        assert_eq!(other.container, Container::Other);
+    }
+
+    #[tokio::test]
+    async fn pix_fmt_10_fills_in_missing_bits_per_raw_sample() {
+        let media = probe(
+            &video_json("hevc", None, "yuv420p10le", 1080, "bt709", "", "mp4"),
+            0,
+        )
+        .await
+        .expect("probe");
+        assert_eq!(media.bit_depth, 10);
+    }
+
+    #[tokio::test]
+    async fn hdr_from_color_transfer_and_dv_from_codec_tag() {
+        let hdr = probe(
+            &video_json(
+                "hevc",
+                Some("10"),
+                "yuv420p10le",
+                1080,
+                "smpte2084",
+                "",
+                "mp4",
+            ),
+            0,
+        )
+        .await
+        .expect("hdr");
+        assert!(hdr.hdr);
+        assert!(!hdr.dolby_vision);
+
+        let dv = probe(
+            &video_json(
+                "hevc",
+                Some("10"),
+                "yuv420p10le",
+                1080,
+                "bt709",
+                r#","codec_tag_string": "dvh1""#,
+                "mp4",
+            ),
+            0,
+        )
+        .await
+        .expect("dv");
+        assert!(dv.dolby_vision);
+
+        let uhd = probe(
+            &video_json("hevc", Some("10"), "yuv420p10le", 2160, "bt709", "", "mp4"),
+            0,
+        )
+        .await
+        .expect("uhd");
+        assert_eq!(uhd.height, 2160);
+    }
 }

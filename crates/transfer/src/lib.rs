@@ -11,8 +11,8 @@ pub use home::{
     pool_status, probe_range, stat_entry,
 };
 pub use mediaops_net::{
-    ChannelPool, DaemonRole, HomeGateway, IdentityBundle, NetError, connect_pool, connect_tcp,
-    connect_unix, mint, probe_range_n, serve_home_unix, serve_tcp, serve_unix,
+    ChannelPool, DaemonRole, HomeGateway, IdentityBundle, NetError, Seedbox, connect_pool,
+    connect_tcp, connect_unix, mint, probe_range_n, serve_home_unix, serve_tcp, serve_unix,
 };
 pub use prune::{dir_is_sacred, prune_empty_incoming};
 pub use pull::{PullOutcome, PullSpec, RangeSource, pull_file};
@@ -63,5 +63,51 @@ impl TransferError {
             return Self::Exhausted;
         }
         Self::Rpc(status.message().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mediaops_core::{ControlError, ExitCode};
+    use mediaops_proto::{ErrorDetail, resource_exhausted_detail, status_from_error_detail};
+    use std::io::{Error as IoError, ErrorKind};
+    use std::path::Path;
+
+    #[test]
+    fn io_preserves_path_and_message() {
+        let err = TransferError::io(
+            Path::new("/tmp/partial"),
+            IoError::from(ErrorKind::NotFound),
+        );
+        match err {
+            TransferError::Io { path, message } => {
+                assert_eq!(path, "/tmp/partial");
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_status_resource_exhausted_reason_is_exhausted() {
+        let status = status_from_error_detail(&resource_exhausted_detail("n+1"));
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(matches!(
+            TransferError::from_status(status),
+            TransferError::Exhausted
+        ));
+    }
+
+    #[test]
+    fn from_status_other_codes_are_rpc() {
+        let status = status_from_error_detail(&ErrorDetail::from(ControlError {
+            exit_code: ExitCode::Runtime,
+            message: "walker boom".into(),
+        }));
+        match TransferError::from_status(status) {
+            TransferError::Rpc(message) => assert_eq!(message, "walker boom"),
+            other => panic!("expected Rpc, got {other:?}"),
+        }
     }
 }

@@ -15,6 +15,9 @@ mod run;
 mod status;
 mod watch;
 
+#[cfg(test)]
+mod test_support;
+
 const BIN_NAME: &str = "mediaops";
 
 #[derive(Parser, Debug)]
@@ -235,6 +238,7 @@ enum SeedboxCommand {
     },
 }
 
+#[derive(Debug)]
 pub(crate) enum AppError {
     Usage(String),
     Runtime(anyhow::Error),
@@ -574,7 +578,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     state_db,
                 },
         })) => {
-            let line = encode_cmd::scan(cli.json, library_root, state_db).await?;
+            let line = encode_cmd::scan(&SystemExec, cli.json, library_root, state_db).await?;
             write_stdout(&line)
         }
         Some(Command::Encode(EncodeArgs {
@@ -588,6 +592,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 },
         })) => {
             let line = encode_cmd::run(
+                &SystemExec,
                 cli.json,
                 title,
                 state_db,

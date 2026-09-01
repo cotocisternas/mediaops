@@ -208,3 +208,163 @@ impl Transfer for Seedbox {
         Ok(Response::new(Box::pin(stream)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mediaops_core::{Allowlist, Grabber};
+    use mediaops_proto::{
+        DeleteRemoteRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
+        GuardPreviewRequest, KeyDiscoveryRequest, PROTO_PACKAGE, RemoteRef as WireRef, StatRequest,
+        UnmonitorRequest,
+    };
+    use std::io::Write;
+    use tokio_stream::StreamExt;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-seedbox-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn seedbox_with(root: std::path::PathBuf) -> Seedbox {
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root).expect("root");
+        Seedbox::new(allowlist, "0.1.0", Grabber::None)
+    }
+
+    fn write_file(path: &std::path::Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        let mut f = std::fs::File::create(path).expect("create");
+        f.write_all(bytes).expect("write");
+    }
+
+    #[tokio::test]
+    async fn unused_control_rpcs_fail_loudly() {
+        let root = scratch("unused");
+        let seed = seedbox_with(root.clone());
+        for (name, result) in [
+            (
+                "Unmonitor",
+                seed.unmonitor(Request::new(UnmonitorRequest {
+                    title_id: "movie:tmdb:603".into(),
+                }))
+                .await
+                .err(),
+            ),
+            (
+                "DeleteRemote",
+                seed.delete_remote(Request::new(DeleteRemoteRequest { r#ref: None }))
+                    .await
+                    .err(),
+            ),
+            (
+                "EdgeCheck",
+                seed.edge_check(Request::new(EdgeCheckRequest {}))
+                    .await
+                    .err(),
+            ),
+            (
+                "KeyDiscovery",
+                seed.key_discovery(Request::new(KeyDiscoveryRequest {}))
+                    .await
+                    .err(),
+            ),
+            (
+                "GuardPreview",
+                seed.guard_preview(Request::new(GuardPreviewRequest {}))
+                    .await
+                    .err(),
+            ),
+        ] {
+            let err = result.expect(name);
+            assert!(
+                err.message()
+                    .contains(&format!("{name} is not implemented")),
+                "{name}: {}",
+                err.message()
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn grab_apply_with_grabber_none_is_handshake() {
+        let root = scratch("grab");
+        let seed = seedbox_with(root.clone());
+        let resp = seed
+            .grab_apply(Request::new(GrabApplyRequest {}))
+            .await
+            .expect("grab none")
+            .into_inner();
+        assert_eq!(resp.semver, "0.1.0");
+        assert_eq!(resp.proto_package, PROTO_PACKAGE);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stat_unknown_path_is_runtime_status() {
+        let root = scratch("stat");
+        write_file(&root.join("a.bin"), b"abcdefghij");
+        let seed = seedbox_with(root.clone());
+        let err = seed
+            .stat(Request::new(StatRequest {
+                r#ref: Some(WireRef {
+                    root_id: "seedbox".into(),
+                    rel_path: "missing.bin".into(),
+                }),
+            }))
+            .await
+            .expect_err("missing");
+        assert!(!err.message().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn get_range_past_eof_is_empty_and_oversize_is_clamped_to_remain() {
+        let root = scratch("range");
+        write_file(&root.join("a.bin"), b"abcdefghij");
+        let seed = seedbox_with(root.clone());
+        let wire = WireRef {
+            root_id: "seedbox".into(),
+            rel_path: "a.bin".into(),
+        };
+        let past = seed
+            .get_range(Request::new(GetRangeRequest {
+                r#ref: Some(wire.clone()),
+                offset: 10,
+                len: 4,
+            }))
+            .await
+            .expect("eof")
+            .into_inner();
+        let chunks: Vec<_> = past.collect().await;
+        assert!(chunks.is_empty() || chunks.iter().all(|c| c.as_ref().unwrap().data.is_empty()));
+
+        let oversize = seed
+            .get_range(Request::new(GetRangeRequest {
+                r#ref: Some(wire),
+                offset: 8,
+                len: 100,
+            }))
+            .await
+            .expect("clamp")
+            .into_inner();
+        let mut body = Vec::new();
+        let mut stream = oversize;
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.expect("chunk").data);
+        }
+        assert_eq!(body, b"ij");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
