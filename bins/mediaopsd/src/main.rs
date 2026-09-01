@@ -51,6 +51,9 @@ struct ServeArgs {
     /// Allowlisted root as `id=path`. Repeatable. Seedbox role only.
     #[arg(long = "root", value_parser = parse_root)]
     roots: Vec<(String, PathBuf)>,
+    /// Nginx app conf dir for panel fingerprint (seedbox). Tests use a tempdir.
+    #[arg(long)]
+    nginx_dir: Option<PathBuf>,
 }
 
 fn parse_root(raw: &str) -> Result<(String, PathBuf), String> {
@@ -245,8 +248,11 @@ async fn serve_seedbox(args: ServeArgs) -> Result<(), AppError> {
         .map_err(|e| AppError::Runtime(e.into()))?;
     tracing::info!(%addr, "seedbox listen");
     let (grabber, grab_ops) = seedbox_grab_ops(args.desired_state.as_deref())?;
-    let seedbox =
+    let mut seedbox =
         Seedbox::new(allowlist, env!("CARGO_PKG_VERSION"), grabber).with_grab_ops(grab_ops);
+    if let Some(dir) = args.nginx_dir {
+        seedbox = seedbox.with_nginx_dir(dir);
+    }
     serve_tcp(listener, server, seedbox)
         .await
         .map_err(|err| AppError::Runtime(anyhow!(err)))
@@ -387,6 +393,7 @@ mod tests {
             upstream: None,
             desired_state: None,
             roots: Vec::new(),
+            nginx_dir: None,
         }
     }
 

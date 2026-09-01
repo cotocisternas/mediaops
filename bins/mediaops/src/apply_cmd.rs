@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use mediaops_core::{ControlPort, Envelope, GrabApplyReport};
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
+use mediaops_store::Store;
 use mediaops_transfer::connect_home;
 use serde::Serialize;
 
@@ -38,6 +39,19 @@ pub async fn seedbox_apply(
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
     let control = ControlPortClient::new(ControlClient::new(channel));
+    let edge = control.edge_check().await.map_err(map_control)?;
+    let store = Store::open(&state_db)
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let last = store
+        .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    if crate::doctor::is_frozen(&edge, last.as_deref()) {
+        return Err(AppError::Policy(
+            "panel fingerprint freeze; run mediaops repair edge --repair --confirm".into(),
+        ));
+    }
     let report = control.grab_apply(&toml).await.map_err(map_control)?;
     render_apply(json, &report)
 }

@@ -13,12 +13,12 @@ use mediaops_proto::transfer_client::TransferClient;
 use mediaops_proto::transfer_server::Transfer;
 use mediaops_proto::{
     ConfigurePoolRequest, ConfigurePoolResponse, DeleteRemoteRequest, DeleteRemoteResponse,
-    DfRequest, DfResponse, EdgeCheckRequest, EdgeCheckResponse, ErrorDetail, GetRangeRequest,
-    GetRangeResponse, GrabApplyRequest, GrabApplyResponse, GuardPreviewRequest,
-    GuardPreviewResponse, KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest, ListResponse,
-    PoolStatusRequest, PoolStatusResponse, ProbeRangeRequest, ProbeRangeResponse, StatRequest,
-    StatResponse, UnmonitorRequest, UnmonitorResponse, resource_exhausted_detail,
-    status_from_error_detail,
+    DfRequest, DfResponse, EdgeApplyRequest, EdgeApplyResponse, EdgeCheckRequest,
+    EdgeCheckResponse, ErrorDetail, GetRangeRequest, GetRangeResponse, GrabApplyRequest,
+    GrabApplyResponse, GuardPreviewRequest, GuardPreviewResponse, KeyDiscoveryRequest,
+    KeyDiscoveryResponse, ListRequest, ListResponse, PoolStatusRequest, PoolStatusResponse,
+    ProbeRangeRequest, ProbeRangeResponse, StatRequest, StatResponse, UnmonitorRequest,
+    UnmonitorResponse, resource_exhausted_detail, status_from_error_detail,
 };
 use rustls::ClientConfig;
 use tokio::sync::Mutex;
@@ -150,6 +150,15 @@ impl Control for HomeGateway {
     ) -> Result<Response<EdgeCheckResponse>, Status> {
         ControlClient::new(self.control.clone())
             .edge_check(request)
+            .await
+    }
+
+    async fn edge_apply(
+        &self,
+        request: Request<EdgeApplyRequest>,
+    ) -> Result<Response<EdgeApplyResponse>, Status> {
+        ControlClient::new(self.control.clone())
+            .edge_apply(request)
             .await
     }
 

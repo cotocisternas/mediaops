@@ -24,7 +24,11 @@ pub trait ControlPort: Send + Sync {
         &'a self,
         desired_state_toml: &'a [u8],
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
-    fn edge_check(&self) -> BoxFuture<'_, Result<(), ControlError>>;
+    fn edge_check(&self) -> BoxFuture<'_, Result<EdgeApiReport, ControlError>>;
+    fn edge_apply<'a>(
+        &'a self,
+        desired_state_toml: &'a [u8],
+    ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
     fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>>;
     fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>>;
 }
@@ -37,6 +41,10 @@ pub trait GrabOps: Send + Sync {
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
     fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>>;
     fn edge_api_check(&self) -> BoxFuture<'_, Result<EdgeApiReport, ControlError>>;
+    fn edge_apply<'a>(
+        &'a self,
+        desired: &'a DesiredState,
+    ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
 }
 
 /// `df` payload for handshake + free space. Wire still splits the fields.
@@ -55,7 +63,7 @@ pub struct GrabApplyReport {
 }
 
 /// API-key presence only. Never carries key material (CAP-2).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct KeyPresence {
     pub sonarr_key_present: bool,
     pub radarr_key_present: bool,

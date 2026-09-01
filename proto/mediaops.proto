@@ -56,6 +56,7 @@ service Control {
   rpc DeleteRemote(DeleteRemoteRequest) returns (DeleteRemoteResponse);
   rpc GrabApply(GrabApplyRequest) returns (GrabApplyResponse);
   rpc EdgeCheck(EdgeCheckRequest) returns (EdgeCheckResponse);
+  rpc EdgeApply(EdgeApplyRequest) returns (EdgeApplyResponse);
   rpc KeyDiscovery(KeyDiscoveryRequest) returns (KeyDiscoveryResponse);
   rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
 }
@@ -139,6 +140,20 @@ message EdgeCheckRequest {}
 message EdgeCheckResponse {
   string semver = 1;
   string proto_package = 2;
+  string fingerprint = 3;
+  bool invariant_ok = 4;
+  string drift = 5;
+}
+
+message EdgeApplyRequest {
+  bytes desired_state_toml = 1;
+}
+
+message EdgeApplyResponse {
+  string semver = 1;
+  string proto_package = 2;
+  bool noop = 3;
+  string diff = 4;
 }
 
 message KeyDiscoveryRequest {}

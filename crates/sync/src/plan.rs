@@ -17,6 +17,8 @@ pub struct PlanRequest<'a> {
     pub open_wants: &'a [Job],
     pub desired: &'a DesiredState,
     pub free_bytes: u64,
+    /// When doctor would freeze/drift, emit EdgeApply.
+    pub edge_frozen: bool,
 }
 
 pub struct Planned {
@@ -128,6 +130,9 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         if req.desired.grabber() == Grabber::Servarr {
             actions.insert(0, Action::GrabApply);
         }
+        if req.edge_frozen {
+            actions.insert(0, Action::EdgeApply);
+        }
         return Planned {
             actions,
             first_candidate_breaches: false,
@@ -180,6 +185,9 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
     actions.extend(duplicates);
     if req.desired.grabber() == Grabber::Servarr {
         actions.insert(0, Action::GrabApply);
+    }
+    if req.edge_frozen {
+        actions.insert(0, Action::EdgeApply);
     }
     Planned {
         actions,
@@ -267,6 +275,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -303,6 +312,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -332,6 +342,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: Bytes::GIB + 100,
+            edge_frozen: false,
         });
         assert!(
             planned.actions.iter().all(|a| matches!(
@@ -358,6 +369,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 4 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -387,6 +399,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert_eq!(planned.actions.len(), 1);
         assert!(matches!(planned.actions[0], Action::Copy { .. }));
@@ -407,6 +420,7 @@ lock = false
             open_wants: &wants,
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -432,6 +446,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert_eq!(copies(&planned.actions).len(), 1);
         assert!(
@@ -458,6 +473,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -492,6 +508,7 @@ lock = true
             open_wants: &[],
             desired: &desired,
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -527,6 +544,7 @@ lock = false
             open_wants: &[],
             desired: &desired,
             free_bytes: 10,
+            edge_frozen: false,
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -563,6 +581,7 @@ grabber = "servarr"
             open_wants: &[],
             desired: &desired,
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(
             matches!(planned.actions.first(), Some(Action::GrabApply)),

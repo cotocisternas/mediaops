@@ -120,12 +120,16 @@ where
                     let _report = control.grab_apply(plan.desired_state_toml()).await?;
                 }
             }
+            Action::EdgeApply => {
+                if let Some(control) = ctx.control {
+                    let _report = control.edge_apply(plan.desired_state_toml()).await?;
+                }
+            }
             Action::Encode { .. }
             | Action::Review
             | Action::Unmonitor
             | Action::DeleteRemote
-            | Action::Reclaim
-            | Action::EdgeApply => {}
+            | Action::Reclaim => {}
         }
     }
     Ok(report)
@@ -899,8 +903,29 @@ mod tests {
                 })
             })
         }
-        fn edge_check(&self) -> mediaops_core::BoxFuture<'_, Result<(), ControlError>> {
-            Box::pin(async { Ok(()) })
+        fn edge_check(
+            &self,
+        ) -> mediaops_core::BoxFuture<'_, Result<mediaops_core::EdgeApiReport, ControlError>>
+        {
+            Box::pin(async {
+                Ok(mediaops_core::EdgeApiReport {
+                    fingerprint: String::new(),
+                    invariant_ok: true,
+                    drift: String::new(),
+                })
+            })
+        }
+        fn edge_apply<'a>(
+            &'a self,
+            _: &'a [u8],
+        ) -> mediaops_core::BoxFuture<'a, Result<mediaops_core::GrabApplyReport, ControlError>>
+        {
+            Box::pin(async {
+                Ok(mediaops_core::GrabApplyReport {
+                    noop: true,
+                    diff: String::new(),
+                })
+            })
         }
         fn key_discovery(
             &self,

@@ -144,6 +144,37 @@ pub fn scp_file_command(local: &Path, remote: &str, ssh_config: &Path) -> ExecCo
     )
 }
 
+/// Desired Swizzin nginx app snippet. Host `$host` is EdgeInvariant.
+pub fn desired_nginx_app(url_base: &str, port: u16) -> String {
+    format!(
+        "location {url_base} {{\n    proxy_pass http://127.0.0.1:{port}{url_base};\n    proxy_set_header Host $host;\n}}\n"
+    )
+}
+
+/// Write a small remote file over ssh (not bulk copy). Contents ride argv.
+pub async fn write_remote_file(
+    exec: &impl ExecPort,
+    ssh_config: &Path,
+    remote_path: &str,
+    contents: &str,
+) -> Result<String, SshError> {
+    let old = exec
+        .run(&ssh_exec(ssh_config, &["sudo", "cat", remote_path]))
+        .await;
+    let old_text = old
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let diff = mediaops_core::unified_diff(&old_text, contents, remote_path);
+    if diff.is_empty() {
+        return Ok(diff);
+    }
+    let escaped = contents.replace('\'', "'\\''");
+    let script = format!("printf '%s' '{escaped}' > {remote_path}");
+    exec.run(&ssh_exec(ssh_config, &["sudo", "/bin/sh", "-c", &script]))
+        .await?;
+    Ok(diff)
+}
+
 pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
     let mut args = vec![
         "-F".into(),
@@ -368,6 +399,36 @@ mod tests {
         .await
         .expect("noop");
         assert!(exec.recorded().is_empty());
+    }
+
+    #[test]
+    fn desired_nginx_app_uses_host_dollar_host() {
+        let conf = desired_nginx_app("/sonarr", 8989);
+        assert!(conf.contains("Host $host"));
+        assert!(conf.contains("127.0.0.1:8989/sonarr"));
+        assert!(!conf.contains("Host 127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn nginx_repair_is_exec_not_bulk_copy() {
+        let exec = TranscriptExec::new();
+        let diff = write_remote_file(
+            &exec,
+            Path::new("/tmp/ssh_config"),
+            "/etc/nginx/apps/sonarr.conf",
+            &desired_nginx_app("/sonarr", 8989),
+        )
+        .await
+        .expect("write");
+        assert!(!diff.is_empty());
+        let calls = exec.recorded();
+        assert!(calls.iter().all(|c| c.program_name() == "ssh"), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a.contains("sonarr.conf"))),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test]

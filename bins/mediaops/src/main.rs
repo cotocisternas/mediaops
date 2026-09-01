@@ -9,9 +9,11 @@ use mediaops_ssh::SystemExec;
 
 mod apply_cmd;
 mod bootstrap;
+mod doctor;
 mod encode_cmd;
 mod home;
 mod library;
+mod repair;
 mod run;
 mod status;
 mod watch;
@@ -143,6 +145,57 @@ enum Command {
         config_dir: Option<PathBuf>,
     },
     Encode(EncodeArgs),
+    /// Read-only EdgeInvariant + key presence + PEM-in-git scan.
+    Doctor {
+        #[arg(long)]
+        repair: bool,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        pin: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
+    Repair(RepairArgs),
+}
+
+#[derive(Args, Debug)]
+struct RepairArgs {
+    #[command(subcommand)]
+    command: RepairCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum RepairCommand {
+    /// Confirmed nginx + API edge transaction.
+    Edge {
+        #[arg(long)]
+        repair: bool,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        pin: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        ssh_config: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -642,6 +695,59 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             command: EncodeCommand::Pause { off, state_db },
         })) => {
             let line = encode_cmd::pause(cli.json, off, state_db).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Doctor {
+            repair,
+            confirm,
+            pin,
+            desired_state,
+            socket,
+            tls_dir,
+            config_dir,
+            state_db,
+        }) => {
+            let line = doctor::doctor(
+                cli.json,
+                repair,
+                confirm,
+                pin,
+                desired_state,
+                socket,
+                tls_dir,
+                config_dir,
+                state_db,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Repair(RepairArgs {
+            command:
+                RepairCommand::Edge {
+                    repair,
+                    confirm,
+                    pin,
+                    desired_state,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                    state_db,
+                    ssh_config,
+                },
+        })) => {
+            let line = repair::repair_edge(
+                cli.json,
+                repair,
+                confirm,
+                pin,
+                desired_state,
+                socket,
+                tls_dir,
+                config_dir,
+                state_db,
+                ssh_config,
+            )
+            .await?;
             write_stdout(&line)
         }
     }

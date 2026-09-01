@@ -10,9 +10,9 @@ tonic::include_proto!("mediaops.v1");
 use std::path::PathBuf;
 
 use mediaops_core::{
-    BoxFuture, Bytes, ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, ExitCode,
-    GrabApplyReport, KeyPresence, RemoteEntry as CoreRemoteEntry, RemoteRef as CoreRemoteRef,
-    TitleId, WalkerError,
+    BoxFuture, Bytes, ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, EdgeApiReport,
+    ExitCode, GrabApplyReport, KeyPresence, RemoteEntry as CoreRemoteEntry,
+    RemoteRef as CoreRemoteRef, TitleId, WalkerError,
 };
 use prost::Message;
 
@@ -239,6 +239,25 @@ impl From<GrabApplyResponse> for GrabApplyReport {
     }
 }
 
+impl From<EdgeApplyResponse> for GrabApplyReport {
+    fn from(response: EdgeApplyResponse) -> Self {
+        Self {
+            noop: response.noop,
+            diff: response.diff,
+        }
+    }
+}
+
+impl From<EdgeCheckResponse> for EdgeApiReport {
+    fn from(response: EdgeCheckResponse) -> Self {
+        Self {
+            fingerprint: response.fingerprint,
+            invariant_ok: response.invariant_ok,
+            drift: response.drift,
+        }
+    }
+}
+
 impl From<KeyDiscoveryResponse> for KeyPresence {
     fn from(response: KeyDiscoveryResponse) -> Self {
         Self {
@@ -404,15 +423,35 @@ where
         })
     }
 
-    fn edge_check(&self) -> BoxFuture<'_, Result<(), ControlError>> {
+    fn edge_check(&self) -> BoxFuture<'_, Result<EdgeApiReport, ControlError>> {
         let mut client = self.inner.clone();
         Box::pin(async move {
             let response = client
                 .edge_check(EdgeCheckRequest {})
                 .await
                 .map_err(control_error_from_status)?;
-            check_handshake(&response.into_inner().proto_package)?;
-            Ok(())
+            let inner = response.into_inner();
+            check_handshake(&inner.proto_package)?;
+            Ok(EdgeApiReport::from(inner))
+        })
+    }
+
+    fn edge_apply<'a>(
+        &'a self,
+        desired_state_toml: &'a [u8],
+    ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>> {
+        let mut client = self.inner.clone();
+        let toml = desired_state_toml.to_vec();
+        Box::pin(async move {
+            let response = client
+                .edge_apply(EdgeApplyRequest {
+                    desired_state_toml: toml.into(),
+                })
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            check_handshake(&inner.proto_package)?;
+            Ok(GrabApplyReport::from(inner))
         })
     }
 

@@ -12,6 +12,7 @@
 pub mod bytes;
 pub mod control_port;
 pub mod desired_state;
+pub mod diff;
 pub mod digest;
 pub mod exec;
 pub mod install;
@@ -34,6 +35,7 @@ pub use desired_state::{
     GrabDownloadClient, GrabIndexer, GrabPolicy, Grabber, PathRoot, PinMatrixRow, Pins,
     TlsIdentity, upsert_tls_table,
 };
+pub use diff::{nginx_host_ok, panel_fingerprint, unified_diff};
 pub use digest::{Blake3Hex, DigestError};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};
 pub use install::{
