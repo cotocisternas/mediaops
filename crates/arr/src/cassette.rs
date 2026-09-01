@@ -1,7 +1,10 @@
 //! Replay recorded JSON request/response fixtures through [`HttpTransport`].
 
+use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use mediaops_core::Blake3Hex;
 use serde::Deserialize;
@@ -46,9 +49,11 @@ struct Entry {
 }
 
 /// In-memory cassette set. Misses are errors, never live HTTP.
+/// Repeated method+path hits walk matching entries in order, then reuse the last.
 #[derive(Debug, Clone, Default)]
 pub struct CassetteTransport {
     entries: Vec<Entry>,
+    used: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl CassetteTransport {
@@ -107,7 +112,7 @@ impl CassetteTransport {
         });
     }
 
-    fn lookup(&self, req: &HttpRequest) -> Result<&HttpResponse, TransportError> {
+    fn lookup(&self, req: &HttpRequest) -> Result<HttpResponse, TransportError> {
         let method = req.method.to_ascii_uppercase();
         let path = url_path_and_query(&req.url);
         let digest = req
@@ -115,24 +120,40 @@ impl CassetteTransport {
             .as_deref()
             .map(cassette_body_digest)
             .unwrap_or_else(|| cassette_body_digest(&[]));
-        let mut wildcard = None;
+        let mut exact = Vec::new();
+        let mut wildcard = Vec::new();
         for entry in &self.entries {
             if entry.method != method || entry.path != path {
                 continue;
             }
             match &entry.body_digest {
-                Some(want) if want == &digest => return Ok(&entry.response),
-                None => wildcard = Some(&entry.response),
+                Some(want) if want == &digest => exact.push(entry.response.clone()),
+                None => wildcard.push(entry.response.clone()),
                 Some(_) => continue,
             }
         }
-        wildcard.ok_or_else(|| TransportError::CassetteMiss(format!("{method} {path} {digest}")))
+        let matches = if exact.is_empty() { wildcard } else { exact };
+        if matches.is_empty() {
+            return Err(TransportError::CassetteMiss(format!(
+                "{method} {path} {digest}"
+            )));
+        }
+        let key = format!("{method} {path}");
+        let mut used = self.used.lock().expect("cassette cursor");
+        let n = used.get(&key).copied().unwrap_or(0);
+        let idx = n.min(matches.len() - 1);
+        used.insert(key, n.saturating_add(1));
+        Ok(matches[idx].clone())
     }
 }
 
 impl HttpTransport for CassetteTransport {
-    async fn send(&self, req: &HttpRequest) -> Result<HttpResponse, TransportError> {
-        self.lookup(req).cloned()
+    fn send(
+        &self,
+        req: &HttpRequest,
+    ) -> impl Future<Output = Result<HttpResponse, TransportError>> + Send {
+        let result = self.lookup(req);
+        async move { result }
     }
 }
 

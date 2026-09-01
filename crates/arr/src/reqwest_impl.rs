@@ -1,5 +1,7 @@
 //! Production [`HttpTransport`]. `reqwest` + rustls, no native-tls.
 
+use std::future::Future;
+
 use crate::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
 
 #[derive(Debug, Clone)]
@@ -18,7 +20,16 @@ impl ReqwestTransport {
 }
 
 impl HttpTransport for ReqwestTransport {
-    async fn send(&self, req: &HttpRequest) -> Result<HttpResponse, TransportError> {
+    fn send(
+        &self,
+        req: &HttpRequest,
+    ) -> impl Future<Output = Result<HttpResponse, TransportError>> + Send {
+        self.send_inner(req)
+    }
+}
+
+impl ReqwestTransport {
+    async fn send_inner(&self, req: &HttpRequest) -> Result<HttpResponse, TransportError> {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|err| TransportError::Io(err.to_string()))?;
         let mut builder = self.client.request(method, &req.url);

@@ -108,6 +108,9 @@ pub async fn cmd_run(
         .await
         .map_err(runtime_display)?;
     let n = configure_from_probes(&prepared.store, channel.clone()).await?;
+    let control = mediaops_proto::ControlPortClient::new(
+        mediaops_proto::control_client::ControlClient::new(channel.clone()),
+    );
     let active =
         std::fs::read(&prepared.desired_state).map_err(|err| AppError::Runtime(err.into()))?;
     let bytes = std::fs::read(&prepared.path).map_err(|err| AppError::Runtime(err.into()))?;
@@ -121,6 +124,7 @@ pub async fn cmd_run(
             source: grpc_source(channel),
             library_root: &prepared.library_root,
             concurrency: n as usize,
+            control: Some(&control),
         },
     )
     .await

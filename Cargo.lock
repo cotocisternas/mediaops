@@ -1152,6 +1152,7 @@ dependencies = [
  "fs4",
  "mediaops-core",
  "mediaops-encode",
+ "mediaops-proto",
  "mediaops-ssh",
  "mediaops-store",
  "mediaops-sync",

@@ -1,5 +1,7 @@
 //! HTTP as a port. Production impl is reqwest; tests replay cassettes (AD-15).
 
+use std::future::Future;
+
 /// Outbound request. Headers are ordered pairs so cassettes stay stable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
@@ -25,9 +27,22 @@ pub enum TransportError {
     CassetteMiss(String),
 }
 
-#[allow(async_fn_in_trait)]
 pub trait HttpTransport: Send + Sync {
-    async fn send(&self, req: &HttpRequest) -> Result<HttpResponse, TransportError>;
+    fn send(
+        &self,
+        req: &HttpRequest,
+    ) -> impl Future<Output = Result<HttpResponse, TransportError>> + Send;
+}
+
+impl<T: HttpTransport + ?Sized> HttpTransport for std::sync::Arc<T> {
+    fn send(
+        &self,
+        req: &HttpRequest,
+    ) -> impl Future<Output = Result<HttpResponse, TransportError>> + Send {
+        let inner = std::sync::Arc::clone(self);
+        let req = req.clone();
+        async move { inner.as_ref().send(&req).await }
+    }
 }
 
 /// Path + query of `url`, host stripped so cassettes are address-independent.

@@ -365,8 +365,8 @@ mod tests {
 
         let uds_ch = wait_unix(&sock, client).await;
         let uds_control = mediaops_proto::ControlPortClient::new(ControlClient::new(uds_ch));
-        let bytes = uds_control.df().await.expect("uds df");
-        assert!(bytes.get() > 0);
+        let snapshot = uds_control.df().await.expect("uds df");
+        assert!(snapshot.free.get() > 0);
 
         tcp_task.abort();
         uds_task.abort();
@@ -444,7 +444,7 @@ mod tests {
         let ch = wait_tcp(addr, id.client_config().expect("client")).await;
         let mut control = ControlClient::new(ch);
         control
-            .grab_apply(mediaops_proto::GrabApplyRequest {})
+            .grab_apply(mediaops_proto::GrabApplyRequest::default())
             .await
             .expect("noop");
         task.abort();

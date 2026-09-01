@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
-use mediaops_arr as _;
+use mediaops_arr::{KeyPaths, LocalhostGrabOps, ReqwestTransport};
 use mediaops_core::{
-    Allowlist, DesiredState, ExitCode, Grabber, UnderlayMode, endpoint_fingerprint,
+    Allowlist, DesiredState, ExitCode, GrabOps, Grabber, UnderlayMode, endpoint_fingerprint,
 };
 use mediaops_net::{DaemonRole, HomeGateway, IdentityBundle, Seedbox, serve_home_unix, serve_tcp};
+use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 const BIN_NAME: &str = "mediaopsd";
@@ -243,10 +244,32 @@ async fn serve_seedbox(args: ServeArgs) -> Result<(), AppError> {
         .local_addr()
         .map_err(|e| AppError::Runtime(e.into()))?;
     tracing::info!(%addr, "seedbox listen");
-    let seedbox = Seedbox::new(allowlist, env!("CARGO_PKG_VERSION"), Grabber::None);
+    let (grabber, grab_ops) = seedbox_grab_ops(args.desired_state.as_deref())?;
+    let seedbox =
+        Seedbox::new(allowlist, env!("CARGO_PKG_VERSION"), grabber).with_grab_ops(grab_ops);
     serve_tcp(listener, server, seedbox)
         .await
         .map_err(|err| AppError::Runtime(anyhow!(err)))
+}
+
+fn seedbox_grab_ops(
+    desired_state: Option<&Path>,
+) -> Result<(Grabber, Option<Arc<dyn GrabOps>>), AppError> {
+    let Some(path) = desired_state else {
+        return Ok((Grabber::None, None));
+    };
+    let text = std::fs::read_to_string(path).map_err(|err| AppError::Runtime(err.into()))?;
+    let ds = DesiredState::from_toml(&text).map_err(|err| AppError::Runtime(anyhow!(err)))?;
+    if ds.grabber() != Grabber::Servarr {
+        return Ok((ds.grabber(), None));
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let transport =
+        ReqwestTransport::new().map_err(|err| AppError::Runtime(anyhow!(err.to_string())))?;
+    let ops = LocalhostGrabOps::new(transport, KeyPaths::from_home(&home), &ds);
+    Ok((Grabber::Servarr, Some(Arc::new(ops))))
 }
 
 async fn serve_home(args: ServeArgs) -> Result<(), AppError> {

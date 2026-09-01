@@ -1,5 +1,6 @@
 //! Grabber HTTP behind [`HttpTransport`] (AD-15). Linked only into `mediaopsd`.
 
+mod apply;
 mod cassette;
 mod keys;
 mod lidarr;
@@ -12,6 +13,7 @@ mod servarr;
 mod sonarr;
 mod transport;
 
+pub use apply::LocalhostGrabOps;
 pub use cassette::{CassetteTransport, cassette_body_digest, cassette_key};
 pub use keys::{
     DiscoveredKeys, KeyError, KeyPaths, discover_keys, discover_sab_key, discover_servarr_key,

@@ -1,29 +1,42 @@
 //! Control port. A trait, not I/O: no tokio, tonic, or filesystem.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crate::ExitCode;
 use crate::bytes::Bytes;
 use crate::desired_state::DesiredState;
 use crate::title_id::TitleId;
 use crate::walker::RemoteRef;
 
+/// Boxed future so [`ControlPort`] / [`GrabOps`] are dyn-compatible.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Remote Control operations. Async signatures only; the canonical impl lives in `proto`.
-#[allow(async_fn_in_trait)]
 pub trait ControlPort: Send + Sync {
-    async fn df(&self) -> Result<Bytes, ControlError>;
-    async fn unmonitor(&self, title_id: &TitleId) -> Result<(), ControlError>;
-    async fn delete_remote(&self, remote: &RemoteRef) -> Result<DeleteRemoteOutcome, ControlError>;
-    async fn grab_apply(&self) -> Result<(), ControlError>;
-    async fn edge_check(&self) -> Result<(), ControlError>;
-    async fn key_discovery(&self) -> Result<(), ControlError>;
-    async fn guard_preview(&self) -> Result<(), ControlError>;
+    fn df(&self) -> BoxFuture<'_, Result<DfSnapshot, ControlError>>;
+    fn unmonitor<'a>(&'a self, title_id: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>>;
+    fn delete_remote<'a>(
+        &'a self,
+        remote: &'a RemoteRef,
+    ) -> BoxFuture<'a, Result<DeleteRemoteOutcome, ControlError>>;
+    fn grab_apply<'a>(
+        &'a self,
+        desired_state_toml: &'a [u8],
+    ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
+    fn edge_check(&self) -> BoxFuture<'_, Result<(), ControlError>>;
+    fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>>;
+    fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>>;
 }
 
 /// Seedbox-local grabber HTTP. Injected into `net::Seedbox`; `net` does not name HTTP.
-#[allow(async_fn_in_trait)]
 pub trait GrabOps: Send + Sync {
-    async fn grab_apply(&self, desired: &DesiredState) -> Result<GrabApplyReport, ControlError>;
-    async fn key_discovery(&self) -> Result<KeyPresence, ControlError>;
-    async fn edge_api_check(&self) -> Result<EdgeApiReport, ControlError>;
+    fn grab_apply<'a>(
+        &'a self,
+        desired: &'a DesiredState,
+    ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
+    fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>>;
+    fn edge_api_check(&self) -> BoxFuture<'_, Result<EdgeApiReport, ControlError>>;
 }
 
 /// `df` payload for handshake + free space. Wire still splits the fields.

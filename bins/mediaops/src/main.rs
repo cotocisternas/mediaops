@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use mediaops_core::{ExitCode, ProviderKind};
 use mediaops_ssh::SystemExec;
 
+mod apply_cmd;
 mod bootstrap;
 mod encode_cmd;
 mod home;
@@ -213,6 +214,19 @@ enum LibraryCommand {
 
 #[derive(Subcommand, Debug)]
 enum SeedboxCommand {
+    /// Apply grabber indexer/client sets from desired-state (Control GrabApply).
+    Apply {
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
     /// Install mediaopsd on Host seedbox and mint mTLS (destructive; needs --yes).
     Bootstrap {
         #[arg(long, default_value = "already-there")]
@@ -365,6 +379,27 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
 async fn run(cli: Cli) -> Result<(), AppError> {
     match cli.command {
         None => emit_success(cli.json),
+        Some(Command::Seedbox(SeedboxArgs {
+            command:
+                SeedboxCommand::Apply {
+                    desired_state,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                    state_db,
+                },
+        })) => {
+            let line = apply_cmd::seedbox_apply(
+                cli.json,
+                desired_state,
+                socket,
+                tls_dir,
+                config_dir,
+                state_db,
+            )
+            .await?;
+            write_stdout(&line)
+        }
         Some(Command::Seedbox(SeedboxArgs {
             command:
                 SeedboxCommand::Bootstrap {

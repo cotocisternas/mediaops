@@ -2,8 +2,11 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::pin::Pin;
+use std::sync::Arc;
 
-use mediaops_core::{Allowlist, ControlError, ExitCode, Grabber, RemoteRef, WalkerError};
+use mediaops_core::{
+    Allowlist, ControlError, DesiredState, ExitCode, GrabOps, Grabber, RemoteRef, WalkerError,
+};
 use mediaops_proto::control_server::Control;
 use mediaops_proto::transfer_server::Transfer;
 use mediaops_proto::{
@@ -21,6 +24,7 @@ pub struct Seedbox {
     allowlist: Allowlist,
     semver: String,
     grabber: Grabber,
+    grab_ops: Option<Arc<dyn GrabOps>>,
 }
 
 impl Seedbox {
@@ -29,7 +33,13 @@ impl Seedbox {
             allowlist,
             semver: semver.into(),
             grabber,
+            grab_ops: None,
         }
+    }
+
+    pub fn with_grab_ops(mut self, grab_ops: Option<Arc<dyn GrabOps>>) -> Self {
+        self.grab_ops = grab_ops;
+        self
     }
 
     fn handshake(&self) -> (String, String) {
@@ -97,15 +107,33 @@ impl Control for Seedbox {
 
     async fn grab_apply(
         &self,
-        _request: Request<GrabApplyRequest>,
+        request: Request<GrabApplyRequest>,
     ) -> Result<Response<GrabApplyResponse>, Status> {
-        if self.grabber != Grabber::None {
-            return Err(unused("GrabApply"));
-        }
         let (semver, proto_package) = self.handshake();
+        if self.grabber == Grabber::None || self.grab_ops.is_none() {
+            return Ok(Response::new(GrabApplyResponse {
+                semver,
+                proto_package,
+                noop: true,
+                diff: String::new(),
+            }));
+        }
+        let toml = request.into_inner().desired_state_toml;
+        let desired = DesiredState::from_toml_bytes(&toml).map_err(|err| {
+            status_from_error_detail(&ErrorDetail::from(ControlError::runtime(err.to_string())))
+        })?;
+        let report = self
+            .grab_ops
+            .as_ref()
+            .expect("checked")
+            .grab_apply(&desired)
+            .await
+            .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
         Ok(Response::new(GrabApplyResponse {
             semver,
             proto_package,
+            noop: report.noop,
+            diff: report.diff,
         }))
     }
 
@@ -120,7 +148,24 @@ impl Control for Seedbox {
         &self,
         _request: Request<KeyDiscoveryRequest>,
     ) -> Result<Response<KeyDiscoveryResponse>, Status> {
-        Err(unused("KeyDiscovery"))
+        let (semver, proto_package) = self.handshake();
+        let presence = if let Some(ops) = &self.grab_ops {
+            ops.key_discovery()
+                .await
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?
+        } else {
+            mediaops_core::KeyPresence::default()
+        };
+        Ok(Response::new(KeyDiscoveryResponse {
+            semver,
+            proto_package,
+            sonarr_key_present: presence.sonarr_key_present,
+            radarr_key_present: presence.radarr_key_present,
+            lidarr_key_present: presence.lidarr_key_present,
+            prowlarr_key_present: presence.prowlarr_key_present,
+            sab_key_present: presence.sab_key_present,
+            qbit_key_present: presence.qbit_key_present,
+        }))
     }
 
     async fn guard_preview(
@@ -274,12 +319,6 @@ mod tests {
                     .err(),
             ),
             (
-                "KeyDiscovery",
-                seed.key_discovery(Request::new(KeyDiscoveryRequest {}))
-                    .await
-                    .err(),
-            ),
-            (
                 "GuardPreview",
                 seed.guard_preview(Request::new(GuardPreviewRequest {}))
                     .await
@@ -302,12 +341,19 @@ mod tests {
         let root = scratch("grab");
         let seed = seedbox_with(root.clone());
         let resp = seed
-            .grab_apply(Request::new(GrabApplyRequest {}))
+            .grab_apply(Request::new(GrabApplyRequest::default()))
             .await
             .expect("grab none")
             .into_inner();
         assert_eq!(resp.semver, "0.1.0");
         assert_eq!(resp.proto_package, PROTO_PACKAGE);
+        assert!(resp.noop);
+        let keys = seed
+            .key_discovery(Request::new(KeyDiscoveryRequest {}))
+            .await
+            .expect("keys")
+            .into_inner();
+        assert!(!keys.sonarr_key_present);
         let _ = std::fs::remove_dir_all(root);
     }
 

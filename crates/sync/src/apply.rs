@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mediaops_core::{
-    Action, InstallError, Job, JobEvent, JobId, JobKind, JobState, JobsRepo, PathSchemaError,
-    Placement, Plan, PlanError, PullEvent, PullState, RemoteRef, SKIP_UPGRADE_NEVER, TitleId,
-    TitleIndexRepo, VerifiedStagingHandle, WantEvent, WantState, install, render, staging_path,
+    Action, ControlError, ControlPort, InstallError, Job, JobEvent, JobId, JobKind, JobState,
+    JobsRepo, PathSchemaError, Placement, Plan, PlanError, PullEvent, PullState, RemoteRef,
+    SKIP_UPGRADE_NEVER, TitleId, TitleIndexRepo, VerifiedStagingHandle, WantEvent, WantState,
+    install, render, staging_path,
 };
 use mediaops_transfer::{PullSpec, RangeSource, pull_file};
 
@@ -42,6 +43,8 @@ pub enum ApplyError {
     Titles(String),
     #[error("transfer: {0}")]
     Transfer(String),
+    #[error("control: {0}")]
+    Control(#[from] ControlError),
 }
 
 impl ApplyError {
@@ -56,6 +59,7 @@ pub struct ApplyCtx<'a, J, T, S> {
     pub source: Arc<S>,
     pub library_root: &'a Path,
     pub concurrency: usize,
+    pub control: Option<&'a dyn ControlPort>,
 }
 
 pub async fn apply<J, T, S>(
@@ -111,13 +115,17 @@ where
                 report.skips += 1;
             }
             Action::Skip { .. } => report.skips += 1,
+            Action::GrabApply => {
+                if let Some(control) = ctx.control {
+                    let _report = control.grab_apply(plan.desired_state_toml()).await?;
+                }
+            }
             Action::Encode { .. }
             | Action::Review
             | Action::Unmonitor
             | Action::DeleteRemote
             | Action::Reclaim
-            | Action::EdgeApply
-            | Action::GrabApply => {}
+            | Action::EdgeApply => {}
         }
     }
     Ok(report)
@@ -562,6 +570,7 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
@@ -602,6 +611,7 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
@@ -642,6 +652,7 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
@@ -662,6 +673,7 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
@@ -699,6 +711,7 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
@@ -735,6 +748,7 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
@@ -781,6 +795,7 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
@@ -833,11 +848,102 @@ mod tests {
                 source: src,
                 library_root: &root,
                 concurrency: 1,
+                control: None,
             },
         )
         .await
         .expect_err("mismatch");
         assert!(err.to_string().contains("does not match"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    struct FakeControl {
+        calls: Mutex<usize>,
+    }
+
+    impl ControlPort for FakeControl {
+        fn df(
+            &self,
+        ) -> mediaops_core::BoxFuture<'_, Result<mediaops_core::DfSnapshot, ControlError>> {
+            Box::pin(async {
+                Ok(mediaops_core::DfSnapshot {
+                    free: mediaops_core::Bytes::new(0),
+                    semver: "0.1.0".into(),
+                    proto_package: "mediaops.v1".into(),
+                })
+            })
+        }
+        fn unmonitor<'a>(
+            &'a self,
+            _: &'a TitleId,
+        ) -> mediaops_core::BoxFuture<'a, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn delete_remote<'a>(
+            &'a self,
+            _: &'a RemoteRef,
+        ) -> mediaops_core::BoxFuture<'a, Result<mediaops_core::DeleteRemoteOutcome, ControlError>>
+        {
+            Box::pin(async { Ok(mediaops_core::DeleteRemoteOutcome::Deleted) })
+        }
+        fn grab_apply<'a>(
+            &'a self,
+            _: &'a [u8],
+        ) -> mediaops_core::BoxFuture<'a, Result<mediaops_core::GrabApplyReport, ControlError>>
+        {
+            Box::pin(async {
+                *self.calls.lock().expect("lock") += 1;
+                Ok(mediaops_core::GrabApplyReport {
+                    noop: true,
+                    diff: String::new(),
+                })
+            })
+        }
+        fn edge_check(&self) -> mediaops_core::BoxFuture<'_, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn key_discovery(
+            &self,
+        ) -> mediaops_core::BoxFuture<'_, Result<mediaops_core::KeyPresence, ControlError>>
+        {
+            Box::pin(async { Ok(mediaops_core::KeyPresence::default()) })
+        }
+        fn guard_preview(&self) -> mediaops_core::BoxFuture<'_, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn grab_apply_dispatches_through_control_port() {
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![Action::GrabApply]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("grab-apply");
+        let control = FakeControl {
+            calls: Mutex::new(0),
+        };
+        apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+                control: Some(&control),
+            },
+        )
+        .await
+        .expect("apply");
+        assert_eq!(*control.calls.lock().expect("lock"), 1);
         let _ = fs::remove_dir_all(root);
     }
 }

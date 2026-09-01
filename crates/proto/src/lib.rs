@@ -10,8 +10,9 @@ tonic::include_proto!("mediaops.v1");
 use std::path::PathBuf;
 
 use mediaops_core::{
-    Bytes, ControlError, ControlPort, DeleteRemoteOutcome, ExitCode,
-    RemoteEntry as CoreRemoteEntry, RemoteRef as CoreRemoteRef, TitleId, WalkerError,
+    BoxFuture, Bytes, ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, ExitCode,
+    GrabApplyReport, KeyPresence, RemoteEntry as CoreRemoteEntry, RemoteRef as CoreRemoteRef,
+    TitleId, WalkerError,
 };
 use prost::Message;
 
@@ -219,6 +220,38 @@ impl From<DfResponse> for Bytes {
     }
 }
 
+impl From<DfResponse> for DfSnapshot {
+    fn from(response: DfResponse) -> Self {
+        Self {
+            free: Bytes::new(response.free_bytes),
+            semver: response.semver,
+            proto_package: response.proto_package,
+        }
+    }
+}
+
+impl From<GrabApplyResponse> for GrabApplyReport {
+    fn from(response: GrabApplyResponse) -> Self {
+        Self {
+            noop: response.noop,
+            diff: response.diff,
+        }
+    }
+}
+
+impl From<KeyDiscoveryResponse> for KeyPresence {
+    fn from(response: KeyDiscoveryResponse) -> Self {
+        Self {
+            sonarr_key_present: response.sonarr_key_present,
+            radarr_key_present: response.radarr_key_present,
+            lidarr_key_present: response.lidarr_key_present,
+            prowlarr_key_present: response.prowlarr_key_present,
+            sab_key_present: response.sab_key_present,
+            qbit_key_present: response.qbit_key_present,
+        }
+    }
+}
+
 impl From<ControlError> for ErrorDetail {
     fn from(err: ControlError) -> Self {
         Self {
@@ -301,87 +334,111 @@ impl<T> ControlPortClient<T> {
 
 impl<T> ControlPort for ControlPortClient<T>
 where
-    T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync,
+    T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
     T::Error: Into<tonic::codegen::StdError>,
+    T::Future: Send,
     T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
-    async fn df(&self) -> Result<Bytes, ControlError> {
+    fn df(&self) -> BoxFuture<'_, Result<DfSnapshot, ControlError>> {
         let mut client = self.inner.clone();
-        let response = client
-            .df(DfRequest {})
-            .await
-            .map_err(control_error_from_status)?;
-        let inner = response.into_inner();
-        check_handshake(&inner.proto_package)?;
-        Ok(Bytes::from(inner))
+        Box::pin(async move {
+            let response = client
+                .df(DfRequest {})
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            check_handshake(&inner.proto_package)?;
+            Ok(DfSnapshot::from(inner))
+        })
     }
 
-    async fn unmonitor(&self, title_id: &TitleId) -> Result<(), ControlError> {
+    fn unmonitor<'a>(&'a self, title_id: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>> {
         let mut client = self.inner.clone();
-        let response = client
-            .unmonitor(UnmonitorRequest::from(title_id))
-            .await
-            .map_err(control_error_from_status)?;
-        check_handshake(&response.into_inner().proto_package)?;
-        Ok(())
+        let request = UnmonitorRequest::from(title_id);
+        Box::pin(async move {
+            let response = client
+                .unmonitor(request)
+                .await
+                .map_err(control_error_from_status)?;
+            check_handshake(&response.into_inner().proto_package)?;
+            Ok(())
+        })
     }
 
-    async fn delete_remote(
-        &self,
-        remote: &CoreRemoteRef,
-    ) -> Result<DeleteRemoteOutcome, ControlError> {
+    fn delete_remote<'a>(
+        &'a self,
+        remote: &'a CoreRemoteRef,
+    ) -> BoxFuture<'a, Result<DeleteRemoteOutcome, ControlError>> {
         let mut client = self.inner.clone();
-        let request = DeleteRemoteRequest {
-            r#ref: Some(RemoteRef::try_from(remote).map_err(convert_to_control)?),
-        };
-        let response = client
-            .delete_remote(request)
-            .await
-            .map_err(control_error_from_status)?;
-        let inner = response.into_inner();
-        check_handshake(&inner.proto_package)?;
-        DeleteRemoteOutcome::try_from(inner).map_err(convert_to_control)
+        Box::pin(async move {
+            let request = DeleteRemoteRequest {
+                r#ref: Some(RemoteRef::try_from(remote).map_err(convert_to_control)?),
+            };
+            let response = client
+                .delete_remote(request)
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            check_handshake(&inner.proto_package)?;
+            DeleteRemoteOutcome::try_from(inner).map_err(convert_to_control)
+        })
     }
 
-    async fn grab_apply(&self) -> Result<(), ControlError> {
+    fn grab_apply<'a>(
+        &'a self,
+        desired_state_toml: &'a [u8],
+    ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>> {
         let mut client = self.inner.clone();
-        let response = client
-            .grab_apply(GrabApplyRequest {})
-            .await
-            .map_err(control_error_from_status)?;
-        check_handshake(&response.into_inner().proto_package)?;
-        Ok(())
+        let toml = desired_state_toml.to_vec();
+        Box::pin(async move {
+            let response = client
+                .grab_apply(GrabApplyRequest {
+                    desired_state_toml: toml.into(),
+                })
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            check_handshake(&inner.proto_package)?;
+            Ok(GrabApplyReport::from(inner))
+        })
     }
 
-    async fn edge_check(&self) -> Result<(), ControlError> {
+    fn edge_check(&self) -> BoxFuture<'_, Result<(), ControlError>> {
         let mut client = self.inner.clone();
-        let response = client
-            .edge_check(EdgeCheckRequest {})
-            .await
-            .map_err(control_error_from_status)?;
-        check_handshake(&response.into_inner().proto_package)?;
-        Ok(())
+        Box::pin(async move {
+            let response = client
+                .edge_check(EdgeCheckRequest {})
+                .await
+                .map_err(control_error_from_status)?;
+            check_handshake(&response.into_inner().proto_package)?;
+            Ok(())
+        })
     }
 
-    async fn key_discovery(&self) -> Result<(), ControlError> {
+    fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>> {
         let mut client = self.inner.clone();
-        let response = client
-            .key_discovery(KeyDiscoveryRequest {})
-            .await
-            .map_err(control_error_from_status)?;
-        check_handshake(&response.into_inner().proto_package)?;
-        Ok(())
+        Box::pin(async move {
+            let response = client
+                .key_discovery(KeyDiscoveryRequest {})
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            check_handshake(&inner.proto_package)?;
+            Ok(KeyPresence::from(inner))
+        })
     }
 
-    async fn guard_preview(&self) -> Result<(), ControlError> {
+    fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>> {
         let mut client = self.inner.clone();
-        let response = client
-            .guard_preview(GuardPreviewRequest {})
-            .await
-            .map_err(control_error_from_status)?;
-        check_handshake(&response.into_inner().proto_package)?;
-        Ok(())
+        Box::pin(async move {
+            let response = client
+                .guard_preview(GuardPreviewRequest {})
+                .await
+                .map_err(control_error_from_status)?;
+            check_handshake(&response.into_inner().proto_package)?;
+            Ok(())
+        })
     }
 }
 

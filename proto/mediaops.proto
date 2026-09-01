@@ -123,11 +123,15 @@ message DeleteRemoteResponse {
   DeleteRemoteResult result = 3;
 }
 
-message GrabApplyRequest {}
+message GrabApplyRequest {
+  bytes desired_state_toml = 1;
+}
 
 message GrabApplyResponse {
   string semver = 1;
   string proto_package = 2;
+  bool noop = 3;
+  string diff = 4;
 }
 
 message EdgeCheckRequest {}
@@ -142,6 +146,12 @@ message KeyDiscoveryRequest {}
 message KeyDiscoveryResponse {
   string semver = 1;
   string proto_package = 2;
+  bool sonarr_key_present = 3;
+  bool radarr_key_present = 4;
+  bool lidarr_key_present = 5;
+  bool prowlarr_key_present = 6;
+  bool sab_key_present = 7;
+  bool qbit_key_present = 8;
 }
 
 message GuardPreviewRequest {}

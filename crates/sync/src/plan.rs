@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use mediaops_core::{
-    Action, DesiredState, Job, JobState, RemoteEntry, SKIP_DUPLICATE_TITLE, SKIP_LOCK,
+    Action, DesiredState, Grabber, Job, JobState, RemoteEntry, SKIP_DUPLICATE_TITLE, SKIP_LOCK,
     SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK, TitleId, TitleIndexEntry, TitleKind,
     WantState, parse_placement,
 };
@@ -125,6 +125,9 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         }
         actions.extend(upgrade_never);
         actions.extend(duplicates);
+        if req.desired.grabber() == Grabber::Servarr {
+            actions.insert(0, Action::GrabApply);
+        }
         return Planned {
             actions,
             first_candidate_breaches: false,
@@ -175,6 +178,9 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
 
     actions.extend(upgrade_never);
     actions.extend(duplicates);
+    if req.desired.grabber() == Grabber::Servarr {
+        actions.insert(0, Action::GrabApply);
+    }
     Planned {
         actions,
         first_candidate_breaches,
@@ -535,5 +541,33 @@ lock = false
             planned.actions
         );
         assert!(planned.first_candidate_breaches);
+    }
+
+    #[test]
+    fn servarr_grabber_emits_grab_apply() {
+        let toml = r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 1
+range_len_mib = 8
+max_nvenc = 1
+lock = false
+grabber = "servarr"
+"#;
+        let desired = DesiredState::from_toml(toml).expect("ds");
+        let listings = [entry(&movie_rel("603", 1999), 10)];
+        let planned = plan_actions(PlanRequest {
+            listings: &listings,
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &desired,
+            free_bytes: 2 * Bytes::GIB,
+        });
+        assert!(
+            matches!(planned.actions.first(), Some(Action::GrabApply)),
+            "{:?}",
+            planned.actions
+        );
     }
 }
