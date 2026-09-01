@@ -6,4 +6,8 @@ rust-version.workspace = true
 
 [dependencies]
 mediaops-core.workspace = true
+mediaops-transfer.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread"] }

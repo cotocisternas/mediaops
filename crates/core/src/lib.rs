@@ -38,10 +38,12 @@ pub use jobs::{
     JobState, JobsRepo, PullEvent, PullState, WantEvent, WantState, advance, encode_ready,
 };
 pub use pathschema::{
-    GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, parse, render, staging_path,
-    strip_scene_tags,
+    GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, parse, parse_placement, render,
+    staging_path, strip_scene_tags,
 };
-pub use plan::{Action, Plan, PlanError};
+pub use plan::{
+    Action, Plan, PlanError, SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK,
+};
 pub use probe::{Probe, ProbeError, ProbeRepo, UnderlayMode, endpoint_fingerprint, plateau_n};
 pub use provider::{ProviderError, ProviderKind, already_there_install};
 pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource};

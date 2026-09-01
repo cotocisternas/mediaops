@@ -7,6 +7,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::title_id::{TitleId, TitleKind, TitleSource};
 
 /// PathSchema grammar version. Bump when render/parse rules change.
@@ -15,7 +17,8 @@ pub const GRAMMAR_VERSION: u32 = 1;
 const SCENE_TAGS: &[&str] = &["REPACJ", "REPACK", "PROPER"];
 
 /// Display placement used only to render a path. Identity stays on [`TitleId`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Placement {
     Movie {
         title: String,
@@ -246,7 +249,23 @@ pub fn render(title_id: &TitleId, placement: &Placement) -> Result<PathBuf, Path
 /// Paths under `_ops/needs-split` or `_ops/needs-year` are classified as those
 /// reject bins, not a TitleId.
 pub fn parse(path: impl AsRef<Path>) -> Result<TitleId, PathSchemaError> {
+    parse_inner(path.as_ref()).map(|(title_id, _)| title_id)
+}
+
+/// Parse a library-relative **file** path to TitleId plus placement.
+///
+/// Folder-only paths are not Copy candidates: they have a TitleId but no file
+/// component to install.
+pub fn parse_placement(path: impl AsRef<Path>) -> Result<(TitleId, Placement), PathSchemaError> {
     let path = path.as_ref();
+    let (title_id, placement) = parse_inner(path)?;
+    match placement {
+        Some(placement) => Ok((title_id, placement)),
+        None => Err(PathSchemaError::Invalid(path_utf8(path)?.to_string())),
+    }
+}
+
+fn parse_inner(path: &Path) -> Result<(TitleId, Option<Placement>), PathSchemaError> {
     let raw = path_utf8(path)?;
     if let Some(bin) = classify_reject_bin(path) {
         return Err(PathSchemaError::RejectBin(bin));
@@ -295,42 +314,47 @@ pub fn parse(path: impl AsRef<Path>) -> Result<TitleId, PathSchemaError> {
     let title_id = TitleId::parse(&format!("{}:{}:{id}", kind.as_str(), source.as_str()))
         .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
 
-    if let Some(file) = file {
-        match kind {
-            TitleKind::Movie => {
-                let stem = file_stem(file, raw)?;
-                let file_year = year_from_movie_stem(stem, &display_title, raw)?;
-                if file_year != folder_year {
-                    return Err(PathSchemaError::YearMismatch {
-                        folder: folder_year,
-                        file: file_year,
-                    });
-                }
+    let Some(file) = file else {
+        return Ok((title_id, None));
+    };
+    let extension = file
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_string())
+        .ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
+    let stem = file_stem(file, raw)?;
+    let placement = match kind {
+        TitleKind::Movie => {
+            let file_year = year_from_movie_stem(stem, &display_title, raw)?;
+            if file_year != folder_year {
+                return Err(PathSchemaError::YearMismatch {
+                    folder: folder_year,
+                    file: file_year,
+                });
             }
-            TitleKind::Series => {
-                let stem = file_stem(file, raw)?;
-                let file_year = year_from_episode_stem(stem, &display_title, raw)?;
-                if file_year != folder_year {
-                    return Err(PathSchemaError::YearMismatch {
-                        folder: folder_year,
-                        file: file_year,
-                    });
-                }
-            }
-            TitleKind::Album => {
-                let stem = file_stem(file, raw)?;
-                let file_year = year_from_track_stem(stem, raw)?;
-                if file_year != folder_year {
-                    return Err(PathSchemaError::YearMismatch {
-                        folder: folder_year,
-                        file: file_year,
-                    });
-                }
-            }
+            Placement::movie(display_title, folder_year, extension)
         }
-    }
-
-    Ok(title_id)
+        TitleKind::Series => {
+            let (file_year, season, episode) = episode_from_stem(stem, &display_title, raw)?;
+            if file_year != folder_year {
+                return Err(PathSchemaError::YearMismatch {
+                    folder: folder_year,
+                    file: file_year,
+                });
+            }
+            Placement::episode(display_title, folder_year, season, episode, extension)
+        }
+        TitleKind::Album => {
+            let (track, title, file_year) = track_from_stem(stem, raw)?;
+            if file_year != folder_year {
+                return Err(PathSchemaError::YearMismatch {
+                    folder: folder_year,
+                    file: file_year,
+                });
+            }
+            Placement::track(display_title, folder_year, track, title, extension)
+        }
+    };
+    Ok((title_id, Some(placement)))
 }
 
 /// Staging layout: `_incoming/<kind-source-id>/<final_name>`.
@@ -508,7 +532,7 @@ fn year_from_movie_stem(stem: &str, title: &str, raw: &str) -> Result<u16, PathS
     parse_year_4(year_str, raw)
 }
 
-fn year_from_episode_stem(stem: &str, title: &str, raw: &str) -> Result<u16, PathSchemaError> {
+fn episode_from_stem(stem: &str, title: &str, raw: &str) -> Result<(u16, u8, u8), PathSchemaError> {
     let expected_prefix = format!("{title}.(");
     let rest = stem
         .strip_prefix(&expected_prefix)
@@ -519,10 +543,17 @@ fn year_from_episode_stem(stem: &str, title: &str, raw: &str) -> Result<u16, Pat
     if !is_sxxexx(after) {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     }
-    parse_year_4(year_str, raw)
+    let year = parse_year_4(year_str, raw)?;
+    let season: u8 = after[2..4]
+        .parse()
+        .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    let episode: u8 = after[5..7]
+        .parse()
+        .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    Ok((year, season, episode))
 }
 
-fn year_from_track_stem(stem: &str, raw: &str) -> Result<u16, PathSchemaError> {
+fn track_from_stem(stem: &str, raw: &str) -> Result<(u8, String, u16), PathSchemaError> {
     // Grammar is `NN.<title>.(YYYY)`; movie and series stems are checked in full,
     // so the track stem must be too.
     let Some((track, rest)) = stem.split_once('.') else {
@@ -531,13 +562,17 @@ fn year_from_track_stem(stem: &str, raw: &str) -> Result<u16, PathSchemaError> {
     if track.len() != 2 || !track.bytes().all(|b| b.is_ascii_digit()) {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     }
+    let track: u8 = track
+        .parse()
+        .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
     let Some((title, year_suffix)) = split_tail(rest, 7) else {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     };
     if title.is_empty() || !year_suffix.starts_with(".(") || !year_suffix.ends_with(')') {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     }
-    parse_year_4(&year_suffix[2..6], raw)
+    let year = parse_year_4(&year_suffix[2..6], raw)?;
+    Ok((track, title.to_string(), year))
 }
 
 fn is_sxxexx(after: &str) -> bool {
@@ -1003,5 +1038,39 @@ mod tests {
         assert!(render(&movie_id(), &Placement::movie("A{B", 1999, "mkv")).is_err());
         assert!(parse("movies/A{B.(1999).{tmdb-603}/A{B.(1999).mkv").is_err());
         assert!(parse("movies/...(1999).{tmdb-603}/x.mkv").is_err());
+    }
+
+    #[test]
+    fn parse_placement_requires_a_file_and_round_trips_render() {
+        let movie = render(&movie_id(), &Placement::movie("The.Matrix", 1999, "mkv")).expect("r");
+        let (id, placement) = parse_placement(&movie).expect("placement");
+        assert_eq!(id, movie_id());
+        assert_eq!(placement, Placement::movie("The.Matrix", 1999, "mkv"));
+
+        let series = render(
+            &series_id(),
+            &Placement::episode("The.Wire", 2002, 1, 1, "mkv"),
+        )
+        .expect("r");
+        let (id, placement) = parse_placement(&series).expect("placement");
+        assert_eq!(id, series_id());
+        assert_eq!(placement, Placement::episode("The.Wire", 2002, 1, 1, "mkv"));
+
+        let album = render(
+            &album_id(),
+            &Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac"),
+        )
+        .expect("r");
+        let (id, placement) = parse_placement(&album).expect("placement");
+        assert_eq!(id, album_id());
+        assert_eq!(
+            placement,
+            Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac")
+        );
+
+        assert!(
+            parse_placement("movies/The.Matrix.(1999).{tmdb-603}").is_err(),
+            "folder-only paths are not Copy"
+        );
     }
 }

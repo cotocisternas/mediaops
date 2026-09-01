@@ -1,9 +1,15 @@
-//! Home-side library layout. Plan/apply waits for Epic 4.
+//! Home-side library layout, grabber=None planner, and apply.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mediaops_core::{Bytes, free_bytes};
+use mediaops_core::{Bytes, Placement, TitleId, free_bytes, parse_placement};
+
+mod apply;
+mod plan;
+
+pub use apply::{ApplyCtx, ApplyError, ApplyReport, InstalledCopy, apply};
+pub use plan::{PlanRequest, Planned, plan_actions};
 
 pub const SCHEMA_DIRS: &[&str] = &["movies", "series", "music", "_ops", "_incoming"];
 
@@ -62,8 +68,66 @@ pub fn write_user_units(unit_dir: &Path, exec_start: &str) -> Result<(), Library
     fs::create_dir_all(unit_dir).map_err(|err| LibraryError::io(unit_dir, err))?;
     let service = unit_dir.join("mediaops-run.service");
     let timer = unit_dir.join("mediaops-run.timer");
-    fs::write(&service, run_service_unit(exec_start)).map_err(|err| LibraryError::io(&service, err))?;
+    fs::write(&service, run_service_unit(exec_start))
+        .map_err(|err| LibraryError::io(&service, err))?;
     fs::write(&timer, run_timer_unit()).map_err(|err| LibraryError::io(&timer, err))?;
+    Ok(())
+}
+
+pub fn home_service_unit(exec_start: &str) -> String {
+    format!(
+        "[Unit]\nDescription=mediaopsd home gateway\n\n[Service]\nType=simple\nRestart=on-failure\nExecStart={exec_start}\n\n[Install]\nWantedBy=default.target\n"
+    )
+}
+
+pub fn write_home_unit(unit_dir: &Path, exec_start: &str) -> Result<(), LibraryError> {
+    fs::create_dir_all(unit_dir).map_err(|err| LibraryError::io(unit_dir, err))?;
+    let service = unit_dir.join("mediaopsd-home.service");
+    fs::write(&service, home_service_unit(exec_start))
+        .map_err(|err| LibraryError::io(&service, err))?;
+    Ok(())
+}
+
+/// Walk `movies`/`series`/`music` for TitleId → schema path. Used when a v4
+/// title-index row has an empty path.
+pub fn scan_schema_files(root: &Path) -> Result<Vec<(TitleId, PathBuf, Placement)>, LibraryError> {
+    let mut out = Vec::new();
+    for kind in ["movies", "series", "music"] {
+        let dir = root.join(kind);
+        if !dir.is_dir() {
+            continue;
+        }
+        scan_kind_dir(root, &dir, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn scan_kind_dir(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(TitleId, PathBuf, Placement)>,
+) -> Result<(), LibraryError> {
+    let reader = fs::read_dir(dir).map_err(|err| LibraryError::io(dir, err))?;
+    for entry in reader {
+        let entry = entry.map_err(|err| LibraryError::io(dir, err))?;
+        let path = entry.path();
+        if path.is_dir() {
+            let inner = fs::read_dir(&path).map_err(|err| LibraryError::io(&path, err))?;
+            for file in inner {
+                let file = file.map_err(|err| LibraryError::io(&path, err))?;
+                let file_path = file.path();
+                if !file_path.is_file() {
+                    continue;
+                }
+                let Ok(rel) = file_path.strip_prefix(root) else {
+                    continue;
+                };
+                if let Ok((title_id, placement)) = parse_placement(rel) {
+                    out.push((title_id, rel.to_path_buf(), placement));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -186,8 +250,20 @@ mod tests {
     }
 
     #[test]
+    fn home_service_is_simple_restart_on_failure() {
+        let text = home_service_unit("/opt/mediaopsd serve --role home");
+        assert!(text.contains("Type=simple"));
+        assert!(text.contains("Restart=on-failure"));
+        assert!(text.contains("serve --role home"));
+        assert!(!text.contains("OnCalendar"));
+    }
+
+    #[test]
     fn systemd_exec_start_quotes_spaces() {
-        let line = systemd_exec_start(Path::new("/opt/my bin/mediaops"), &["--state-db", "/tmp/a b/state.db", "run"]);
+        let line = systemd_exec_start(
+            Path::new("/opt/my bin/mediaops"),
+            &["--state-db", "/tmp/a b/state.db", "run"],
+        );
         assert_eq!(
             line,
             "\"/opt/my bin/mediaops\" --state-db \"/tmp/a b/state.db\" run"

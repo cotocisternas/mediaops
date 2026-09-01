@@ -3,6 +3,68 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::{StoreError, sqlite};
 
+pub(crate) fn list_jobs(conn: &mut Connection) -> Result<Vec<Job>, StoreError> {
+    jobs_query(
+        conn,
+        "SELECT id, title_id, kind, state, parent_job_id FROM jobs ORDER BY id",
+        None,
+    )
+}
+
+pub(crate) fn list_jobs_by_title(
+    conn: &mut Connection,
+    title_id: &TitleId,
+) -> Result<Vec<Job>, StoreError> {
+    jobs_query(
+        conn,
+        "SELECT id, title_id, kind, state, parent_job_id FROM jobs WHERE title_id = ?1 ORDER BY id",
+        Some(title_id.render()),
+    )
+}
+
+fn jobs_query(
+    conn: &Connection,
+    sql: &str,
+    title_id: Option<String>,
+) -> Result<Vec<Job>, StoreError> {
+    // `&Connection` is enough for SELECT; callers pass `&mut` from `Store::with`.
+    let mut stmt = conn.prepare(sql).map_err(sqlite)?;
+    let mapped = match title_id {
+        Some(key) => {
+            let rows = stmt.query_map(params![key], job_row).map_err(sqlite)?;
+            collect_jobs(rows)?
+        }
+        None => {
+            let rows = stmt.query_map([], job_row).map_err(sqlite)?;
+            collect_jobs(rows)?
+        }
+    };
+    Ok(mapped)
+}
+
+fn job_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(i64, String, String, String, Option<i64>)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn collect_jobs(
+    rows: impl Iterator<Item = rusqlite::Result<(i64, String, String, String, Option<i64>)>>,
+) -> Result<Vec<Job>, StoreError> {
+    let mut out = Vec::new();
+    for row in rows {
+        let (raw_id, title_id, kind, state, parent) = row.map_err(sqlite)?;
+        out.push(job_from_row(raw_id, &title_id, &kind, &state, parent)?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn get_job(conn: &Connection, id: JobId) -> Result<Option<Job>, StoreError> {
     let row = conn
         .query_row(
@@ -76,7 +138,7 @@ fn validate_parent(
             Ok(())
         }
         JobKind::Encode => match parent_job_id {
-            None => Err(mediaops_core::JobError::EncodeNeedsParent.into()),
+            None => Ok(()),
             Some(pid) => parent_kind_matches(conn, pid, JobKind::Pull),
         },
         JobKind::Pull => match parent_job_id {
@@ -197,14 +259,14 @@ mod tests {
             .await
             .expect("get")
             .expect("parent");
-        assert!(encode_ready(&encode, Some(&parent)));
+        assert!(encode_ready(&encode, Some(&parent), false));
         store
             .advance(encode.id(), JobEvent::Encode(EncodeEvent::Start))
             .await
             .expect("enc start");
         let started = store.get_job(encode.id()).await.expect("get").expect("row");
         assert_eq!(started.state(), JobState::Encode(EncodeState::Encoding));
-        assert!(!encode_ready(&started, Some(&parent)));
+        assert!(!encode_ready(&started, Some(&parent), false));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -235,11 +297,13 @@ mod tests {
             .await
             .expect_err("want is not pull");
         assert!(err.to_string().contains("expected pull"), "{err}");
-        let err = store
+        let local = store
             .create_job(JobKind::Encode, &title, None)
             .await
-            .expect_err("no parent");
-        assert!(err.to_string().contains("requires a parent"), "{err}");
+            .expect("already-local encode");
+        assert_eq!(local.parent_job_id(), None);
+        assert!(encode_ready(&local, None, true));
+        assert!(!encode_ready(&local, None, false));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -256,6 +320,12 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got.state(), JobState::Want(WantState::Open));
+        let listed = JobsRepo::list(&store).await.expect("list");
+        assert_eq!(listed.len(), 1);
+        let by_title = JobsRepo::list_by_title(&store, &title)
+            .await
+            .expect("list title");
+        assert_eq!(by_title.len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

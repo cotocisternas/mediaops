@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use mediaops_core::{
-    DesiredState, Envelope, Placement, Probe, RemoteRef, TitleId, TitleKind,
-    VerifiedStagingHandle, install,
+    DesiredState, Envelope, Placement, Probe, RemoteRef, TitleId, TitleKind, VerifiedStagingHandle,
+    install, parse_placement,
 };
 use mediaops_store::Store;
 use mediaops_sync::refuse_below_watermark;
@@ -12,8 +12,8 @@ use mediaops_transfer::{
 };
 use serde::Serialize;
 
-use crate::bootstrap;
 use crate::AppError;
+use crate::bootstrap;
 
 #[derive(Debug, Serialize)]
 struct ListEntry {
@@ -139,8 +139,8 @@ pub async fn pull(
     } else {
         library_root
     };
-    let ds_text = std::fs::read_to_string(&desired_state)
-        .map_err(|err| AppError::Runtime(err.into()))?;
+    let ds_text =
+        std::fs::read_to_string(&desired_state).map_err(|err| AppError::Runtime(err.into()))?;
     let ds = DesiredState::from_toml(&ds_text).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
     if ds.lock() {
         return Err(AppError::Policy(
@@ -148,13 +148,15 @@ pub async fn pull(
         ));
     }
     let title_id = TitleId::parse(&title_id).map_err(|err| AppError::Usage(err.to_string()))?;
-    let remote = RemoteRef::from_wire_parts(root, path)
-        .map_err(|err| AppError::Usage(err.to_string()))?;
     let placement = if do_install {
-        Some(placement_for(&title_id, &name, title, year, season, episode)?)
+        Some(placement_for(
+            &title_id, &path, &name, title, year, season, episode,
+        )?)
     } else {
         None
     };
+    let remote =
+        RemoteRef::from_wire_parts(root, path).map_err(|err| AppError::Usage(err.to_string()))?;
 
     let channel = connect_home(&socket, &tls_dir)
         .await
@@ -233,7 +235,10 @@ pub async fn pull(
         .await
         .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
     store
-        .advance(job.id(), mediaops_core::JobEvent::Pull(mediaops_core::PullEvent::Start))
+        .advance(
+            job.id(),
+            mediaops_core::JobEvent::Pull(mediaops_core::PullEvent::Start),
+        )
         .await
         .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
     store
@@ -259,7 +264,11 @@ pub async fn pull(
             .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
         whole_file_b3 = placed.whole_file_b3.clone();
         store
-            .record_install(&title_id, &placed.whole_file_b3)
+            .record_install(
+                &title_id,
+                &placed.whole_file_b3,
+                handle.dest_rel().to_str().unwrap_or(""),
+            )
             .await
             .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
         store
@@ -299,31 +308,46 @@ pub async fn pull(
 
 fn placement_for(
     title_id: &TitleId,
+    remote_path: &std::path::Path,
     name: &str,
     title: Option<String>,
     year: Option<u16>,
     season: Option<u8>,
     episode: Option<u8>,
 ) -> Result<Placement, AppError> {
+    if let Ok((parsed_id, placement)) = parse_placement(remote_path) {
+        if parsed_id == *title_id {
+            return Ok(placement);
+        }
+    }
     let ext = name
         .rsplit_once('.')
         .map(|(_, ext)| ext.to_string())
         .ok_or_else(|| AppError::Usage("--name must have an extension for --install".into()))?;
-    let title = title.ok_or_else(|| AppError::Usage("--install requires --title".into()))?;
-    let year = year.ok_or_else(|| AppError::Usage("--install requires --year".into()))?;
     match title_id.kind() {
-        TitleKind::Movie => Ok(Placement::movie(title, year, ext)),
-        TitleKind::Series => Ok(Placement::episode(
-            title,
-            year,
-            season.ok_or_else(|| AppError::Usage("--install of a series requires --season".into()))?,
-            episode
-                .ok_or_else(|| AppError::Usage("--install of a series requires --episode".into()))?,
-            ext,
-        )),
         TitleKind::Album => Err(AppError::Usage(
-            "--install for albums needs Epic 4; omit --install to keep the staged file".into(),
+            "album --install requires a schema-valid --path (parse_placement)".into(),
         )),
+        TitleKind::Movie | TitleKind::Series => {
+            let title =
+                title.ok_or_else(|| AppError::Usage("--install requires --title".into()))?;
+            let year = year.ok_or_else(|| AppError::Usage("--install requires --year".into()))?;
+            match title_id.kind() {
+                TitleKind::Movie => Ok(Placement::movie(title, year, ext)),
+                TitleKind::Series => Ok(Placement::episode(
+                    title,
+                    year,
+                    season.ok_or_else(|| {
+                        AppError::Usage("--install of a series requires --season".into())
+                    })?,
+                    episode.ok_or_else(|| {
+                        AppError::Usage("--install of a series requires --episode".into())
+                    })?,
+                    ext,
+                )),
+                TitleKind::Album => unreachable!(),
+            }
+        }
     }
 }
 

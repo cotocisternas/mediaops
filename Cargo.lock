@@ -1005,7 +1005,9 @@ name = "mediaops-sync"
 version = "0.1.0"
 dependencies = [
  "mediaops-core",
+ "mediaops-transfer",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

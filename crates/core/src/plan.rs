@@ -4,17 +4,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::desired_state::{DesiredState, DesiredStateError};
 use crate::digest::Blake3Hex;
+use crate::pathschema::Placement;
+use crate::title_id::TitleId;
+use crate::walker::RemoteRef;
+
+/// Skip reasons the grabber=None planner emits. Apply treats these as data.
+pub const SKIP_UPGRADE_NEVER: &str = "upgrade_never";
+pub const SKIP_WATERMARK: &str = "watermark";
+pub const SKIP_MAX_COPY: &str = "max_copy";
+pub const SKIP_LOCK: &str = "lock";
 
 /// Exhaustive plan action. Match every variant; do not add a `_` arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Internally tagged so Copy/Skip/Encode can carry the payloads apply needs.
+/// Review and later verbs stay unit placeholders until their epics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
-    Copy,
-    Skip,
+    Copy {
+        title_id: TitleId,
+        remote: RemoteRef,
+        file_len: u64,
+        placement: Placement,
+    },
+    Skip {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title_id: Option<TitleId>,
+        reason: String,
+    },
     Review,
     Unmonitor,
     DeleteRemote,
-    Encode,
+    Encode {
+        title_id: TitleId,
+    },
     Reclaim,
     EdgeApply,
     GrabApply,
@@ -146,6 +169,33 @@ impl Plan {
 mod tests {
     use super::*;
     use crate::desired_state::tests::HAPPY_TOML;
+    use crate::pathschema::Placement;
+    use crate::title_id::TitleId;
+    use crate::walker::RemoteRef;
+    use std::path::PathBuf;
+
+    fn sample_title() -> TitleId {
+        TitleId::movie("603").expect("title")
+    }
+
+    fn sample_copy() -> Action {
+        Action::Copy {
+            title_id: sample_title(),
+            remote: RemoteRef::from_wire_parts(
+                "seed".into(),
+                PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+            )
+            .expect("ref"),
+            file_len: 100,
+            placement: Placement::movie("The.Matrix", 1999, "mkv"),
+        }
+    }
+
+    fn sample_encode() -> Action {
+        Action::Encode {
+            title_id: sample_title(),
+        }
+    }
 
     #[test]
     fn plan_round_trip_preserves_bytes_and_digest() {
@@ -160,7 +210,7 @@ mod tests {
 
         let plan = Plan::from_toml_bytes(bytes.clone())
             .expect("snapshot")
-            .with_actions(vec![Action::Copy, Action::Encode]);
+            .with_actions(vec![sample_copy(), sample_encode()]);
         assert_eq!(plan.desired_state_toml(), bytes.as_slice());
         assert_eq!(plan.desired_state_b3().as_str(), expected_digest);
 
@@ -172,7 +222,7 @@ mod tests {
         let decoded: Plan = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.desired_state_toml(), bytes.as_slice());
         assert_eq!(decoded.desired_state_b3().as_str(), expected_digest);
-        assert_eq!(decoded.actions(), &[Action::Copy, Action::Encode]);
+        assert_eq!(decoded.actions(), &[sample_copy(), sample_encode()]);
         assert_eq!(decoded, plan);
 
         let from_embedding = decoded.desired_state().expect("re-parse");
@@ -212,24 +262,27 @@ mod tests {
     #[test]
     fn action_match_is_exhaustive() {
         let actions = [
-            Action::Copy,
-            Action::Skip,
+            sample_copy(),
+            Action::Skip {
+                title_id: None,
+                reason: SKIP_WATERMARK.into(),
+            },
             Action::Review,
             Action::Unmonitor,
             Action::DeleteRemote,
-            Action::Encode,
+            sample_encode(),
             Action::Reclaim,
             Action::EdgeApply,
             Action::GrabApply,
         ];
-        for action in actions {
+        for action in &actions {
             let _ = match action {
-                Action::Copy => "copy",
-                Action::Skip => "skip",
+                Action::Copy { .. } => "copy",
+                Action::Skip { .. } => "skip",
                 Action::Review => "review",
                 Action::Unmonitor => "unmonitor",
                 Action::DeleteRemote => "delete_remote",
-                Action::Encode => "encode",
+                Action::Encode { .. } => "encode",
                 Action::Reclaim => "reclaim",
                 Action::EdgeApply => "edge_apply",
                 Action::GrabApply => "grab_apply",
@@ -239,23 +292,28 @@ mod tests {
     }
 
     #[test]
-    fn action_json_tokens_are_snake_case() {
+    fn action_json_tokens_are_internally_tagged_snake_case() {
         // Every other identifier in the plan contract is snake_case, and a plan
         // is a persisted artifact: the casing is frozen once one is written.
+        let skip = Action::Skip {
+            title_id: None,
+            reason: SKIP_UPGRADE_NEVER.into(),
+        };
         let cases = [
-            (Action::Copy, "copy"),
-            (Action::Skip, "skip"),
+            (sample_copy(), "copy"),
+            (skip, "skip"),
             (Action::Review, "review"),
             (Action::Unmonitor, "unmonitor"),
             (Action::DeleteRemote, "delete_remote"),
-            (Action::Encode, "encode"),
+            (sample_encode(), "encode"),
             (Action::Reclaim, "reclaim"),
             (Action::EdgeApply, "edge_apply"),
             (Action::GrabApply, "grab_apply"),
         ];
         for (action, token) in cases {
             let encoded = serde_json::to_string(&action).expect("serialize");
-            assert_eq!(encoded, format!("\"{token}\""));
+            let value: serde_json::Value = serde_json::from_str(&encoded).expect("value");
+            assert_eq!(value["type"].as_str(), Some(token), "{encoded}");
             let decoded: Action =
                 serde_json::from_str(&encoded).expect("round-trip the wire token");
             assert_eq!(decoded, action);
@@ -369,13 +427,16 @@ mod tests {
         let value = serde_json::json!({
             "desired_state_toml": snapshot,
             "desired_state_b3": digest,
-            "actions": ["copy", "delete_remote"],
+            "actions": [
+                {"type": "review"},
+                {"type": "delete_remote"}
+            ],
         });
 
         let plan = serde_json::from_value::<Plan>(value).expect("archived plan still loads");
         assert_eq!(plan.desired_state_toml(), snapshot.as_bytes());
         assert_eq!(plan.desired_state_b3().as_str(), digest);
-        assert_eq!(plan.actions(), &[Action::Copy, Action::DeleteRemote]);
+        assert_eq!(plan.actions(), &[Action::Review, Action::DeleteRemote]);
         // Only interpreting the snapshot as the current schema fails, and it
         // fails where the caller asked for it.
         assert_eq!(

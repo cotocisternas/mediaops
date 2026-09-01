@@ -13,14 +13,23 @@ use crate::title_id::TitleId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TitleIndexEntry {
     title_id: TitleId,
+    /// Library-relative schema path. Empty means a pre-v5 row; callers walk
+    /// `movies`/`series`/`music` and [`crate::pathschema::parse`] once.
+    path: String,
     install_b3: Blake3Hex,
     current_b3: Blake3Hex,
 }
 
 impl TitleIndexEntry {
-    pub fn new(title_id: TitleId, install_b3: Blake3Hex, current_b3: Blake3Hex) -> Self {
+    pub fn new(
+        title_id: TitleId,
+        path: impl Into<String>,
+        install_b3: Blake3Hex,
+        current_b3: Blake3Hex,
+    ) -> Self {
         Self {
             title_id,
+            path: path.into(),
             install_b3,
             current_b3,
         }
@@ -28,6 +37,14 @@ impl TitleIndexEntry {
 
     pub fn title_id(&self) -> &TitleId {
         &self.title_id
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn path_missing(&self) -> bool {
+        self.path.is_empty()
     }
 
     pub fn install_b3(&self) -> &Blake3Hex {
@@ -56,11 +73,14 @@ pub trait TitleIndexRepo: Send + Sync {
     type Error;
 
     async fn get(&self, title_id: &TitleId) -> Result<Option<TitleIndexEntry>, Self::Error>;
-    /// First placement: writes `install_b3` and `current_b3`. `install_b3` never changes.
+    async fn list(&self) -> Result<Vec<TitleIndexEntry>, Self::Error>;
+    /// First placement: writes `install_b3`, `current_b3`, and the schema path.
+    /// `install_b3` never changes.
     async fn record_install(
         &self,
         title_id: &TitleId,
         digest: &Blake3Hex,
+        path: &str,
     ) -> Result<(), Self::Error>;
     /// Encode replace: updates `current_b3` only.
     async fn record_replace(
@@ -83,8 +103,14 @@ mod tests {
         let title = TitleId::movie("603").expect("title");
         let install = digest('a');
         let current = digest('b');
-        let entry = TitleIndexEntry::new(title.clone(), install.clone(), current.clone());
+        let entry = TitleIndexEntry::new(
+            title.clone(),
+            "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+            install.clone(),
+            current.clone(),
+        );
         assert_eq!(entry.title_id(), &title);
+        assert!(!entry.path_missing());
         assert_eq!(entry.install_b3(), &install);
         assert_eq!(entry.current_b3(), &current);
     }
