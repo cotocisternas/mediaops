@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -12,9 +12,7 @@ use mediaops_ssh::{
     systemd_user_unit,
 };
 use mediaops_store::Store;
-use mediaops_transfer::{
-    IdentityBundle, connect_home, mint, probe_range, probe_range_n,
-};
+use mediaops_transfer::{IdentityBundle, connect_home, mint, probe_range, probe_range_n};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -469,11 +467,89 @@ pub fn default_unit_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".config/systemd/user"))
 }
 
+pub fn lock_path(state_db: &Path) -> PathBuf {
+    state_db
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("mediaops.lock")
+}
+
+pub fn default_plans_dir() -> PathBuf {
+    default_state_dir().join("plans")
+}
+
+/// Compact UTC stamp `YYYYMMDDTHHMMSSZ` without a datetime crate.
+pub fn utc_compact() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    utc_compact_secs(secs)
+}
+
+pub(crate) fn utc_compact_secs(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}{m:02}{d:02}T{hour:02}{min:02}{sec:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
+}
+
+/// If another process holds the exclusive flock, return the lockfile JSON.
+pub fn lock_holder_if_contended(path: &Path) -> Result<Option<serde_json::Value>, BootstrapError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(BootstrapError::Io(err.to_string())),
+    };
+    match fs4::FileExt::try_lock_shared(&file) {
+        Ok(()) => {
+            let _ = fs4::FileExt::unlock(&file);
+            Ok(None)
+        }
+        Err(fs4::TryLockError::WouldBlock) => {
+            let text =
+                std::fs::read_to_string(path).map_err(|err| BootstrapError::Io(err.to_string()))?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Ok(Some(serde_json::json!({"unparsed": ""})));
+            }
+            match serde_json::from_str(trimmed) {
+                Ok(value) => Ok(Some(value)),
+                Err(_) => Ok(Some(serde_json::json!({ "unparsed": trimmed }))),
+            }
+        }
+        Err(err) => Err(BootstrapError::Io(err.to_string())),
+    }
+}
+
 pub fn exclusive_lock(path: &Path) -> Result<File, BootstrapError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| BootstrapError::Io(err.to_string()))?;
     }
-    let mut file = File::create(path).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
     match fs4::FileExt::try_lock(&file) {
         Ok(()) => {
             write_lock_holder(&mut file)?;
@@ -711,6 +787,12 @@ mod tests {
     }
 
     #[test]
+    fn utc_compact_epoch_is_1970() {
+        assert_eq!(utc_compact_secs(0), "19700101T000000Z");
+        assert_eq!(utc_compact_secs(86_400), "19700102T000000Z");
+    }
+
+    #[test]
     fn exclusive_lock_records_pid_and_command() {
         let dir = scratch("lock");
         let path = dir.join("mediaops.lock");
@@ -720,11 +802,27 @@ mod tests {
         assert_eq!(value["pid"], std::process::id());
         assert!(value["started_at"].as_u64().is_some());
         assert!(
-            value["command"]
-                .as_str()
-                .is_some_and(|c| !c.is_empty()),
+            value["command"].as_str().is_some_and(|c| !c.is_empty()),
             "command: {value}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exclusive_lock_conflict_does_not_truncate_holder() {
+        let dir = scratch("lock-trunc");
+        let path = dir.join("mediaops.lock");
+        let _held = exclusive_lock(&path).expect("first");
+        let before = std::fs::read_to_string(&path).expect("read");
+        let err = exclusive_lock(&path).expect_err("conflict");
+        assert!(matches!(err, BootstrapError::LockConflict));
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            before, after,
+            "conflicting locker must not wipe holder JSON"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(after.trim()).expect("json");
+        assert_eq!(parsed["pid"], std::process::id());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

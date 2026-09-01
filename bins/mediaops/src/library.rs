@@ -5,12 +5,13 @@ use mediaops_encode::probe_nvenc;
 use mediaops_ssh::SystemExec;
 use mediaops_store::Store;
 use mediaops_sync::{
-    ensure_layout, media_server_warnings, refuse_below_watermark, systemd_exec_start, write_user_units,
+    ensure_layout, media_server_warnings, refuse_below_watermark, systemd_exec_start,
+    write_home_unit, write_user_units,
 };
 use serde::Serialize;
 
-use crate::bootstrap;
 use crate::AppError;
+use crate::bootstrap;
 
 #[derive(Debug, Serialize)]
 struct BootstrapData {
@@ -85,6 +86,29 @@ pub async fn bootstrap_library(
     let state_db_arg = state_db.display().to_string();
     let exec_start = systemd_exec_start(&exe, &["--state-db", &state_db_arg, "run"]);
     write_user_units(&unit_dir, &exec_start).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
+
+    let mut daemon = exe.clone();
+    daemon.set_file_name("mediaopsd");
+    let tls_dir = bootstrap::default_tls_dir(&config_dir);
+    let socket = bootstrap::default_socket();
+    let tls_arg = tls_dir.display().to_string();
+    let ds_arg = desired_state.display().to_string();
+    let sock_arg = socket.display().to_string();
+    let home_exec = systemd_exec_start(
+        &daemon,
+        &[
+            "serve",
+            "--role",
+            "home",
+            "--tls-dir",
+            &tls_arg,
+            "--desired-state",
+            &ds_arg,
+            "--socket",
+            &sock_arg,
+        ],
+    );
+    write_home_unit(&unit_dir, &home_exec).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
     if enable_timer {
         enable_user_timer(&SystemExec).await?;
     }
@@ -133,9 +157,15 @@ fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
 }
 
 async fn enable_user_timer(exec: &impl ExecPort) -> Result<(), AppError> {
-    let reload = ExecCommand::new(
+    let reload = ExecCommand::new("systemctl", vec!["--user".into(), "daemon-reload".into()]);
+    let enable_home = ExecCommand::new(
         "systemctl",
-        vec!["--user".into(), "daemon-reload".into()],
+        vec![
+            "--user".into(),
+            "enable".into(),
+            "--now".into(),
+            "mediaopsd-home.service".into(),
+        ],
     );
     let enable = ExecCommand::new(
         "systemctl",
@@ -146,7 +176,7 @@ async fn enable_user_timer(exec: &impl ExecPort) -> Result<(), AppError> {
             "mediaops-run.timer".into(),
         ],
     );
-    for cmd in [reload, enable] {
+    for cmd in [reload, enable_home, enable] {
         let out = exec
             .run(&cmd)
             .await
@@ -201,6 +231,10 @@ mod tests {
         assert_eq!(calls[0].1, vec!["--user", "daemon-reload"]);
         assert_eq!(
             calls[1].1,
+            vec!["--user", "enable", "--now", "mediaopsd-home.service"]
+        );
+        assert_eq!(
+            calls[2].1,
             vec!["--user", "enable", "--now", "mediaops-run.timer"]
         );
     }

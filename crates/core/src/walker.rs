@@ -8,6 +8,8 @@ use std::fs::{self, Metadata};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
@@ -47,6 +49,29 @@ impl RemoteRef {
 
     pub fn rel_path(&self) -> &Path {
         &self.rel_path
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RemoteRefSerde {
+    root_id: String,
+    rel_path: PathBuf,
+}
+
+impl Serialize for RemoteRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RemoteRefSerde {
+            root_id: self.root_id.clone(),
+            rel_path: self.rel_path.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RemoteRefSerde::deserialize(deserializer)?;
+        RemoteRef::from_wire_parts(raw.root_id, raw.rel_path).map_err(serde::de::Error::custom)
     }
 }
 

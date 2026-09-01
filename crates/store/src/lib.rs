@@ -1,6 +1,6 @@
-//! sqlite adapter (AD-8). Schema `user_version` 4: `probes` (v1), `title_index` /
-//! `jobs` (v2) with `jobs.title_id` (v3), `machine` kv (v4). `holds_decisions`
-//! waits on Epic 6.
+//! sqlite adapter (AD-8). Schema `user_version` 5: `probes` (v1), `title_index` /
+//! `jobs` (v2) with `jobs.title_id` (v3), `machine` kv (v4), `title_index.path`
+//! (v5). `holds_decisions` waits on Epic 6.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,7 +16,7 @@ mod machine;
 mod probes;
 mod title_index;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const JOBS_DDL: &str = "CREATE TABLE jobs (
                 id INTEGER PRIMARY KEY NOT NULL,
@@ -105,14 +105,20 @@ impl Store {
             .await
     }
 
+    pub async fn list_titles(&self) -> Result<Vec<TitleIndexEntry>, StoreError> {
+        self.with(|conn| title_index::list_titles(conn)).await
+    }
+
     pub async fn record_install(
         &self,
         title_id: &TitleId,
         digest: &Blake3Hex,
+        path: &str,
     ) -> Result<(), StoreError> {
         let title_id = title_id.clone();
         let digest = digest.clone();
-        self.with(move |conn| title_index::record_install(conn, &title_id, &digest))
+        let path = path.to_string();
+        self.with(move |conn| title_index::record_install(conn, &title_id, &digest, &path))
             .await
     }
 
@@ -129,6 +135,16 @@ impl Store {
 
     pub async fn get_job(&self, id: JobId) -> Result<Option<Job>, StoreError> {
         self.with(move |conn| jobs::get_job(conn, id)).await
+    }
+
+    pub async fn list_jobs(&self) -> Result<Vec<Job>, StoreError> {
+        self.with(|conn| jobs::list_jobs(conn)).await
+    }
+
+    pub async fn list_jobs_by_title(&self, title_id: &TitleId) -> Result<Vec<Job>, StoreError> {
+        let title_id = title_id.clone();
+        self.with(move |conn| jobs::list_jobs_by_title(conn, &title_id))
+            .await
     }
 
     pub async fn create_job(
@@ -179,12 +195,17 @@ impl TitleIndexRepo for Store {
         Store::get_title(self, title_id).await
     }
 
+    async fn list(&self) -> Result<Vec<TitleIndexEntry>, StoreError> {
+        Store::list_titles(self).await
+    }
+
     async fn record_install(
         &self,
         title_id: &TitleId,
         digest: &Blake3Hex,
+        path: &str,
     ) -> Result<(), StoreError> {
-        Store::record_install(self, title_id, digest).await
+        Store::record_install(self, title_id, digest, path).await
     }
 
     async fn record_replace(
@@ -201,6 +222,14 @@ impl JobsRepo for Store {
 
     async fn get(&self, id: JobId) -> Result<Option<Job>, StoreError> {
         Store::get_job(self, id).await
+    }
+
+    async fn list(&self) -> Result<Vec<Job>, StoreError> {
+        Store::list_jobs(self).await
+    }
+
+    async fn list_by_title(&self, title_id: &TitleId) -> Result<Vec<Job>, StoreError> {
+        Store::list_jobs_by_title(self, title_id).await
     }
 
     async fn create(
@@ -278,7 +307,35 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         )
         .map_err(sqlite)?;
     }
+    if version < 5 {
+        ensure_title_index_path(conn)?;
+        conn.pragma_update(None, "user_version", 5)
+            .map_err(sqlite)?;
+    }
     Ok(())
+}
+
+fn title_index_has_path(conn: &Connection) -> Result<bool, StoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(title_index)")
+        .map_err(sqlite)?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite)?;
+    for col in cols {
+        if col.map_err(sqlite)? == "path" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_title_index_path(conn: &Connection) -> Result<(), StoreError> {
+    if title_index_has_path(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("ALTER TABLE title_index ADD COLUMN path TEXT NOT NULL DEFAULT '';")
+        .map_err(sqlite)
 }
 
 fn jobs_has_title_id(conn: &Connection) -> Result<bool, StoreError> {
@@ -389,7 +446,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         conn.query_row("SELECT COUNT(*) FROM title_index", [], |row| {
             row.get::<_, i64>(0)
         })
@@ -400,11 +457,17 @@ mod tests {
         .expect("machine exists");
         conn.prepare("SELECT title_id FROM jobs")
             .expect("jobs.title_id exists");
+        conn.prepare("SELECT path FROM title_index")
+            .expect("title_index.path exists");
         drop(conn);
 
         let title = TitleId::movie("603").expect("title");
         store
-            .record_install(&title, &Blake3Hex::parse(&"a".repeat(64)).expect("d"))
+            .record_install(
+                &title,
+                &Blake3Hex::parse(&"a".repeat(64)).expect("d"),
+                "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+            )
             .await
             .expect("install");
         let job = store
@@ -432,7 +495,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -458,15 +521,107 @@ mod tests {
     async fn machine_kv_round_trips() {
         let dir = scratch("machine");
         let store = Store::open(dir.join("state.db")).await.expect("open");
-        assert!(store.get_machine("library_root").await.expect("get").is_none());
+        assert!(
+            store
+                .get_machine("library_root")
+                .await
+                .expect("get")
+                .is_none()
+        );
         store
             .put_machine("library_root", "/data/media")
             .await
             .expect("put");
         assert_eq!(
-            store.get_machine("library_root").await.expect("get").as_deref(),
+            store
+                .get_machine("library_root")
+                .await
+                .expect("get")
+                .as_deref(),
             Some("/data/media")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn write_v4_title_without_path(path: &Path) {
+        let conn = Connection::open(path).expect("raw");
+        conn.execute_batch(
+            "CREATE TABLE probes (
+                endpoint_fingerprint TEXT PRIMARY KEY NOT NULL,
+                range_concurrency INTEGER NOT NULL
+            );
+            CREATE TABLE title_index (
+                title_id TEXT PRIMARY KEY NOT NULL,
+                install_b3 TEXT NOT NULL,
+                current_b3 TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY NOT NULL,
+                title_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                parent_job_id INTEGER,
+                FOREIGN KEY (parent_job_id) REFERENCES jobs(id)
+            );
+            CREATE TABLE machine (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+            PRAGMA user_version = 4;",
+        )
+        .expect("v4");
+        let title = TitleId::movie("603").expect("title");
+        let digest = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO title_index (title_id, install_b3, current_b3) VALUES (?1, ?2, ?3)",
+            rusqlite::params![title.render(), digest, digest],
+        )
+        .expect("row");
+    }
+
+    #[tokio::test]
+    async fn v4_title_index_row_migrates_empty_path_and_record_install_backfills() {
+        let dir = scratch("v4-path");
+        let path = dir.join("state.db");
+        write_v4_title_without_path(&path);
+        let store = Store::open(&path).await.expect("open");
+        let title = TitleId::movie("603").expect("title");
+        let entry = store.get_title(&title).await.expect("get").expect("row");
+        assert!(entry.path_missing(), "v4 row must migrate to empty path");
+        let digest = Blake3Hex::parse(&"a".repeat(64)).expect("d");
+        let schema = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        store
+            .record_install(&title, &digest, schema)
+            .await
+            .expect("backfill");
+        let entry = store.get_title(&title).await.expect("get").expect("row");
+        assert_eq!(entry.path(), schema);
+        let listed = store.list_titles().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path(), schema);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn create_want_is_idempotent_for_one_open_row() {
+        let dir = scratch("want-unique");
+        let store = Store::open(dir.join("state.db")).await.expect("open");
+        let title = TitleId::movie("603").expect("title");
+        let a = store
+            .create_job(JobKind::Want, &title, None)
+            .await
+            .expect("first");
+        let b = store
+            .create_job(JobKind::Want, &title, None)
+            .await
+            .expect("second");
+        assert_eq!(a.id(), b.id());
+        let jobs = store.list_jobs_by_title(&title).await.expect("list");
+        let opens = jobs
+            .iter()
+            .filter(|j| matches!(j.state(), mediaops_core::JobState::Want(WantState::Open)))
+            .count();
+        assert_eq!(opens, 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,8 +1,8 @@
 //! UDS and TCP serve/connect through one rustls config.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use http::Uri;

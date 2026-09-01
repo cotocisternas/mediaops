@@ -76,11 +76,13 @@ pub fn save(path: &Path, sidecar: &Sidecar) -> Result<(), TransferError> {
         fs::create_dir_all(parent).map_err(|err| TransferError::io(parent, err))?;
     }
     let tmp = path.with_extension("b3.tmp");
-    let json =
-        serde_json::to_vec_pretty(sidecar).map_err(|err| TransferError::Sidecar(err.to_string()))?;
+    let json = serde_json::to_vec_pretty(sidecar)
+        .map_err(|err| TransferError::Sidecar(err.to_string()))?;
     let mut file = File::create(&tmp).map_err(|err| TransferError::io(&tmp, err))?;
-    file.write_all(&json).map_err(|err| TransferError::io(&tmp, err))?;
-    file.sync_all().map_err(|err| TransferError::io(&tmp, err))?;
+    file.write_all(&json)
+        .map_err(|err| TransferError::io(&tmp, err))?;
+    file.sync_all()
+        .map_err(|err| TransferError::io(&tmp, err))?;
     fs::rename(&tmp, path).map_err(|err| TransferError::io(path, err))?;
     Ok(())
 }

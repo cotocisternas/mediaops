@@ -3,6 +3,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// Library title kind. Paired with a single identity source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TitleKind {
@@ -236,6 +238,19 @@ impl FromStr for TitleId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
+    }
+}
+
+impl Serialize for TitleId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.render())
+    }
+}
+
+impl<'de> Deserialize<'de> for TitleId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        TitleId::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 

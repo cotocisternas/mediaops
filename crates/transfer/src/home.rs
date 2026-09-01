@@ -13,11 +13,14 @@ use mediaops_proto::{
 };
 use tonic::transport::Channel;
 
-use crate::pull::RangeSource;
 use crate::TransferError;
+use crate::pull::RangeSource;
+
+pub type HomeChannel = Channel;
 
 pub async fn connect_home(socket: &Path, tls_dir: &Path) -> Result<Channel, TransferError> {
-    let id = IdentityBundle::from_dir(tls_dir).map_err(|err| TransferError::Net(err.to_string()))?;
+    let id =
+        IdentityBundle::from_dir(tls_dir).map_err(|err| TransferError::Net(err.to_string()))?;
     let client = id
         .client_config()
         .map_err(|err| TransferError::Net(err.to_string()))?;
@@ -40,7 +43,10 @@ pub async fn list_entries(channel: Channel) -> Result<Vec<RemoteEntry>, Transfer
         .map_err(|err| TransferError::Wire(err.to_string()))
 }
 
-pub async fn stat_entry(channel: Channel, remote: &RemoteRef) -> Result<RemoteEntry, TransferError> {
+pub async fn stat_entry(
+    channel: Channel,
+    remote: &RemoteRef,
+) -> Result<RemoteEntry, TransferError> {
     let mut client = TransferClient::new(channel);
     let wire = WireRef::try_from(remote).map_err(|err| TransferError::Wire(err.to_string()))?;
     let st = client
@@ -114,11 +120,7 @@ impl RangeSource for GrpcRangeSource {
             .map_err(TransferError::from_status)?
             .into_inner();
         let mut buf = Vec::new();
-        while let Some(chunk) = stream
-            .message()
-            .await
-            .map_err(TransferError::from_status)?
-        {
+        while let Some(chunk) = stream.message().await.map_err(TransferError::from_status)? {
             if buf.len() as u64 + chunk.data.len() as u64 > len {
                 return Err(TransferError::ShortRange {
                     offset,

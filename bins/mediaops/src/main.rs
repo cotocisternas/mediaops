@@ -8,9 +8,12 @@ use mediaops_core::{ExitCode, ProviderKind};
 use mediaops_ssh::SystemExec;
 
 mod bootstrap;
+mod encode_cmd;
 mod home;
 mod library;
 mod run;
+mod status;
+mod watch;
 
 const BIN_NAME: &str = "mediaops";
 
@@ -70,8 +73,105 @@ enum Command {
         episode: Option<u8>,
     },
     Library(LibraryArgs),
-    /// Fails closed until Epic 4 plan/apply. Still takes the flock (exit 3 on conflict).
+    /// Plan Copy/Skip from listings and write the Plan artifact.
+    Plan {
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        plans_dir: Option<PathBuf>,
+    },
+    /// Plan then apply that exact artifact in this locked process.
     Run {
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        plans_dir: Option<PathBuf>,
+    },
+    /// Record a per-title want and exit. Does not wait for playable.
+    Watch {
+        title: String,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
+    /// Why is this title stuck (pull / watermark / lock / encode-queue).
+    Why {
+        title: String,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
+    /// Lock holder, open wants, in-flight jobs, last plan file.
+    Status {
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        plans_dir: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
+    Encode(EncodeArgs),
+}
+
+#[derive(Args, Debug)]
+struct EncodeArgs {
+    #[command(subcommand)]
+    command: EncodeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum EncodeCommand {
+    /// Classify movies/ under EncodePolicy. Lock-free.
+    Scan {
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
+    /// Run ready encode jobs, or one title.
+    Run {
+        title: Option<String>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
+    /// Set or clear the encode_pause machine flag. Lock-free.
+    Pause {
+        #[arg(long)]
+        off: bool,
         #[arg(long)]
         state_db: Option<PathBuf>,
     },
@@ -140,15 +240,17 @@ pub(crate) enum AppError {
     Runtime(anyhow::Error),
     Policy(String),
     LockConflict(String),
+    DriftVerify(String),
     Emitted(ExitCode),
 }
 
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(message) | Self::Policy(message) | Self::LockConflict(message) => {
-                write!(f, "{message}")
-            }
+            Self::Usage(message)
+            | Self::Policy(message)
+            | Self::LockConflict(message)
+            | Self::DriftVerify(message) => write!(f, "{message}"),
             Self::Runtime(err) => write!(f, "{err}"),
             Self::Emitted(_) => write!(f, "already emitted"),
         }
@@ -192,6 +294,7 @@ fn to_exit_code(err: &AppError) -> ExitCode {
         AppError::Runtime(_) => ExitCode::Runtime,
         AppError::Policy(_) => ExitCode::PolicyRefusal,
         AppError::LockConflict(_) => ExitCode::LockConflict,
+        AppError::DriftVerify(_) => ExitCode::DriftVerify,
         AppError::Emitted(code) => *code,
     }
 }
@@ -380,8 +483,125 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             .await?;
             write_stdout(&line)
         }
-        Some(Command::Run { state_db }) => {
-            let line = run::run_stub(state_db)?;
+        Some(Command::Plan {
+            state_db,
+            desired_state,
+            library_root,
+            socket,
+            tls_dir,
+            config_dir,
+            plans_dir,
+        }) => {
+            let line = run::cmd_plan(
+                cli.json,
+                state_db,
+                desired_state,
+                library_root,
+                socket,
+                tls_dir,
+                config_dir,
+                plans_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Run {
+            state_db,
+            desired_state,
+            library_root,
+            socket,
+            tls_dir,
+            config_dir,
+            plans_dir,
+        }) => {
+            let line = run::cmd_run(
+                cli.json,
+                state_db,
+                desired_state,
+                library_root,
+                socket,
+                tls_dir,
+                config_dir,
+                plans_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Watch { title, state_db }) => {
+            let line = watch::watch(cli.json, title, state_db).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Why {
+            title,
+            state_db,
+            desired_state,
+            library_root,
+            config_dir,
+        }) => {
+            let line = status::why(
+                cli.json,
+                title,
+                state_db,
+                desired_state,
+                library_root,
+                config_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Status {
+            state_db,
+            plans_dir,
+            desired_state,
+            library_root,
+            config_dir,
+        }) => {
+            let line = status::status(
+                cli.json,
+                state_db,
+                plans_dir,
+                desired_state,
+                library_root,
+                config_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Encode(EncodeArgs {
+            command:
+                EncodeCommand::Scan {
+                    library_root,
+                    state_db,
+                },
+        })) => {
+            let line = encode_cmd::scan(cli.json, library_root, state_db).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Encode(EncodeArgs {
+            command:
+                EncodeCommand::Run {
+                    title,
+                    state_db,
+                    library_root,
+                    desired_state,
+                    config_dir,
+                },
+        })) => {
+            let line = encode_cmd::run(
+                cli.json,
+                title,
+                state_db,
+                library_root,
+                desired_state,
+                config_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Encode(EncodeArgs {
+            command: EncodeCommand::Pause { off, state_db },
+        })) => {
+            let line = encode_cmd::pause(cli.json, off, state_db).await?;
             write_stdout(&line)
         }
     }
@@ -447,5 +667,12 @@ mod tests {
         let err = AppError::LockConflict("held".into());
         assert_eq!(to_exit_code(&err), ExitCode::LockConflict);
         assert_eq!(i32::from(to_exit_code(&err)), 3);
+    }
+
+    #[test]
+    fn drift_verify_maps_to_exit_4() {
+        let err = AppError::DriftVerify("snapshot".into());
+        assert_eq!(to_exit_code(&err), ExitCode::DriftVerify);
+        assert_eq!(i32::from(to_exit_code(&err)), 4);
     }
 }

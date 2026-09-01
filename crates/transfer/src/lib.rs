@@ -7,17 +7,17 @@ mod schedule;
 mod sidecar;
 
 pub use home::{
-    configure_pool, connect_home, grpc_source, list_entries, pool_status, probe_range, stat_entry,
-    GrpcRangeSource,
+    GrpcRangeSource, HomeChannel, configure_pool, connect_home, grpc_source, list_entries,
+    pool_status, probe_range, stat_entry,
 };
 pub use mediaops_net::{
     ChannelPool, DaemonRole, HomeGateway, IdentityBundle, NetError, connect_pool, connect_tcp,
     connect_unix, mint, probe_range_n, serve_home_unix, serve_tcp, serve_unix,
 };
 pub use prune::{dir_is_sacred, prune_empty_incoming};
-pub use pull::{pull_file, PullOutcome, PullSpec, RangeSource};
-pub use schedule::{plan_ranges, take_slots, PendingFile};
-pub use sidecar::{Sidecar, SIDECAR_VERSION};
+pub use pull::{PullOutcome, PullSpec, RangeSource, pull_file};
+pub use schedule::{PendingFile, plan_ranges, take_slots};
+pub use sidecar::{SIDECAR_VERSION, Sidecar};
 
 use std::io;
 use std::path::Path;

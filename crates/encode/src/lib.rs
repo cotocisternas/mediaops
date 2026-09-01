@@ -1,6 +1,17 @@
-//! NVENC probe. Encode policy waits for Epic 4.
+//! EncodePolicy, ffprobe, and NVENC transcode. Linked only into the CLI tree.
 
 use mediaops_core::{ExecCommand, ExecPort};
+
+pub mod ffprobe;
+pub mod policy;
+pub mod run;
+
+pub use ffprobe::{ffprobe_command, probe_media};
+pub use policy::{Container, EncodeDecision, ProbeMedia, VideoCodec, classify};
+pub use run::{
+    TranscodeSpec, backup_path, converting_path, encode_to_converting, ffmpeg_nvenc_args,
+    replace_converting, session_cap, should_start_next, transcode_nvenc,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvencProbe {
@@ -13,6 +24,20 @@ pub struct NvencProbe {
 pub enum EncodeError {
     #[error("{0}")]
     Exec(String),
+    #[error("ffprobe: {0}")]
+    Probe(String),
+    #[error("path: {0}")]
+    Path(String),
+    #[error("install: {0}")]
+    Install(String),
+    #[error("io: {0}")]
+    Io(String),
+    #[error("encode paused")]
+    Paused,
+    #[error("no NVENC capacity")]
+    NoCapacity,
+    #[error("encode refused by policy")]
+    Refused,
 }
 
 /// Probe `ffmpeg -encoders` for `hevc_nvenc`. No GPU required for the fake exec port.

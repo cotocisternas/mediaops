@@ -59,8 +59,9 @@ impl JobKind {
         }
     }
 
-    /// Kind the parent row must have when a parent is set. Encode always
-    /// requires a parent; Pull may omit one; Want and Hold must not have one.
+    /// Kind the parent row must have when a parent is set. Encode may omit a
+    /// parent (already-local file). Pull may omit one. Want and Hold must not
+    /// have one. When Encode does set a parent it must be a Pull.
     pub fn required_parent_kind(self) -> Option<JobKind> {
         match self {
             Self::Pull => Some(Self::Want),
@@ -363,9 +364,6 @@ impl Job {
             JobKind::Want | JobKind::Hold if parent_job_id.is_some() => {
                 return Err(JobError::UnexpectedParent { kind: state.kind() });
             }
-            JobKind::Encode if parent_job_id.is_none() => {
-                return Err(JobError::EncodeNeedsParent);
-            }
             JobKind::Want | JobKind::Hold | JobKind::Pull | JobKind::Encode => {}
         }
         Ok(Self {
@@ -549,8 +547,9 @@ fn illegal(kind: JobKind, from: &'static str, event: &'static str) -> JobError {
     JobError::IllegalTransition { kind, from, event }
 }
 
-/// Encode is ready when it is still queued and its parent Copy (Pull) job is Installed.
-pub fn encode_ready(job: &Job, parent: Option<&Job>) -> bool {
+/// Encode is ready when it is still queued and either its parent Pull is
+/// Installed, or it has no parent and the title already has a title-index row.
+pub fn encode_ready(job: &Job, parent: Option<&Job>, title_indexed: bool) -> bool {
     match job.state() {
         JobState::Encode(EncodeState::Queued) => {}
         JobState::Encode(EncodeState::Encoding)
@@ -560,13 +559,16 @@ pub fn encode_ready(job: &Job, parent: Option<&Job>) -> bool {
         | JobState::Pull(_)
         | JobState::Hold(_) => return false,
     }
-    let Some(parent) = parent else {
-        return false;
-    };
-    if job.parent_job_id() != Some(parent.id()) {
-        return false;
+    match job.parent_job_id() {
+        Some(parent_id) => {
+            let Some(parent) = parent else {
+                return false;
+            };
+            parent.id() == parent_id
+                && matches!(parent.state(), JobState::Pull(PullState::Installed))
+        }
+        None => parent.is_none() && title_indexed,
     }
-    matches!(parent.state(), JobState::Pull(PullState::Installed))
 }
 
 /// Jobs repository port (AD-8, AD-10). `advance` is the sole state write.
@@ -577,6 +579,8 @@ pub trait JobsRepo: Send + Sync {
     type Error;
 
     async fn get(&self, id: JobId) -> Result<Option<Job>, Self::Error>;
+    async fn list(&self) -> Result<Vec<Job>, Self::Error>;
+    async fn list_by_title(&self, title_id: &TitleId) -> Result<Vec<Job>, Self::Error>;
     async fn create(
         &self,
         kind: JobKind,
@@ -666,24 +670,31 @@ mod tests {
     fn encode_ready_when_parent_copy_is_installed() {
         let parent = job(1, JobState::Pull(PullState::Installed), None);
         let encode = job(2, JobState::Encode(EncodeState::Queued), Some(1));
-        assert!(encode_ready(&encode, Some(&parent)));
+        assert!(encode_ready(&encode, Some(&parent), false));
+    }
+
+    #[test]
+    fn encode_ready_without_parent_when_title_is_indexed() {
+        let encode = job(2, JobState::Encode(EncodeState::Queued), None);
+        assert!(encode_ready(&encode, None, true));
+        assert!(!encode_ready(&encode, None, false));
     }
 
     #[test]
     fn encode_is_not_ready_until_parent_copy_is_installed() {
         let parent = job(1, JobState::Pull(PullState::Verifying), None);
         let encode = job(2, JobState::Encode(EncodeState::Queued), Some(1));
-        assert!(!encode_ready(&encode, Some(&parent)));
-        assert!(!encode_ready(&encode, None));
+        assert!(!encode_ready(&encode, Some(&parent), true));
+        assert!(!encode_ready(&encode, None, true));
         let want = job(1, JobState::Want(WantState::Satisfied), None);
-        assert!(!encode_ready(&encode, Some(&want)));
+        assert!(!encode_ready(&encode, Some(&want), true));
         let wrong_parent = job(9, JobState::Pull(PullState::Installed), None);
-        assert!(!encode_ready(&encode, Some(&wrong_parent)));
+        assert!(!encode_ready(&encode, Some(&wrong_parent), true));
         let started = job(2, JobState::Encode(EncodeState::Encoding), Some(1));
         let installed = job(1, JobState::Pull(PullState::Installed), None);
-        assert!(!encode_ready(&started, Some(&installed)));
+        assert!(!encode_ready(&started, Some(&installed), true));
         let pull = job(3, JobState::Pull(PullState::Queued), Some(1));
-        assert!(!encode_ready(&pull, Some(&installed)));
+        assert!(!encode_ready(&pull, Some(&installed), true));
     }
 
     #[test]
@@ -710,10 +721,10 @@ mod tests {
     }
 
     #[test]
-    fn encode_requires_a_parent_and_want_forbids_one() {
-        let err = Job::new(id(1), title(), JobState::Encode(EncodeState::Queued), None)
-            .expect_err("encode parent");
-        assert!(matches!(err, JobError::EncodeNeedsParent), "{err}");
+    fn encode_parent_is_optional_and_want_forbids_one() {
+        let local = Job::new(id(1), title(), JobState::Encode(EncodeState::Queued), None)
+            .expect("already-local encode");
+        assert_eq!(local.parent_job_id(), None);
         let err = Job::new(id(1), title(), JobState::Want(WantState::Open), Some(id(2)))
             .expect_err("want parent");
         assert!(

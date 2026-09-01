@@ -8,9 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use mediaops_core::{
     Allowlist, DesiredState, ExitCode, Grabber, UnderlayMode, endpoint_fingerprint,
 };
-use mediaops_net::{
-    DaemonRole, HomeGateway, IdentityBundle, Seedbox, serve_home_unix, serve_tcp,
-};
+use mediaops_net::{DaemonRole, HomeGateway, IdentityBundle, Seedbox, serve_home_unix, serve_tcp};
 use tokio::net::{UnixListener, UnixStream};
 
 const BIN_NAME: &str = "mediaopsd";

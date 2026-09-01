@@ -8,9 +8,9 @@ use std::sync::Arc;
 use mediaops_core::{Blake3Hex, RemoteRef, TitleId, staging_path};
 use tokio::task::JoinSet;
 
-use crate::schedule::{plan_ranges, remaining, PendingFile, take_slots};
-use crate::sidecar::{self, Sidecar};
 use crate::TransferError;
+use crate::schedule::{PendingFile, plan_ranges, remaining, take_slots};
+use crate::sidecar::{self, Sidecar};
 
 pub trait RangeSource: Send + Sync {
     fn get_range(
@@ -87,11 +87,8 @@ pub async fn pull_file<S: RangeSource + 'static>(
     let range_len = sidecar.range_len;
     let planned = plan_ranges(spec.file_len, range_len);
     let mut todo = remaining(&planned, &sidecar);
-    let resumed_ranges: Vec<(u64, u64)> = sidecar
-        .ranges
-        .iter()
-        .map(|r| (r.offset, r.len))
-        .collect();
+    let resumed_ranges: Vec<(u64, u64)> =
+        sidecar.ranges.iter().map(|r| (r.offset, r.len)).collect();
 
     {
         let file = OpenOptions::new()
@@ -123,7 +120,8 @@ pub async fn pull_file<S: RangeSource + 'static>(
             });
         }
         while let Some(joined) = set.join_next().await {
-            let (offset, len, bytes) = joined.map_err(|err| TransferError::Join(err.to_string()))??;
+            let (offset, len, bytes) =
+                joined.map_err(|err| TransferError::Join(err.to_string()))??;
             if bytes.len() as u64 != len {
                 return Err(TransferError::ShortRange {
                     offset,
@@ -188,7 +186,8 @@ fn write_range(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), TransferErr
         .map_err(|err| TransferError::io(path, err))?;
     file.write_all(bytes)
         .map_err(|err| TransferError::io(path, err))?;
-    file.sync_all().map_err(|err| TransferError::io(path, err))?;
+    file.sync_all()
+        .map_err(|err| TransferError::io(path, err))?;
     Ok(())
 }
 
