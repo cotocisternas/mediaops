@@ -8,6 +8,7 @@ use mediaops_core::{ExitCode, ProviderKind};
 use mediaops_ssh::SystemExec;
 
 mod bootstrap;
+mod encode_cmd;
 mod home;
 mod library;
 mod run;
@@ -130,6 +131,43 @@ enum Command {
         state_db: Option<PathBuf>,
         #[arg(long)]
         plans_dir: Option<PathBuf>,
+    },
+    Encode(EncodeArgs),
+}
+
+#[derive(Args, Debug)]
+struct EncodeArgs {
+    #[command(subcommand)]
+    command: EncodeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum EncodeCommand {
+    /// Classify movies/ under EncodePolicy. Lock-free.
+    Scan {
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
+    /// Run ready encode jobs, or one title.
+    Run {
+        title: Option<String>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
+    /// Set or clear the encode_pause machine flag. Lock-free.
+    Pause {
+        #[arg(long)]
+        off: bool,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
     },
 }
 
@@ -510,6 +548,43 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             plans_dir,
         }) => {
             let line = status::status(cli.json, state_db, plans_dir).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Encode(EncodeArgs {
+            command:
+                EncodeCommand::Scan {
+                    library_root,
+                    state_db,
+                },
+        })) => {
+            let line = encode_cmd::scan(cli.json, library_root, state_db).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Encode(EncodeArgs {
+            command:
+                EncodeCommand::Run {
+                    title,
+                    state_db,
+                    library_root,
+                    desired_state,
+                    config_dir,
+                },
+        })) => {
+            let line = encode_cmd::run(
+                cli.json,
+                title,
+                state_db,
+                library_root,
+                desired_state,
+                config_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Encode(EncodeArgs {
+            command: EncodeCommand::Pause { off, state_db },
+        })) => {
+            let line = encode_cmd::pause(cli.json, off, state_db).await?;
             write_stdout(&line)
         }
     }

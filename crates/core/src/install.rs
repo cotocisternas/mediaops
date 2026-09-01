@@ -177,6 +177,12 @@ impl VerifiedConvertingHandle {
     }
 }
 
+fn backup_in_schema_dir(library_root: &Path, backup: &Path) -> bool {
+    ["movies", "series", "music"]
+        .iter()
+        .any(|dir| is_under(&library_root.join(dir), backup))
+}
+
 /// `candidate` is under `root` without walking out via `..`.
 fn is_under(root: &Path, candidate: &Path) -> bool {
     let Ok(rel) = candidate.strip_prefix(root) else {
@@ -204,13 +210,12 @@ pub fn free_bytes(path: &Path) -> Result<u64, InstallError> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            InstallError::Io {
+        let cstr =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| InstallError::Io {
                 path: path.display().to_string(),
                 kind: std::io::ErrorKind::InvalidInput,
                 message: "path contains NUL".into(),
-            }
-        })?;
+            })?;
         let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         let rc = unsafe { libc::statvfs(cstr.as_ptr(), vfs.as_mut_ptr()) };
         if rc != 0 {
@@ -262,7 +267,8 @@ pub fn install(
     if fs::symlink_metadata(&dest).is_ok() {
         return Err(InstallError::DestinationExists(dest.display().to_string()));
     }
-    let file = fs::File::open(&handle.source).map_err(|err| InstallError::io(&handle.source, &err))?;
+    let file =
+        fs::File::open(&handle.source).map_err(|err| InstallError::io(&handle.source, &err))?;
     let whole_file_b3 =
         Blake3Hex::of_reader(file).map_err(|err| InstallError::io(&handle.source, &err))?;
     if let Some(parent) = dest.parent() {
@@ -291,9 +297,9 @@ pub fn replace(
         return Err(InstallError::TitleMismatch);
     }
     let backup_destination = backup_destination.as_ref();
-    // The library is written only through the schema path; a backup landing
-    // inside it would be a second, unschema'd writer.
-    if backup_destination.starts_with(library_root) {
+    // Schema dirs are the only library writers. `_ops/` (encode backups) is
+    // under the library root but is not a schema library dir.
+    if backup_in_schema_dir(library_root, backup_destination) {
         return Err(InstallError::BackupInsideLibrary(
             backup_destination.display().to_string(),
         ));
@@ -397,7 +403,10 @@ mod tests {
         assert_eq!(installed.path, expected);
         assert!(installed.path.starts_with(&lib));
         assert_eq!(fs::read(&installed.path).expect("read"), b"matrix-bytes");
-        assert_eq!(installed.whole_file_b3, crate::Blake3Hex::of_bytes(b"matrix-bytes"));
+        assert_eq!(
+            installed.whole_file_b3,
+            crate::Blake3Hex::of_bytes(b"matrix-bytes")
+        );
         assert!(!staged.exists());
         assert_eq!(
             pathschema::parse(installed.path.strip_prefix(&lib).expect("strip")).expect("parse"),
@@ -784,11 +793,41 @@ mod tests {
         let converting_handle =
             VerifiedConvertingHandle::verify(&title_id, converting, &placement).expect("verify");
 
-        let inside = lib.join("_backup").join("The.Matrix.(1999).mkv");
+        let inside = lib
+            .join("movies")
+            .join("The.Matrix.(1999).{tmdb-603}")
+            .join("backup.mkv");
         assert!(matches!(
             replace(&lib, &title_id, &converting_handle, &inside),
             Err(InstallError::BackupInsideLibrary(_))
         ));
         assert_eq!(fs::read(&installed).expect("live untouched"), b"bytes");
+    }
+
+    #[test]
+    fn backup_under_ops_is_legal_and_movies_is_not() {
+        let tmp = TempTree::new();
+        let lib = tmp.path.join("library");
+        let title_id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let handle = staged_handle(&lib, &title_id, &placement);
+        let installed = install(&lib, &title_id, &handle).expect("install");
+
+        let converting = tmp
+            .path
+            .join("work")
+            .join("The.Matrix.(1999).mkv.converting");
+        write_file(&converting, b"encoded");
+        let converting_handle =
+            VerifiedConvertingHandle::verify(&title_id, converting, &placement).expect("verify");
+        let backup = lib
+            .join("_ops")
+            .join("backup-hevc-originals")
+            .join("movie-tmdb-603")
+            .join("The.Matrix.(1999).mkv");
+        let replaced = replace(&lib, &title_id, &converting_handle, &backup).expect("ops backup");
+        assert_eq!(replaced, installed.path);
+        assert_eq!(fs::read(&replaced).expect("new"), b"encoded");
+        assert_eq!(fs::read(&backup).expect("backup"), b"bytes");
     }
 }

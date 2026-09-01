@@ -124,6 +124,54 @@ pub async fn cmd_run(
     )
     .await
     .map_err(map_apply)?;
+
+    let ds = prepared
+        .plan
+        .desired_state()
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let nvenc_cap = prepared
+        .store
+        .get_machine("nvenc_cap")
+        .await
+        .map_err(runtime_display)?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let paused = prepared
+        .store
+        .get_machine("encode_pause")
+        .await
+        .map_err(runtime_display)?
+        .as_deref()
+        == Some("1");
+    let ffmpeg = prepared
+        .store
+        .get_machine("ffmpeg_path")
+        .await
+        .map_err(runtime_display)?
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ffmpeg".into());
+    let cap = mediaops_encode::session_cap(ds.max_nvenc(), nvenc_cap, nvenc_cap > 0);
+    for inst in &report.installed {
+        if let Some(pull) = prepared
+            .store
+            .get_job(inst.pull_job_id)
+            .await
+            .map_err(runtime_display)?
+        {
+            let _ = crate::encode_cmd::after_install(
+                &prepared.store,
+                &prepared.library_root,
+                &inst.title_id,
+                &inst.path,
+                &pull,
+                &ffmpeg,
+                cap,
+                paused,
+            )
+            .await;
+        }
+    }
+
     let _ = std::fs::remove_file(&prepared.path);
     let data = RunData {
         path: prepared.path.display().to_string(),

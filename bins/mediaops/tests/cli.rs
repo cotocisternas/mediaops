@@ -116,7 +116,7 @@ fn help_exits_ok() {
         stdout.contains("seedbox"),
         "help must mention seedbox: {stdout}"
     );
-    for verb in ["plan", "run", "watch", "why", "status"] {
+    for verb in ["plan", "run", "watch", "why", "status", "encode"] {
         assert!(stdout.contains(verb), "help must mention {verb}: {stdout}");
     }
     assert!(
@@ -523,5 +523,48 @@ fn why_and_status_json_envelopes() {
     let status_v = stdout_json(&status);
     assert_eq!(status_v["ok"], true);
     assert_eq!(status_v["data"]["open_wants"][0]["state"], "open");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn encode_pause_is_lock_free_json_envelope() {
+    let dir = scratch("encode-pause");
+    let lock_path = dir.join("mediaops.lock");
+    let file = std::fs::File::create(&lock_path).expect("lock file");
+    fs4::FileExt::try_lock(&file).expect("hold lock");
+    let output = bin()
+        .args([
+            "--json",
+            "encode",
+            "pause",
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("pause");
+    drop(file);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["data"]["encode_pause"], true);
+    let off = bin()
+        .args([
+            "--json",
+            "encode",
+            "pause",
+            "--off",
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("pause off");
+    assert_eq!(off.status.code(), Some(0));
+    let off_v = stdout_json(&off);
+    assert_eq!(off_v["data"]["encode_pause"], false);
     let _ = std::fs::remove_dir_all(&dir);
 }
