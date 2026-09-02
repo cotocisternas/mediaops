@@ -82,7 +82,8 @@ fn nginx_fingerprint(dir: &std::path::Path) -> Result<(String, Vec<String>), Str
     let mut files = Vec::new();
     let mut drift = Vec::new();
     let reader = std::fs::read_dir(dir).map_err(|err| err.to_string())?;
-    for entry in reader.flatten() {
+    for entry in reader {
+        let entry = entry.map_err(|err| err.to_string())?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("conf") {
             continue;
@@ -149,13 +150,16 @@ impl Control for Seedbox {
         request: Request<GrabApplyRequest>,
     ) -> Result<Response<GrabApplyResponse>, Status> {
         let (semver, proto_package) = self.handshake();
-        if self.grabber == Grabber::None || self.grab_ops.is_none() {
+        if self.grabber == Grabber::None {
             return Ok(Response::new(GrabApplyResponse {
                 semver,
                 proto_package,
                 noop: true,
                 diff: String::new(),
             }));
+        }
+        if self.grab_ops.is_none() {
+            return Err(unused("GrabApply"));
         }
         let toml = request.into_inner().desired_state_toml;
         let desired = DesiredState::from_toml_bytes(&toml).map_err(|err| {
@@ -185,7 +189,11 @@ impl Control for Seedbox {
             Some(dir) => nginx_fingerprint(dir).map_err(|err| {
                 status_from_error_detail(&ErrorDetail::from(ControlError::runtime(err)))
             })?,
-            None => (String::new(), Vec::new()),
+            None => {
+                return Err(status_from_error_detail(&ErrorDetail::from(
+                    ControlError::runtime("nginx_dir required for panel fingerprint"),
+                )));
+            }
         };
         if let Some(ops) = &self.grab_ops {
             let api = ops

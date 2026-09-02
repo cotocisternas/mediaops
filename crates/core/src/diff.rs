@@ -26,9 +26,26 @@ pub fn panel_fingerprint(files: &[(String, &[u8])]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// EdgeInvariant nginx Host header: `$host`, not a rewritten localhost.
+/// EdgeInvariant nginx Host header: `$host` as a bounded token, not `$hostname`
+/// and not `X-Forwarded-Host $host`.
 pub fn nginx_host_ok(conf: &str) -> bool {
-    conf.contains("Host $host") || conf.contains("host $host")
+    let lower = conf.to_ascii_lowercase();
+    let needle = "host $host";
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if lower[i..].starts_with(needle) {
+            let before_ok = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let after = i + needle.len();
+            let after_ok = after == bytes.len()
+                || matches!(bytes[after], b';' | b' ' | b'\n' | b'\r' | b'\t' | b'}');
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -47,6 +64,14 @@ mod tests {
         assert!(diff.contains("b/config.xml"));
         assert!(diff.contains("-bind=*"));
         assert!(diff.contains("+bind=127.0.0.1"));
+    }
+
+    #[test]
+    fn nginx_host_ok_is_bounded_token() {
+        assert!(nginx_host_ok("proxy_set_header Host $host;\n"));
+        assert!(!nginx_host_ok("proxy_set_header Host $hostname;\n"));
+        assert!(!nginx_host_ok("proxy_set_header X-Forwarded-Host $host;\n"));
+        assert!(!nginx_host_ok("proxy_set_header Host 127.0.0.1;\n"));
     }
 
     #[test]

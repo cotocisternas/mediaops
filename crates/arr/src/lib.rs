@@ -17,7 +17,7 @@ pub use apply::{LocalhostGrabOps, host_config_drift};
 pub use cassette::{CassetteTransport, cassette_body_digest, cassette_key};
 pub use keys::{
     DiscoveredKeys, KeyError, KeyPaths, discover_keys, discover_sab_key, discover_servarr_key,
-    is_masked_key, refuse_masked,
+    is_masked_key, refuse_key, refuse_masked,
 };
 pub use lidarr::Lidarr;
 pub use prowlarr::Prowlarr;
@@ -103,14 +103,15 @@ mod tests {
             "system/status",
             "health",
             "diskspace",
-            "queue",
-            "history",
-            "blocklist",
-            "wanted/missing",
+            "queue?page=1&pageSize=200",
+            "history?page=1&pageSize=200",
+            "blocklist?page=1&pageSize=200",
+            "wanted/missing?page=1&pageSize=200",
+            "wanted/cutoff?page=1&pageSize=200",
             "calendar",
             "command",
             "system/backup",
-            "filesystem?path=/data",
+            "filesystem?path=%2Fdata",
             "manualimport",
             "release?term=matrix",
         ];
@@ -186,6 +187,7 @@ mod tests {
             client.history().await,
             client.blocklist().await,
             client.wanted_missing().await,
+            client.wanted_cutoff().await,
             client.calendar().await,
             client.commands().await,
             client.backups().await,

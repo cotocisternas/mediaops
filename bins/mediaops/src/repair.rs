@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use mediaops_core::{ControlPort, Envelope, ExecPort};
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
-use mediaops_ssh::{desired_nginx_app, write_remote_file};
+use mediaops_ssh::{nginx_test_and_reload, write_spliced_nginx_app};
 use mediaops_store::Store;
 use mediaops_transfer::connect_home;
 use serde::Serialize;
@@ -59,14 +59,7 @@ pub async fn repair_edge(
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
     let control = ControlPortClient::new(ControlClient::new(channel));
-    let api = control
-        .edge_apply(&toml)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{}", err.message)))?;
     let mut diffs = Vec::new();
-    if !api.diff.is_empty() {
-        diffs.push(api.diff);
-    }
     let ssh_config = ssh_config.unwrap_or_else(bootstrap::default_ssh_config);
     let bases = ds.edge().map(|e| e.url_bases.clone()).unwrap_or_default();
     for (app, port) in [
@@ -84,14 +77,23 @@ pub async fn repair_edge(
                 "lidarr" => "/lidarr",
                 _ => "/prowlarr",
             });
-        let desired = desired_nginx_app(url_base, port);
         let remote = format!("/etc/nginx/apps/{app}.conf");
-        let diff = write_remote_file(exec, &ssh_config, &remote, &desired)
+        let diff = write_spliced_nginx_app(exec, &ssh_config, &remote, url_base, port)
             .await
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
         if !diff.is_empty() {
             diffs.push(diff);
         }
+    }
+    nginx_test_and_reload(exec, &ssh_config)
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let api = control
+        .edge_apply(&toml)
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{}", err.message)))?;
+    if !api.diff.is_empty() {
+        diffs.push(api.diff);
     }
     let check = control
         .edge_check()
@@ -179,6 +181,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["ok"], true);
         assert!(exec.recorded().iter().any(|c| c.program_name() == "ssh"));
+        let store = crate::test_support::open_store(&dir).await;
+        let pin = store.get_machine(EDGE_FINGERPRINT_KEY).await.expect("get");
+        assert_eq!(pin.as_deref(), value["data"]["fingerprint"].as_str());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

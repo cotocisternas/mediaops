@@ -45,16 +45,35 @@ impl<T: HttpTransport> Prowlarr<T> {
     }
 
     pub async fn search(&self, query: &str) -> Result<Value, ArrError> {
-        self.client.get_json(&format!("search?query={query}")).await
+        self.client
+            .get_json(&format!(
+                "search?query={}",
+                crate::transport::query_encode(query)
+            ))
+            .await
     }
 
-    /// Doctor invariant: application URLs must include the Prowlarr `url_base`.
+    /// Doctor invariant: application URLs must include `url_base` as a path segment.
     pub fn application_url_ok(sync_level_url: &str, url_base: &str) -> bool {
-        if url_base.is_empty() {
+        let base = url_base.trim_end_matches('/');
+        if base.is_empty() || !base.starts_with('/') {
             return false;
         }
-        let base = url_base.trim_end_matches('/');
-        sync_level_url.contains(base)
+        let hay = sync_level_url.as_bytes();
+        let needle = base.as_bytes();
+        let mut i = 0;
+        while i + needle.len() <= hay.len() {
+            if &hay[i..i + needle.len()] == needle {
+                let after = i + needle.len();
+                let ok_after =
+                    after == hay.len() || matches!(hay[after], b'/' | b'?' | b'#' | b':');
+                if ok_after {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+        false
     }
 }
 
@@ -151,6 +170,14 @@ mod tests {
         assert!(!Prowlarr::<CassetteTransport>::application_url_ok(
             "/1/",
             "/prowlarr"
+        ));
+        assert!(!Prowlarr::<CassetteTransport>::application_url_ok(
+            "http://127.0.0.1:8989/sonarr-backup",
+            "/sonarr"
+        ));
+        assert!(!Prowlarr::<CassetteTransport>::application_url_ok(
+            "http://127.0.0.1:8989/sonarr",
+            "/"
         ));
     }
 }

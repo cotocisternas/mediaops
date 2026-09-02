@@ -151,6 +151,56 @@ pub fn desired_nginx_app(url_base: &str, port: u16) -> String {
     )
 }
 
+/// Keep live Swizzin conf; only ensure `proxy_set_header Host $host`.
+pub fn splice_host_dollar_host(live: &str) -> String {
+    if mediaops_core::nginx_host_ok(live) {
+        return live.to_string();
+    }
+    let mut out = Vec::new();
+    let mut replaced = false;
+    for line in live.lines() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("proxy_set_header host ") {
+            out.push(format!("{indent}proxy_set_header Host $host;"));
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        let mut inserted = false;
+        let mut with_insert = Vec::new();
+        for line in &out {
+            with_insert.push(line.clone());
+            if !inserted
+                && line
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("proxy_pass ")
+            {
+                let indent_len = line.len() - line.trim_start().len();
+                with_insert.push(format!(
+                    "{}proxy_set_header Host $host;",
+                    " ".repeat(indent_len)
+                ));
+                inserted = true;
+            }
+        }
+        out = with_insert;
+        if !inserted {
+            out.push("    proxy_set_header Host $host;".into());
+        }
+    }
+    let mut text = out.join("\n");
+    if live.ends_with('\n') && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
 /// Write a small remote file over ssh (not bulk copy). Contents ride argv.
 pub async fn write_remote_file(
     exec: &impl ExecPort,
@@ -160,10 +210,19 @@ pub async fn write_remote_file(
 ) -> Result<String, SshError> {
     let old = exec
         .run(&ssh_exec(ssh_config, &["sudo", "cat", remote_path]))
-        .await;
-    let old_text = old
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default();
+        .await?;
+    let old_text = if old.status == 0 {
+        String::from_utf8_lossy(&old.stdout).into_owned()
+    } else {
+        let err = String::from_utf8_lossy(&old.stderr);
+        if err.contains("No such file") || err.contains("not found") {
+            String::new()
+        } else {
+            return Err(SshError::Other(format!(
+                "sudo cat {remote_path} failed: {err}"
+            )));
+        }
+    };
     let diff = mediaops_core::unified_diff(&old_text, contents, remote_path);
     if diff.is_empty() {
         return Ok(diff);
@@ -173,6 +232,49 @@ pub async fn write_remote_file(
     exec.run(&ssh_exec(ssh_config, &["sudo", "/bin/sh", "-c", &script]))
         .await?;
     Ok(diff)
+}
+
+/// Read live app conf, splice `Host $host`, write if needed.
+pub async fn write_spliced_nginx_app(
+    exec: &impl ExecPort,
+    ssh_config: &Path,
+    remote_path: &str,
+    url_base: &str,
+    port: u16,
+) -> Result<String, SshError> {
+    let old = exec
+        .run(&ssh_exec(ssh_config, &["sudo", "cat", remote_path]))
+        .await?;
+    let live = if old.status == 0 {
+        String::from_utf8_lossy(&old.stdout).into_owned()
+    } else {
+        let err = String::from_utf8_lossy(&old.stderr);
+        if err.contains("No such file") || err.contains("not found") {
+            String::new()
+        } else {
+            return Err(SshError::Other(format!(
+                "sudo cat {remote_path} failed: {err}"
+            )));
+        }
+    };
+    let desired = if live.trim().is_empty() {
+        desired_nginx_app(url_base, port)
+    } else {
+        splice_host_dollar_host(&live)
+    };
+    write_remote_file(exec, ssh_config, remote_path, &desired).await
+}
+
+/// `nginx -t` then reload. Repair calls this after writing app confs.
+pub async fn nginx_test_and_reload(
+    exec: &impl ExecPort,
+    ssh_config: &Path,
+) -> Result<(), SshError> {
+    exec.run(&ssh_exec(ssh_config, &["sudo", "nginx", "-t"]))
+        .await?;
+    exec.run(&ssh_exec(ssh_config, &["sudo", "nginx", "-s", "reload"]))
+        .await?;
+    Ok(())
 }
 
 pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
@@ -474,6 +576,24 @@ mod tests {
                 .any(|a| a.contains("panel") || a.contains("swizzin"))),
             "{calls:?}"
         );
+        assert!(
+            calls.iter().any(|c| {
+                c.program_name() == "cargo"
+                    && c.args
+                        .iter()
+                        .any(|a| a.contains("x86_64-unknown-linux-musl"))
+            }),
+            "musl cargo argv missing: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn splice_host_keeps_surrounding_conf() {
+        let live = "location /sonarr {\n    proxy_pass http://127.0.0.1:8989/sonarr;\n    proxy_set_header Host 127.0.0.1;\n    proxy_http_version 1.1;\n}\n";
+        let out = splice_host_dollar_host(live);
+        assert!(out.contains("proxy_http_version 1.1"));
+        assert!(out.contains("Host $host"));
+        assert!(!out.contains("Host 127.0.0.1"));
     }
 
     #[tokio::test]

@@ -270,17 +270,12 @@ async fn prepare(
     let control = mediaops_proto::ControlPortClient::new(
         mediaops_proto::control_client::ControlClient::new(channel.clone()),
     );
-    let edge_frozen = match control.edge_check().await {
-        Ok(edge) => {
-            let last = store
-                .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
-                .await
-                .ok()
-                .flatten();
-            crate::doctor::is_frozen(&edge, last.as_deref())
-        }
-        Err(_) => false,
-    };
+    let edge = control.edge_check().await.map_err(runtime_display)?;
+    let last = store
+        .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+        .await
+        .map_err(runtime_display)?;
+    let edge_frozen = crate::doctor::is_frozen(&edge, last.as_deref());
     let planned = plan_actions(PlanRequest {
         listings: &listings,
         title_index: &title_index,

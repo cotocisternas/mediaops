@@ -83,12 +83,25 @@ struct GrabToml {
     policy: GrabPolicy,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrabIndexer {
     pub name: String,
     pub priority: i32,
     pub app: String,
+    pub implementation: String,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub config_contract: Option<String>,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -105,6 +118,13 @@ impl DownloadClientKind {
             Self::Qbittorrent => "qbittorrent",
         }
     }
+
+    pub fn implementation(self) -> &'static str {
+        match self {
+            Self::Sabnzbd => "Sabnzbd",
+            Self::Qbittorrent => "QBittorrent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -113,6 +133,20 @@ pub struct GrabDownloadClient {
     pub name: String,
     pub priority: i32,
     pub kind: DownloadClientKind,
+    #[serde(default)]
+    pub implementation: Option<String>,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
+}
+
+impl GrabDownloadClient {
+    pub fn implementation_name(&self) -> &str {
+        self.implementation
+            .as_deref()
+            .unwrap_or_else(|| self.kind.implementation())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -166,30 +200,65 @@ pub struct PinMatrixRow {
     pub refuse_above: String,
 }
 
-/// Compare `major.minor.patch` (missing patch = 0).
+/// Compare `major.minor.patch` (missing patch = 0). Extra segments and non-numeric patch refuse.
 pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.strip_prefix('v').unwrap_or(s);
     let mut parts = s.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let patch = match parts.next() {
+        None => 0,
+        Some(p) => p.parse().ok()?,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
     Some((major, minor, patch))
 }
 
 /// Exit 5 when a pin is above `refuse_above` (Lidarr glibc trap).
 pub fn pin_matrix_refuse(pins: &Pins) -> Option<String> {
+    pin_matrix_refuse_live(pins, None, None)
+}
+
+/// Same as [`pin_matrix_refuse`], consulting live OS/glibc when provided.
+pub fn pin_matrix_refuse_live(
+    pins: &Pins,
+    live_os: Option<&str>,
+    live_glibc: Option<&str>,
+) -> Option<String> {
     for row in &pins.matrix {
-        let current = match row.package.as_str() {
+        if let Some(os) = live_os
+            && !row.os.is_empty()
+            && row.os != os
+        {
+            continue;
+        }
+        if let Some(glibc) = live_glibc
+            && let (Some(have), Some(need)) = (parse_semver(glibc), parse_semver(&row.glibc_min))
+            && have < need
+        {
+            return Some(format!(
+                "Lidarr glibc trap: live glibc {glibc} < {} on {}",
+                row.glibc_min, row.os
+            ));
+        }
+        let current = match row.package.to_ascii_lowercase().as_str() {
             "lidarr" => match pins.lidarr.as_deref() {
                 Some(v) => v,
-                None => continue,
+                None => {
+                    return Some(format!("matrix row {} needs pins.lidarr", row.package));
+                }
             },
-            _ => continue,
+            other => {
+                return Some(format!("unknown matrix package {other}"));
+            }
         };
         let Some(cur) = parse_semver(current) else {
-            continue;
+            return Some(format!("unparseable pin {current}"));
         };
         let Some(limit) = parse_semver(&row.refuse_above) else {
-            continue;
+            return Some(format!("unparseable refuse_above {}", row.refuse_above));
         };
         if cur > limit {
             return Some(format!(
@@ -285,10 +354,18 @@ impl DesiredState {
             raw.paths.roots.iter().map(|r| r.id.as_str()),
             "paths.roots.id",
         )?;
-        reject_duplicate_names(
-            raw.grab.indexers.iter().map(|i| i.name.as_str()),
-            "grab.indexers.name",
-        )?;
+        {
+            let mut seen = HashSet::new();
+            for idx in &raw.grab.indexers {
+                let key = format!("{}/{}", idx.app, idx.name);
+                if !seen.insert(key) {
+                    return Err(DesiredStateError::DuplicateName {
+                        field: "grab.indexers.app+name",
+                        name: format!("{}@{}", idx.name, idx.app),
+                    });
+                }
+            }
+        }
         reject_duplicate_names(
             raw.grab.download_clients.iter().map(|c| c.name.as_str()),
             "grab.download_clients.name",
@@ -709,6 +786,7 @@ path = "/data/complete"
 name = "NZBgeek"
 priority = 25
 app = "prowlarr"
+implementation = "Newznab"
 
 [[grab.download_clients]]
 name = "SABnzbd"
@@ -755,18 +833,93 @@ refuse_above = "2.14.5"
 name = "NZBgeek"
 priority = 25
 app = "prowlarr"
+implementation = "Newznab"
 [[grab.indexers]]
 name = "NZBgeek"
 priority = 50
 app = "prowlarr"
+implementation = "Newznab"
 "#
         );
         assert!(matches!(
             DesiredState::from_toml(&dup),
             Err(DesiredStateError::DuplicateName {
-                field: "grab.indexers.name",
+                field: "grab.indexers.app+name",
+                ..
+            })
+        ));
+        let two_apps = format!(
+            r#"
+{HAPPY_TOML}
+[[grab.indexers]]
+name = "NZBgeek"
+priority = 25
+app = "sonarr"
+implementation = "Newznab"
+[[grab.indexers]]
+name = "NZBgeek"
+priority = 25
+app = "radarr"
+implementation = "Newznab"
+"#
+        );
+        assert!(DesiredState::from_toml(&two_apps).is_ok());
+
+        let dup_client = format!(
+            r#"
+{HAPPY_TOML}
+[[grab.download_clients]]
+name = "SABnzbd"
+priority = 1
+kind = "sabnzbd"
+[[grab.download_clients]]
+name = "SABnzbd"
+priority = 2
+kind = "sabnzbd"
+"#
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&dup_client),
+            Err(DesiredStateError::DuplicateName {
+                field: "grab.download_clients.name",
                 name
-            }) if name == "NZBgeek"
+            }) if name == "SABnzbd"
+        ));
+        let dup_pack = format!(
+            r#"
+{HAPPY_TOML}
+[[grab.custom_format_packs]]
+name = "prefer-h264"
+scores = {{ "x264" = 1 }}
+[[grab.custom_format_packs]]
+name = "prefer-h264"
+scores = {{ "x265" = 1 }}
+"#
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&dup_pack),
+            Err(DesiredStateError::DuplicateName {
+                field: "grab.custom_format_packs.name",
+                name
+            }) if name == "prefer-h264"
+        ));
+        let dup_root = format!(
+            r#"
+{HAPPY_TOML}
+[[paths.roots]]
+id = "complete"
+path = "/a"
+[[paths.roots]]
+id = "complete"
+path = "/b"
+"#
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&dup_root),
+            Err(DesiredStateError::DuplicateName {
+                field: "paths.roots.id",
+                name
+            }) if name == "complete"
         ));
     }
 
@@ -789,5 +942,17 @@ app = "prowlarr"
         let msg = pin_matrix_refuse(&trap).expect("refuse");
         assert!(msg.contains("Lidarr glibc trap"), "{msg}");
         assert!(msg.contains("2.15.0"), "{msg}");
+        let bad = Pins {
+            lidarr: Some("latest".into()),
+            matrix: ok.matrix.clone(),
+        };
+        assert!(
+            pin_matrix_refuse(&bad)
+                .expect("unparseable")
+                .contains("unparseable"),
+        );
+        assert_eq!(parse_semver("2.14.x"), None);
+        assert_eq!(parse_semver("2.14.5.9"), None);
+        assert_eq!(parse_semver("v2.14.5"), Some((2, 14, 5)));
     }
 }

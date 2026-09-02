@@ -43,7 +43,12 @@ impl<T: HttpTransport> Lidarr<T> {
     }
 
     pub async fn parse(&self, title: &str) -> Result<Value, ArrError> {
-        self.client.get_json(&format!("parse?title={title}")).await
+        self.client
+            .get_json(&format!(
+                "parse?title={}",
+                crate::transport::query_encode(title)
+            ))
+            .await
     }
 }
 

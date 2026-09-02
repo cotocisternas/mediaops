@@ -29,9 +29,11 @@ impl<T: HttpTransport> Sonarr<T> {
     }
 
     pub async fn seasons(&self, series_id: i64) -> Result<Value, ArrError> {
-        self.client
-            .get_json(&format!("season?seriesId={series_id}"))
-            .await
+        let series = self.client.get_json(&format!("series/{series_id}")).await?;
+        Ok(series
+            .get("seasons")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new())))
     }
 
     pub async fn episodes(&self, series_id: i64) -> Result<Value, ArrError> {
@@ -45,7 +47,12 @@ impl<T: HttpTransport> Sonarr<T> {
     }
 
     pub async fn parse(&self, title: &str) -> Result<Value, ArrError> {
-        self.client.get_json(&format!("parse?title={title}")).await
+        self.client
+            .get_json(&format!(
+                "parse?title={}",
+                crate::transport::query_encode(title)
+            ))
+            .await
     }
 }
 
@@ -70,12 +77,12 @@ mod tests {
         );
         t.push(
             "GET",
-            "/sonarr/api/v3/season?seriesId=1",
+            "/sonarr/api/v3/series/1",
             None,
             HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: b"[]".to_vec(),
+                body: b"{\"id\":1,\"seasons\":[]}".to_vec(),
             },
         );
         t.push(

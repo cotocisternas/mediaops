@@ -39,7 +39,7 @@ pub fn refuse_pems_in_git_work_tree(dir: &Path) -> Result<(), AppError> {
         return Ok(());
     }
     let mut hits = Vec::new();
-    walk_pems(dir, 0, &mut hits);
+    walk_pems(dir, 0, &mut hits)?;
     if hits.is_empty() {
         return Ok(());
     }
@@ -52,26 +52,29 @@ pub fn refuse_pems_in_git_work_tree(dir: &Path) -> Result<(), AppError> {
     )))
 }
 
-fn walk_pems(dir: &Path, depth: u8, hits: &mut Vec<PathBuf>) {
+fn walk_pems(dir: &Path, depth: u8, hits: &mut Vec<PathBuf>) -> Result<(), AppError> {
     if depth > 4 {
-        return;
+        return Err(AppError::Policy("pem scan truncated".into()));
     }
-    let Ok(reader) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in reader.flatten() {
+    let reader = std::fs::read_dir(dir).map_err(|e| AppError::Policy(e.to_string()))?;
+    for entry in reader {
+        let entry = entry.map_err(|e| AppError::Policy(e.to_string()))?;
         let path = entry.path();
         if path.is_dir() {
             if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
                 continue;
             }
-            walk_pems(&path, depth + 1, hits);
+            walk_pems(&path, depth + 1, hits)?;
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("pem") {
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("pem" | "crt" | "key")
+        ) {
             hits.push(path);
         }
     }
+    Ok(())
 }
 
 pub async fn doctor(
@@ -100,6 +103,9 @@ pub async fn doctor(
     refuse_pems_in_git_work_tree(&config_dir)?;
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
     refuse_pems_in_git_work_tree(&tls_dir)?;
+    if let Ok(cwd) = std::env::current_dir() {
+        refuse_pems_in_git_work_tree(&cwd)?;
+    }
     let socket = socket.unwrap_or_else(bootstrap::default_socket);
     let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
     let _ = desired_state;
@@ -230,6 +236,55 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["ok"], true);
         assert_eq!(value["data"]["read_only"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_drift_when_fingerprint_pinned_stale() {
+        let _g = crate::test_support::serial_net();
+        let dir = crate::test_support::scratch("doctor-drift");
+        let lb = crate::test_support::start_pair(None, b"").await;
+        let store = crate::test_support::open_store(&dir).await;
+        store
+            .put_machine(EDGE_FINGERPRINT_KEY, "stale")
+            .await
+            .expect("pin");
+        let err = doctor(
+            true,
+            false,
+            false,
+            None,
+            None,
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            Some(dir.clone()),
+            Some(dir.join("state.db")),
+        )
+        .await
+        .expect_err("drift");
+        assert!(matches!(err, AppError::DriftVerify(_)), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn doctor_refuses_pem_in_config_git_tree() {
+        let dir = crate::test_support::scratch("doctor-pem");
+        std::fs::create_dir_all(dir.join(".git")).expect("git");
+        std::fs::write(dir.join("ca.pem"), "-----BEGIN CERTIFICATE-----\n").expect("pem");
+        let err = doctor(
+            true,
+            false,
+            false,
+            None,
+            None,
+            Some(dir.join("missing.sock")),
+            Some(dir.join("tls")),
+            Some(dir.clone()),
+            Some(dir.join("state.db")),
+        )
+        .await
+        .expect_err("pem");
+        assert!(matches!(err, AppError::Policy(_)), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::servarr::ArrError;
-use crate::transport::{HttpRequest, HttpTransport};
+use crate::transport::{HttpRequest, HttpTransport, query_encode};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QbitPreferences {
@@ -29,7 +29,11 @@ impl<T: HttpTransport> QbitClient<T> {
     }
 
     pub async fn login(&mut self, username: &str, password: &str) -> Result<(), ArrError> {
-        let body = format!("username={username}&password={password}");
+        let body = format!(
+            "username={}&password={}",
+            query_encode(username),
+            query_encode(password)
+        );
         let req = HttpRequest {
             method: "POST".into(),
             url: format!("{}/api/v2/auth/login", self.base_url),
@@ -46,15 +50,31 @@ impl<T: HttpTransport> QbitClient<T> {
                 body: "login failed".into(),
             });
         }
-        if let Some((_, set)) = resp
+        let text = String::from_utf8_lossy(&resp.body);
+        if text.trim() != "Ok." {
+            return Err(ArrError::Http {
+                status: resp.status,
+                body: "login failed".into(),
+            });
+        }
+        let Some((_, set)) = resp
             .headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
-        {
-            self.cookie = Some(set.clone());
-        } else {
-            self.cookie = Some("SID=cassette".into());
+        else {
+            return Err(ArrError::Http {
+                status: resp.status,
+                body: "login failed".into(),
+            });
+        };
+        let cookie = set.split(';').next().unwrap_or(set).trim();
+        if cookie.is_empty() {
+            return Err(ArrError::Http {
+                status: resp.status,
+                body: "login failed".into(),
+            });
         }
+        self.cookie = Some(cookie.to_string());
         Ok(())
     }
 
@@ -101,35 +121,51 @@ impl<T: HttpTransport> QbitClient<T> {
     }
 
     pub async fn torrent_properties(&self, hash: &str) -> Result<Value, ArrError> {
-        self.get(&format!("/api/v2/torrents/properties?hash={hash}"))
-            .await
+        self.get(&format!(
+            "/api/v2/torrents/properties?hash={}",
+            query_encode(hash)
+        ))
+        .await
     }
 
     pub async fn torrent_files(&self, hash: &str) -> Result<Value, ArrError> {
-        self.get(&format!("/api/v2/torrents/files?hash={hash}"))
-            .await
+        self.get(&format!(
+            "/api/v2/torrents/files?hash={}",
+            query_encode(hash)
+        ))
+        .await
     }
 
     pub async fn torrent_trackers(&self, hash: &str) -> Result<Value, ArrError> {
-        self.get(&format!("/api/v2/torrents/trackers?hash={hash}"))
-            .await
+        self.get(&format!(
+            "/api/v2/torrents/trackers?hash={}",
+            query_encode(hash)
+        ))
+        .await
     }
 
     pub async fn pause(&self, hashes: &str) -> Result<Value, ArrError> {
-        self.post("/api/v2/torrents/pause", Some(&format!("hashes={hashes}")))
-            .await
+        self.post(
+            "/api/v2/torrents/pause",
+            Some(&format!("hashes={}", query_encode(hashes))),
+        )
+        .await
     }
 
     pub async fn resume(&self, hashes: &str) -> Result<Value, ArrError> {
-        self.post("/api/v2/torrents/resume", Some(&format!("hashes={hashes}")))
-            .await
+        self.post(
+            "/api/v2/torrents/resume",
+            Some(&format!("hashes={}", query_encode(hashes))),
+        )
+        .await
     }
 
     pub async fn delete(&self, hashes: &str, delete_files: bool) -> Result<Value, ArrError> {
         self.post(
             "/api/v2/torrents/delete",
             Some(&format!(
-                "hashes={hashes}&deleteFiles={}",
+                "hashes={}&deleteFiles={}",
+                query_encode(hashes),
                 if delete_files { "true" } else { "false" }
             )),
         )
@@ -283,5 +319,66 @@ mod tests {
         qbit.pause("h").await.expect("pause");
         qbit.resume("h").await.expect("resume");
         qbit.delete("h", true).await.expect("delete");
+    }
+
+    #[tokio::test]
+    async fn login_fails_on_fails_body_or_missing_cookie() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "POST",
+            "/api/v2/auth/login",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"Fails.".to_vec(),
+            },
+        );
+        let mut qbit = QbitClient::new(t, "http://127.0.0.1:8080");
+        qbit.login("admin", "admin").await.expect_err("Fails.");
+
+        let mut t = CassetteTransport::new();
+        t.push(
+            "POST",
+            "/api/v2/auth/login",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"Ok.".to_vec(),
+            },
+        );
+        let mut qbit = QbitClient::new(t, "http://127.0.0.1:8080");
+        qbit.login("admin", "admin").await.expect_err("no cookie");
+    }
+
+    #[tokio::test]
+    async fn missing_privacy_flags_are_not_ok() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "POST",
+            "/api/v2/auth/login",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: vec![("set-cookie".into(), "SID=abc; Path=/; HttpOnly".into())],
+                body: b"Ok.".to_vec(),
+            },
+        );
+        t.push(
+            "GET",
+            "/api/v2/app/preferences",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            },
+        );
+        let mut qbit = QbitClient::new(t, "http://127.0.0.1:8080");
+        qbit.login("admin", "admin").await.expect("login");
+        let prefs = qbit.preferences().await.expect("prefs");
+        assert!(!QbitClient::<CassetteTransport>::privacy_ok(&prefs));
+        assert!(prefs.dht && prefs.pex && prefs.lsd);
     }
 }

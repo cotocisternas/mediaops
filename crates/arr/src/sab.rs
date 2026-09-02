@@ -2,9 +2,9 @@
 
 use serde_json::Value;
 
-use crate::keys::{is_masked_key, refuse_masked};
-use crate::servarr::ArrError;
-use crate::transport::{HttpRequest, HttpTransport};
+use crate::keys::{is_masked_key, refuse_key};
+use crate::servarr::{ArrError, http_error};
+use crate::transport::{HttpRequest, HttpTransport, query_encode, redact_secrets};
 
 pub const SAB_CATEGORIES: &[&str] = &["tv", "movies", "music"];
 
@@ -21,7 +21,7 @@ impl<T: HttpTransport> SabClient<T> {
         api_key: impl Into<String>,
     ) -> Result<Self, ArrError> {
         let api_key = api_key.into();
-        refuse_masked(&api_key)?;
+        refuse_key(&api_key)?;
         Ok(Self {
             transport,
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -33,15 +33,17 @@ impl<T: HttpTransport> SabClient<T> {
         if is_masked_key(&self.api_key) {
             return Err(ArrError::MaskedKey);
         }
-        let mut url = format!("{}/api?mode={mode}&apikey=KEY&output=json", self.base_url);
-        // Key is sent as a header-equivalent query param; cassette keys on path
-        // with a placeholder so fixtures never contain material.
-        url = url.replace("apikey=KEY", &format!("apikey={}", self.api_key));
+        let mut url = format!(
+            "{}/api?mode={}&apikey={}&output=json",
+            self.base_url,
+            query_encode(mode),
+            query_encode(&self.api_key)
+        );
         for (k, v) in extra {
             url.push('&');
             url.push_str(k);
             url.push('=');
-            url.push_str(v);
+            url.push_str(&query_encode(v));
         }
         let req = HttpRequest {
             method: "GET".into(),
@@ -51,12 +53,17 @@ impl<T: HttpTransport> SabClient<T> {
         };
         let resp = self.transport.send(&req).await?;
         if resp.status >= 400 {
+            return Err(http_error(&resp));
+        }
+        let value: Value =
+            serde_json::from_slice(&resp.body).map_err(|err| ArrError::Json(err.to_string()))?;
+        if value.get("status") == Some(&Value::Bool(false)) {
             return Err(ArrError::Http {
                 status: resp.status,
-                body: String::from_utf8_lossy(&resp.body).into(),
+                body: redact_secrets(&value.to_string()),
             });
         }
-        serde_json::from_slice(&resp.body).map_err(|err| ArrError::Json(err.to_string()))
+        Ok(value)
     }
 
     pub async fn queue(&self) -> Result<Value, ArrError> {
@@ -133,7 +140,7 @@ mod tests {
         );
         t.push(
             "GET",
-            "/api?mode=addurl&apikey=k&output=json&name=http://x.nzb",
+            "/api?mode=addurl&apikey=k&output=json&name=http%3A%2F%2Fx.nzb",
             None,
             HttpResponse {
                 status: 200,
@@ -211,12 +218,66 @@ mod tests {
         ]));
     }
 
+    #[tokio::test]
+    async fn queue_error_does_not_echo_api_key() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/api?mode=queue&apikey=KEY&output=json",
+            None,
+            HttpResponse {
+                status: 500,
+                headers: Vec::new(),
+                body: b"{\"error\":\"apikey=super-secret-sab failed\"}".to_vec(),
+            },
+        );
+        let sab = SabClient::new(t, "http://127.0.0.1:8080", "super-secret-sab").expect("sab");
+        let err = sab.queue().await.expect_err("http");
+        let shown = format!("{err:?}{err}");
+        assert!(!shown.contains("super-secret-sab"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn cassette_miss_does_not_echo_api_key() {
+        let sab = SabClient::new(
+            CassetteTransport::new(),
+            "http://127.0.0.1:8080",
+            "super-secret-sab",
+        )
+        .expect("sab");
+        let err = sab.queue().await.expect_err("miss");
+        let shown = format!("{err:?}{err}");
+        assert!(!shown.contains("super-secret-sab"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn status_false_is_an_error() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/api?mode=queue&apikey=k&output=json",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"status\":false,\"error\":\"nope\"}".to_vec(),
+            },
+        );
+        let sab = SabClient::new(t, "http://127.0.0.1:8080", "k").expect("sab");
+        let err = sab.queue().await.expect_err("status");
+        assert!(matches!(err, ArrError::Http { status: 200, .. }));
+    }
+
     #[test]
     fn masked_sab_key_refused() {
         let t = CassetteTransport::new();
         assert!(matches!(
             SabClient::new(t, "http://127.0.0.1:8080", "********"),
             Err(ArrError::MaskedKey)
+        ));
+        assert!(matches!(
+            SabClient::new(CassetteTransport::new(), "http://127.0.0.1:8080", ""),
+            Err(ArrError::Other(_))
         ));
     }
 }

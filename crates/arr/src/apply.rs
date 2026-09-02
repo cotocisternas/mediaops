@@ -1,12 +1,12 @@
 //! Grabber set-diff apply and runtime key discovery (GrabOps).
 
 use mediaops_core::{
-    BoxFuture, ControlError, DesiredState, EdgeApiReport, GrabApplyReport, GrabOps, Grabber,
-    KeyPresence,
+    BoxFuture, ControlError, DesiredState, EdgeApiReport, GrabApplyReport, GrabDownloadClient,
+    GrabIndexer, GrabOps, Grabber, KeyPresence, unified_diff,
 };
 use serde_json::{Value, json};
 
-use crate::keys::{KeyPaths, discover_keys};
+use crate::keys::{DiscoveredKeys, KeyPaths, discover_keys};
 use crate::prowlarr::Prowlarr;
 use crate::servarr::{ArrClient, ArrError, HostConfig};
 use crate::transport::HttpTransport;
@@ -87,29 +87,31 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
                     diff: String::new(),
                 });
             }
-            let keys = discover_keys(&self.key_paths).map_err(key_to_control)?;
+            let ops = self.with_desired(desired);
+            let keys = discover_keys(&ops.key_paths).map_err(key_to_control)?;
+            require_keys_for_desired(desired, &keys)?;
             let mut diffs = Vec::new();
             if let Some(key) = keys.sonarr() {
                 let client =
-                    ArrClient::new(self.transport.clone(), &self.sonarr_base, "/api/v3", key)
+                    ArrClient::new(ops.transport.clone(), &ops.sonarr_base, "/api/v3", key)
                         .map_err(arr_to_control)?;
                 diffs.extend(apply_app(&client, "sonarr", desired, true).await?);
             }
             if let Some(key) = keys.radarr() {
                 let client =
-                    ArrClient::new(self.transport.clone(), &self.radarr_base, "/api/v3", key)
+                    ArrClient::new(ops.transport.clone(), &ops.radarr_base, "/api/v3", key)
                         .map_err(arr_to_control)?;
                 diffs.extend(apply_app(&client, "radarr", desired, true).await?);
             }
             if let Some(key) = keys.lidarr() {
                 let client =
-                    ArrClient::new(self.transport.clone(), &self.lidarr_base, "/api/v1", key)
+                    ArrClient::new(ops.transport.clone(), &ops.lidarr_base, "/api/v1", key)
                         .map_err(arr_to_control)?;
                 diffs.extend(apply_app(&client, "lidarr", desired, true).await?);
             }
             if let Some(key) = keys.prowlarr() {
                 let client =
-                    ArrClient::new(self.transport.clone(), &self.prowlarr_base, "/api/v1", key)
+                    ArrClient::new(ops.transport.clone(), &ops.prowlarr_base, "/api/v1", key)
                         .map_err(arr_to_control)?;
                 diffs.extend(apply_app(&client, "prowlarr", desired, false).await?);
             }
@@ -143,13 +145,49 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
         desired: &'a DesiredState,
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>> {
         Box::pin(async move {
-            let diffs = apply_edge_host(self, desired).await?;
+            let ops = self.with_desired(desired);
+            let diffs = apply_edge_host(&ops, desired).await?;
             Ok(GrabApplyReport {
                 noop: diffs.is_empty(),
                 diff: diffs.join("\n"),
             })
         })
     }
+}
+
+impl<T: Clone> LocalhostGrabOps<T> {
+    fn with_desired(&self, desired: &DesiredState) -> Self {
+        Self::new(self.transport.clone(), self.key_paths.clone(), desired)
+    }
+}
+
+fn require_keys_for_desired(
+    desired: &DesiredState,
+    keys: &DiscoveredKeys,
+) -> Result<(), ControlError> {
+    for idx in &desired.grab().indexers {
+        let present = match idx.app.as_str() {
+            "sonarr" => keys.sonarr().is_some(),
+            "radarr" => keys.radarr().is_some(),
+            "lidarr" => keys.lidarr().is_some(),
+            "prowlarr" => keys.prowlarr().is_some(),
+            other => {
+                return Err(ControlError::policy(format!("unknown grab app `{other}`")));
+            }
+        };
+        if !present {
+            return Err(ControlError::policy(format!("{} API key missing", idx.app)));
+        }
+    }
+    let media_needed = !desired.grab().download_clients.is_empty()
+        || !desired.grab().custom_format_packs.is_empty()
+        || desired.grab().policy.delay_minutes.is_some()
+        || desired.grab().policy.quality_profile.is_some();
+    if media_needed && keys.sonarr().is_none() && keys.radarr().is_none() && keys.lidarr().is_none()
+    {
+        return Err(ControlError::policy("media *arr API key missing"));
+    }
+    Ok(())
 }
 
 async fn apply_app<T: HttpTransport>(
@@ -182,6 +220,12 @@ async fn apply_indexers<T: HttpTransport>(
                 idx.name
             )));
         }
+        if idx.id.is_none() {
+            return Err(ControlError::runtime(format!(
+                "{app} indexer `{}` missing id",
+                idx.name
+            )));
+        }
     }
     let want: Vec<_> = desired
         .grab()
@@ -189,49 +233,39 @@ async fn apply_indexers<T: HttpTransport>(
         .iter()
         .filter(|i| i.app == app)
         .collect();
+    if want.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut diffs = Vec::new();
     for idx in &live {
         if !want.iter().any(|w| w.name == idx.name) {
-            if let Some(id) = idx.id {
-                client.delete_indexer(id).await.map_err(arr_to_control)?;
-                diffs.push(format!("-{app} indexer {}", idx.name));
-            }
+            let id = idx.id.expect("checked");
+            client.delete_indexer(id).await.map_err(arr_to_control)?;
+            diffs.push(format!("-{app} indexer {}", idx.name));
         }
     }
     for spec in want {
         match live.iter().find(|l| l.name == spec.name) {
             None => {
-                client
-                    .post_json(
-                        "indexer",
-                        &json!({
-                            "name": spec.name,
-                            "priority": spec.priority,
-                            "enable": true
-                        }),
-                    )
-                    .await
-                    .map_err(arr_to_control)?;
+                let body = indexer_resource(spec, None);
+                client.post_indexer(&body).await.map_err(arr_to_control)?;
                 diffs.push(format!("+{app} indexer {}", spec.name));
             }
-            Some(live_idx) if live_idx.priority != spec.priority => {
-                if let Some(id) = live_idx.id {
+            Some(live_idx) => {
+                let id = live_idx.id.expect("checked");
+                let live_json = client
+                    .get_json(&format!("indexer/{id}"))
+                    .await
+                    .map_err(arr_to_control)?;
+                let merged = indexer_resource(spec, Some(&live_json));
+                if live_json != merged {
                     client
-                        .put_indexer(
-                            id,
-                            &json!({
-                                "id": id,
-                                "name": spec.name,
-                                "priority": spec.priority,
-                                "enable": true
-                            }),
-                        )
+                        .put_indexer(id, &merged)
                         .await
                         .map_err(arr_to_control)?;
-                    diffs.push(format!("~{app} indexer {} priority", spec.name));
+                    diffs.push(format!("~{app} indexer {}", spec.name));
                 }
             }
-            Some(_) => {}
         }
     }
     Ok(diffs)
@@ -250,52 +284,53 @@ async fn apply_download_clients<T: HttpTransport>(
                 c.name
             )));
         }
+        if c.id.is_none() {
+            return Err(ControlError::runtime(format!(
+                "download client `{}` missing id",
+                c.name
+            )));
+        }
     }
     let want = &desired.grab().download_clients;
+    if want.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut diffs = Vec::new();
     for c in &live {
         if !want.iter().any(|w| w.name == c.name) {
-            if let Some(id) = c.id {
-                client
-                    .delete_download_client(id)
-                    .await
-                    .map_err(arr_to_control)?;
-                diffs.push(format!("-client {}", c.name));
-            }
+            let id = c.id.expect("checked");
+            client
+                .delete_download_client(id)
+                .await
+                .map_err(arr_to_control)?;
+            diffs.push(format!("-client {}", c.name));
         }
     }
     for spec in want {
         match live.iter().find(|l| l.name == spec.name) {
             None => {
+                let body = client_resource(spec, None);
                 client
-                    .post_download_client(&json!({
-                        "name": spec.name,
-                        "priority": spec.priority,
-                        "implementation": spec.kind.as_str(),
-                        "enable": true
-                    }))
+                    .post_download_client(&body)
                     .await
                     .map_err(arr_to_control)?;
                 diffs.push(format!("+client {}", spec.name));
             }
-            Some(live_c) if live_c.priority != spec.priority => {
-                if let Some(id) = live_c.id {
+            Some(live_c) => {
+                let id = live_c.id.expect("checked");
+                let live_json = client
+                    .get_json(&format!("downloadclient/{id}"))
+                    .await
+                    .map_err(arr_to_control)?;
+                let merged = client_resource(spec, Some(&live_json));
+                if live_json != merged {
                     client
-                        .put_download_client(
-                            id,
-                            &json!({
-                                "id": id,
-                                "name": spec.name,
-                                "priority": spec.priority,
-                                "enable": true
-                            }),
-                        )
+                        .put_download_client(id, &merged)
                         .await
                         .map_err(arr_to_control)?;
-                    diffs.push(format!("~client {} priority", spec.name));
+                    diffs.push(format!("~client {}", spec.name));
                 }
             }
-            Some(_) => {}
         }
     }
     Ok(diffs)
@@ -310,32 +345,91 @@ async fn apply_cf_packs<T: HttpTransport>(
         return Ok(Vec::new());
     }
     let live = client.custom_formats().await.map_err(arr_to_control)?;
-    let items = live.as_array().cloned().unwrap_or_default();
+    let items = live
+        .as_array()
+        .cloned()
+        .ok_or_else(|| ControlError::runtime("customformat not array"))?;
     let mut diffs = Vec::new();
+    let mut known = items;
     for pack in packs {
         for name in pack.scores.keys() {
-            let existing = items
+            let existing = known
                 .iter()
-                .find(|v| v.get("name").and_then(Value::as_str) == Some(name.as_str()));
+                .find(|v| v.get("name").and_then(Value::as_str) == Some(name.as_str()))
+                .cloned();
             match existing {
                 Some(live_cf) => {
-                    let id = live_cf.get("id").and_then(Value::as_i64).unwrap_or(0);
-                    client
-                        .put_custom_format(id, live_cf)
-                        .await
-                        .map_err(arr_to_control)?;
+                    let id = live_cf
+                        .get("id")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| ControlError::runtime(format!("cf `{name}` missing id")))?;
+                    let mut body = live_cf.clone();
+                    body["name"] = json!(name);
+                    if body != live_cf {
+                        client
+                            .put_custom_format(id, &body)
+                            .await
+                            .map_err(arr_to_control)?;
+                        diffs.push(format!("~cf {name}"));
+                    }
                 }
                 None => {
-                    client
+                    let created = client
                         .post_custom_format(&json!({"name": name}))
                         .await
                         .map_err(arr_to_control)?;
+                    known.push(created);
                     diffs.push(format!("+cf {name}"));
                 }
             }
         }
     }
+    if let Some(profile_name) = &desired.grab().policy.quality_profile {
+        diffs.extend(apply_quality_profile_scores(client, profile_name, packs, &known).await?);
+    }
     Ok(diffs)
+}
+
+async fn apply_quality_profile_scores<T: HttpTransport>(
+    client: &ArrClient<T>,
+    profile_name: &str,
+    packs: &[mediaops_core::CustomFormatPack],
+    cfs: &[Value],
+) -> Result<Vec<String>, ControlError> {
+    let profiles = client.quality_profiles().await.map_err(arr_to_control)?;
+    let items = profiles
+        .as_array()
+        .ok_or_else(|| ControlError::runtime("qualityprofile not array"))?;
+    let live = items
+        .iter()
+        .find(|p| p.get("name").and_then(Value::as_str) == Some(profile_name))
+        .cloned()
+        .ok_or_else(|| ControlError::policy(format!("quality profile `{profile_name}` missing")))?;
+    let id = live
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ControlError::runtime("quality profile missing id"))?;
+    let mut format_items = Vec::new();
+    for pack in packs {
+        for (name, score) in &pack.scores {
+            let format = cfs
+                .iter()
+                .find(|cf| cf.get("name").and_then(Value::as_str) == Some(name.as_str()))
+                .and_then(|cf| cf.get("id").and_then(Value::as_i64))
+                .ok_or_else(|| ControlError::runtime(format!("cf `{name}` missing id")))?;
+            format_items.push(json!({"format": format, "name": name, "score": score}));
+        }
+    }
+    let mut body = live.clone();
+    body["formatItems"] = json!(format_items);
+    if body == live {
+        return Ok(Vec::new());
+    }
+    client
+        .put_json(&format!("qualityprofile/{id}"), &body)
+        .await
+        .map_err(arr_to_control)?;
+    Ok(vec![format!("~quality profile {profile_name} scores")])
 }
 
 async fn apply_policy<T: HttpTransport>(
@@ -343,18 +437,30 @@ async fn apply_policy<T: HttpTransport>(
     desired: &DesiredState,
 ) -> Result<Vec<String>, ControlError> {
     let policy = &desired.grab().policy;
-    if policy.delay_minutes.is_none() && policy.quality_profile.is_none() {
+    if policy.delay_minutes.is_none() {
         return Ok(Vec::new());
     }
     let mut diffs = Vec::new();
     if let Some(minutes) = policy.delay_minutes {
         let live = client.delay_profiles().await.map_err(arr_to_control)?;
-        if let Some(first) = live.as_array().and_then(|a| a.first()) {
-            let id = first.get("id").and_then(Value::as_i64).unwrap_or(1);
-            let live_min = first.get("delay").and_then(Value::as_u64).unwrap_or(0);
-            if live_min != u64::from(minutes) {
-                let mut body = first.clone();
+        let items = live
+            .as_array()
+            .ok_or_else(|| ControlError::runtime("delayprofile not array"))?;
+        if items.is_empty() {
+            return Err(ControlError::runtime("no delay profile to apply"));
+        }
+        for profile in items {
+            let id = profile
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| ControlError::runtime("delay profile missing id"))?;
+            let mut body = profile.clone();
+            body["usenetDelay"] = json!(minutes);
+            body["torrentDelay"] = json!(minutes);
+            if body.get("delay").is_some() {
                 body["delay"] = json!(minutes);
+            }
+            if body != *profile {
                 client
                     .put_delay_profile(id, &body)
                     .await
@@ -364,6 +470,54 @@ async fn apply_policy<T: HttpTransport>(
         }
     }
     Ok(diffs)
+}
+
+fn indexer_resource(spec: &GrabIndexer, live: Option<&Value>) -> Value {
+    let mut body = live.cloned().unwrap_or_else(|| json!({}));
+    body["name"] = json!(spec.name);
+    body["priority"] = json!(spec.priority);
+    body["enable"] = json!(spec.enable);
+    body["implementation"] = json!(spec.implementation);
+    if let Some(protocol) = &spec.protocol {
+        body["protocol"] = json!(protocol);
+    }
+    if let Some(contract) = &spec.config_contract {
+        body["configContract"] = json!(contract);
+    }
+    merge_fields(&mut body, &spec.fields);
+    body
+}
+
+fn client_resource(spec: &GrabDownloadClient, live: Option<&Value>) -> Value {
+    let mut body = live.cloned().unwrap_or_else(|| json!({}));
+    body["name"] = json!(spec.name);
+    body["priority"] = json!(spec.priority);
+    body["enable"] = json!(spec.enable);
+    body["implementation"] = json!(spec.implementation_name());
+    merge_fields(&mut body, &spec.fields);
+    body
+}
+
+fn merge_fields(body: &mut Value, desired: &std::collections::BTreeMap<String, String>) {
+    if desired.is_empty() {
+        return;
+    }
+    let mut fields = body
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (name, value) in desired {
+        if let Some(existing) = fields
+            .iter_mut()
+            .find(|f| f.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        {
+            existing["value"] = json!(value);
+        } else {
+            fields.push(json!({"name": name, "value": value}));
+        }
+    }
+    body["fields"] = json!(fields);
 }
 
 async fn check_edge_apps<T: HttpTransport + Clone>(
@@ -386,6 +540,8 @@ async fn check_edge_apps<T: HttpTransport + Clone>(
             )
             .await?,
         );
+    } else if ops.url_bases.contains_key("sonarr") {
+        drift.push("sonarr key missing; host unchecked".into());
     }
     if let Some(key) = keys.radarr() {
         drift.extend(
@@ -402,6 +558,8 @@ async fn check_edge_apps<T: HttpTransport + Clone>(
             )
             .await?,
         );
+    } else if ops.url_bases.contains_key("radarr") {
+        drift.push("radarr key missing; host unchecked".into());
     }
     if let Some(key) = keys.lidarr() {
         drift.extend(
@@ -418,6 +576,8 @@ async fn check_edge_apps<T: HttpTransport + Clone>(
             )
             .await?,
         );
+    } else if ops.url_bases.contains_key("lidarr") {
+        drift.push("lidarr key missing; host unchecked".into());
     }
     if let Some(key) = keys.prowlarr() {
         let client = ArrClient::new(ops.transport.clone(), &ops.prowlarr_base, "/api/v1", key)
@@ -440,24 +600,42 @@ async fn check_edge_apps<T: HttpTransport + Clone>(
             .await
             .map_err(arr_to_control)?;
         if let Some(arr) = apps.as_array() {
-            let base = ops
-                .url_bases
-                .get("prowlarr")
-                .map(String::as_str)
-                .unwrap_or("/prowlarr");
             for app in arr {
                 let url = app
                     .get("baseUrl")
                     .or_else(|| app.get("url"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                let name = app
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let base = app_url_base(ops, &name);
                 if !Prowlarr::<T>::application_url_ok(url, base) {
                     drift.push(format!("Prowlarr app URL `{url}` missing {base}"));
                 }
             }
+        } else {
+            drift.push("prowlarr applications missing or not an array".into());
         }
+    } else if ops.url_bases.contains_key("prowlarr") {
+        drift.push("prowlarr key missing; host unchecked".into());
     }
     Ok(drift)
+}
+
+fn app_url_base<'a>(ops: &'a LocalhostGrabOps<impl HttpTransport>, name: &str) -> &'a str {
+    ops.url_bases
+        .get(name)
+        .map(String::as_str)
+        .unwrap_or_else(|| match name {
+            "sonarr" => "/sonarr",
+            "radarr" => "/radarr",
+            "lidarr" => "/lidarr",
+            "prowlarr" => "/prowlarr",
+            _ => "/sonarr",
+        })
 }
 
 async fn check_host_client<T: HttpTransport>(
@@ -479,7 +657,7 @@ pub fn host_config_drift(
     app: &str,
 ) -> Vec<String> {
     let mut drift = Vec::new();
-    if host.bind_address == "*" || host.bind_address == "0.0.0.0" {
+    if matches!(host.bind_address.as_str(), "*" | "0.0.0.0" | "::" | "::0") {
         drift.push(format!("{app} bind-to-star"));
     } else if host.bind_address != bind {
         drift.push(format!("{app} bind {}", host.bind_address));
@@ -497,8 +675,19 @@ pub fn host_config_drift(
 
 async fn apply_edge_host<T: HttpTransport + Clone>(
     ops: &LocalhostGrabOps<T>,
-    _desired: &DesiredState,
+    desired: &DesiredState,
 ) -> Result<Vec<String>, ControlError> {
+    let bind = desired
+        .edge()
+        .map(|e| e.bind.as_str())
+        .unwrap_or(ops.bind.as_str());
+    let auth = desired
+        .edge()
+        .map(|e| e.auth.as_str())
+        .unwrap_or(ops.auth.as_str());
+    if matches!(bind, "*" | "0.0.0.0" | "::" | "::0") {
+        return Err(ControlError::policy("refusing bind-to-star"));
+    }
     let keys = discover_keys(&ops.key_paths).map_err(key_to_control)?;
     let mut diffs = Vec::new();
     for (app, base, prefix, key) in [
@@ -515,10 +704,9 @@ async fn apply_edge_host<T: HttpTransport + Clone>(
         let Some(key) = key else { continue };
         let client =
             ArrClient::new(ops.transport.clone(), base, prefix, key).map_err(arr_to_control)?;
-        let live = client.host_config().await.map_err(arr_to_control)?;
-        let url_base = ops
-            .url_bases
-            .get(app)
+        let url_base = desired
+            .edge()
+            .and_then(|e| e.url_bases.get(app))
             .map(String::as_str)
             .unwrap_or_else(|| match app {
                 "sonarr" => "/sonarr",
@@ -526,22 +714,79 @@ async fn apply_edge_host<T: HttpTransport + Clone>(
                 "lidarr" => "/lidarr",
                 _ => "/prowlarr",
             });
-        if live.bind_address == ops.bind
-            && live.url_base == url_base
-            && live.authentication_method.eq_ignore_ascii_case(&ops.auth)
-        {
-            continue;
-        }
-        let body = json!({
-            "bindAddress": ops.bind,
-            "urlBase": url_base,
-            "authenticationMethod": ops.auth,
-        });
-        client
-            .put_host_config(&body)
+        let live = client
+            .get_json("config/host")
             .await
             .map_err(arr_to_control)?;
-        diffs.push(format!("~{app} host bind/url_base/auth"));
+        let mut body = live.clone();
+        body["bindAddress"] = json!(bind);
+        body["urlBase"] = json!(url_base);
+        body["authenticationMethod"] = json!(auth);
+        if live != body {
+            let old = serde_json::to_string_pretty(&live).unwrap_or_default();
+            let new = serde_json::to_string_pretty(&body).unwrap_or_default();
+            diffs.push(unified_diff(&old, &new, &format!("{app}/config/host")));
+            client
+                .put_host_config(&body)
+                .await
+                .map_err(arr_to_control)?;
+        }
+        if app == "prowlarr" {
+            diffs.extend(apply_prowlarr_app_urls(&client, desired, ops).await?);
+        }
+    }
+    Ok(diffs)
+}
+
+async fn apply_prowlarr_app_urls<T: HttpTransport>(
+    client: &ArrClient<T>,
+    desired: &DesiredState,
+    ops: &LocalhostGrabOps<T>,
+) -> Result<Vec<String>, ControlError> {
+    let apps = client
+        .get_json("applications")
+        .await
+        .map_err(arr_to_control)?;
+    let Some(arr) = apps.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut diffs = Vec::new();
+    for app in arr {
+        let url = app
+            .get("baseUrl")
+            .or_else(|| app.get("url"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let name = app
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let base = desired
+            .edge()
+            .and_then(|e| e.url_bases.get(&name))
+            .map(String::as_str)
+            .unwrap_or_else(|| app_url_base(ops, &name));
+        if Prowlarr::<T>::application_url_ok(url, base) {
+            continue;
+        }
+        let id = app
+            .get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| ControlError::runtime("prowlarr application missing id"))?;
+        let mut body = app.clone();
+        let port = match name.as_str() {
+            "sonarr" => 8989,
+            "radarr" => 7878,
+            "lidarr" => 8686,
+            _ => 9696,
+        };
+        body["baseUrl"] = json!(format!("http://127.0.0.1:{port}{base}"));
+        client
+            .put_json(&format!("applications/{id}"), &body)
+            .await
+            .map_err(arr_to_control)?;
+        diffs.push(format!("~prowlarr app {name} url_base"));
     }
     Ok(diffs)
 }
@@ -552,6 +797,9 @@ fn arr_to_control(err: ArrError) -> ControlError {
         ArrError::DuplicateIndexer(name) => {
             ControlError::policy(format!("duplicate indexer `{name}`"))
         }
+        ArrError::DuplicateDownloadClient(name) => {
+            ControlError::policy(format!("duplicate download client `{name}`"))
+        }
         other => ControlError::runtime(other.to_string()),
     }
 }
@@ -559,6 +807,7 @@ fn arr_to_control(err: ArrError) -> ControlError {
 fn key_to_control(err: crate::keys::KeyError) -> ControlError {
     match err {
         crate::keys::KeyError::MaskedKey => ControlError::policy("masked API key refused"),
+        crate::keys::KeyError::EmptyKey => ControlError::policy("empty API key refused"),
         crate::keys::KeyError::Io(msg) => ControlError::runtime(msg),
     }
 }
@@ -606,6 +855,7 @@ grabber = "servarr"
 name = "NZBgeek"
 priority = 25
 app = "sonarr"
+implementation = "Newznab"
 
 [[grab.download_clients]]
 name = "SABnzbd"
@@ -627,6 +877,7 @@ kind = "sabnzbd"
         let home = scratch("noop");
         write_sonarr_key(&home, "k");
         let mut t = CassetteTransport::new();
+        t.push("GET", "/sonarr/api/v3/indexer", None, json_ok(json!([])));
         t.push("GET", "/sonarr/api/v3/indexer", None, json_ok(json!([])));
         t.push(
             "POST",
@@ -654,9 +905,21 @@ kind = "sabnzbd"
         );
         t.push(
             "GET",
+            "/sonarr/api/v3/indexer/1",
+            None,
+            json_ok(json!({"id":1,"name":"NZBgeek","priority":25,"enable":true,"implementation":"Newznab"})),
+        );
+        t.push(
+            "GET",
             "/sonarr/api/v3/downloadclient",
             None,
             json_ok(json!([{"id":1,"name":"SABnzbd","priority":1}])),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/downloadclient/1",
+            None,
+            json_ok(json!({"id":1,"name":"SABnzbd","priority":1,"enable":true,"implementation":"Sabnzbd"})),
         );
         let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
         let first = ops.grab_apply(&ds_servarr()).await.expect("first");
@@ -819,19 +1082,20 @@ auth = "forms"
             "GET",
             "/sonarr/api/v3/delayprofile",
             None,
-            json_ok(json!([{"id":1,"delay":0}])),
+            json_ok(json!([{"id":1,"usenetDelay":0,"torrentDelay":0}])),
         );
         t.push(
             "PUT",
             "/sonarr/api/v3/delayprofile/1",
             None,
-            json_ok(json!({"id":1,"delay":5})),
+            json_ok(json!({"id":1,"usenetDelay":5,"torrentDelay":5})),
         );
         t.push(
             "GET",
             "/sonarr/api/v3/config/host",
             None,
             json_ok(json!({
+                "id": 1,
                 "bindAddress": "*",
                 "urlBase": "",
                 "authenticationMethod": "none"
@@ -893,9 +1157,21 @@ auth = "forms"
         );
         t.push(
             "GET",
+            "/sonarr/api/v3/indexer/1",
+            None,
+            json_ok(json!({"id":1,"name":"NZBgeek","priority":25,"enable":true,"implementation":"Newznab"})),
+        );
+        t.push(
+            "GET",
             "/sonarr/api/v3/downloadclient",
             None,
             json_ok(json!([{"id":1,"name":"SABnzbd","priority":1}])),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/downloadclient/1",
+            None,
+            json_ok(json!({"id":1,"name":"SABnzbd","priority":1,"enable":true,"implementation":"Sabnzbd"})),
         );
         let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
         let report = ops.grab_apply(&ds_servarr()).await.expect("apply");
@@ -904,6 +1180,141 @@ auth = "forms"
             "{}",
             report.diff
         );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn missing_sonarr_key_is_policy_not_noop() {
+        let home = scratch("no-key");
+        let t = CassetteTransport::new();
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let err = ops.grab_apply(&ds_servarr()).await.expect_err("key");
+        assert_eq!(err.exit_code, mediaops_core::ExitCode::PolicyRefusal);
+        assert!(err.message.contains("sonarr"), "{}", err.message);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn extra_client_is_deleted_and_priority_updates() {
+        let home = scratch("client-diff");
+        write_sonarr_key(&home, "k");
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/indexer",
+            None,
+            json_ok(json!([{"id":1,"name":"NZBgeek","priority":25}])),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/indexer/1",
+            None,
+            json_ok(json!({"id":1,"name":"NZBgeek","priority":25,"enable":true,"implementation":"Newznab"})),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/downloadclient",
+            None,
+            json_ok(json!([
+                {"id":1,"name":"SABnzbd","priority":9,"implementation":"Sabnzbd"},
+                {"id":2,"name":"Extra","priority":1}
+            ])),
+        );
+        t.push(
+            "DELETE",
+            "/sonarr/api/v3/downloadclient/2",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            },
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/downloadclient/1",
+            None,
+            json_ok(json!({"id":1,"name":"SABnzbd","priority":9,"enable":true,"implementation":"Sabnzbd"})),
+        );
+        t.push(
+            "PUT",
+            "/sonarr/api/v3/downloadclient/1",
+            None,
+            json_ok(json!({"id":1,"name":"SABnzbd","priority":1})),
+        );
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let report = ops.grab_apply(&ds_servarr()).await.expect("apply");
+        assert!(report.diff.contains("-client Extra"), "{}", report.diff);
+        assert!(report.diff.contains("~client SABnzbd"), "{}", report.diff);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn bind_to_star_includes_ipv6_any() {
+        let star = HostConfig {
+            bind_address: "::".into(),
+            url_base: "/sonarr".into(),
+            authentication_method: "forms".into(),
+        };
+        assert!(
+            host_config_drift(&star, "/sonarr", "127.0.0.1", "forms", "sonarr")
+                .iter()
+                .any(|d| d.contains("bind-to-star"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_api_check_flags_prowlarr_app_url_without_sonarr_base() {
+        let home = scratch("prowlarr-url");
+        write_sonarr_key(&home, "k");
+        let prowlarr = home.join(".config/Prowlarr/config.xml");
+        fs::create_dir_all(prowlarr.parent().expect("p")).expect("mkdir");
+        fs::write(&prowlarr, "<Config><ApiKey>k</ApiKey></Config>").expect("xml");
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/config/host",
+            None,
+            json_ok(json!({
+                "bindAddress": "127.0.0.1",
+                "urlBase": "/sonarr",
+                "authenticationMethod": "forms"
+            })),
+        );
+        t.push(
+            "GET",
+            "/prowlarr/api/v1/config/host",
+            None,
+            json_ok(json!({
+                "bindAddress": "127.0.0.1",
+                "urlBase": "/prowlarr",
+                "authenticationMethod": "forms"
+            })),
+        );
+        t.push(
+            "GET",
+            "/prowlarr/api/v1/applications",
+            None,
+            json_ok(json!([{"id":1,"name":"Sonarr","baseUrl":"http://127.0.0.1:8989/1/"}])),
+        );
+        let toml = r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 0
+range_len_mib = 1
+max_nvenc = 1
+lock = false
+grabber = "servarr"
+[edge]
+url_bases = { sonarr = "/sonarr", prowlarr = "/prowlarr" }
+bind = "127.0.0.1"
+auth = "forms"
+"#;
+        let ds = DesiredState::from_toml(toml).expect("ds");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds);
+        let report = ops.edge_api_check().await.expect("check");
+        assert!(!report.invariant_ok);
+        assert!(report.drift.contains("missing /sonarr"), "{}", report.drift);
         let _ = fs::remove_dir_all(home);
     }
 }

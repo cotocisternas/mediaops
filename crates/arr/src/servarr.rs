@@ -5,8 +5,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::keys::{is_masked_key, refuse_masked};
-use crate::transport::{HttpRequest, HttpResponse, HttpTransport, TransportError};
+use crate::keys::{is_masked_key, refuse_key};
+use crate::transport::{
+    HttpRequest, HttpResponse, HttpTransport, TransportError, query_encode, redact_secrets,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ArrError {
@@ -20,13 +22,15 @@ pub enum ArrError {
     Json(String),
     #[error("duplicate indexer `{0}`")]
     DuplicateIndexer(String),
+    #[error("duplicate download client `{0}`")]
+    DuplicateDownloadClient(String),
     #[error("{0}")]
     Other(String),
 }
 
 impl From<TransportError> for ArrError {
     fn from(err: TransportError) -> Self {
-        Self::Transport(err.to_string())
+        Self::Transport(redact_secrets(&err.redacted().to_string()))
     }
 }
 
@@ -34,6 +38,7 @@ impl From<crate::keys::KeyError> for ArrError {
     fn from(err: crate::keys::KeyError) -> Self {
         match err {
             crate::keys::KeyError::MaskedKey => Self::MaskedKey,
+            crate::keys::KeyError::EmptyKey => Self::Other("empty API key".into()),
             crate::keys::KeyError::Io(msg) => Self::Other(msg),
         }
     }
@@ -87,10 +92,7 @@ impl<T: HttpTransport> ArrClient<T> {
         api_key: impl Into<String>,
     ) -> Result<Self, ArrError> {
         let api_key = api_key.into();
-        refuse_masked(&api_key)?;
-        if is_masked_key(&api_key) {
-            return Err(ArrError::MaskedKey);
-        }
+        refuse_key(&api_key)?;
         Ok(Self {
             transport,
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -235,12 +237,19 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     pub async fn post_indexer(&self, body: &Value) -> Result<Value, ArrError> {
-        if let Some(name) = body.get("name").and_then(Value::as_str)
-            && live_has_name(&self.indexers().await?, name)
-        {
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("indexer");
+        if live_has_name(&self.indexers().await?, name) {
             return Err(ArrError::DuplicateIndexer(name.to_string()));
         }
-        self.post_json("indexer", body).await
+        match self.post_json("indexer", body).await {
+            Err(ArrError::Http { status: 409, .. }) => {
+                Err(ArrError::DuplicateIndexer(name.to_string()))
+            }
+            other => other,
+        }
     }
 
     pub async fn delete_indexer(&self, id: i64) -> Result<(), ArrError> {
@@ -257,7 +266,16 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     pub async fn post_download_client(&self, body: &Value) -> Result<Value, ArrError> {
-        self.post_json("downloadclient", body).await
+        let name = body
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("downloadclient");
+        match self.post_json("downloadclient", body).await {
+            Err(ArrError::Http { status: 409, .. }) => {
+                Err(ArrError::DuplicateDownloadClient(name.to_string()))
+            }
+            other => other,
+        }
     }
 
     pub async fn delete_download_client(&self, id: i64) -> Result<(), ArrError> {
@@ -293,19 +311,23 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     pub async fn queue(&self) -> Result<Value, ArrError> {
-        self.get_json("queue").await
+        self.get_paged("queue").await
     }
 
     pub async fn history(&self) -> Result<Value, ArrError> {
-        self.get_json("history").await
+        self.get_paged("history").await
     }
 
     pub async fn blocklist(&self) -> Result<Value, ArrError> {
-        self.get_json("blocklist").await
+        self.get_paged("blocklist").await
     }
 
     pub async fn wanted_missing(&self) -> Result<Value, ArrError> {
-        self.get_json("wanted/missing").await
+        self.get_paged("wanted/missing").await
+    }
+
+    pub async fn wanted_cutoff(&self) -> Result<Value, ArrError> {
+        self.get_paged("wanted/cutoff").await
     }
 
     pub async fn calendar(&self) -> Result<Value, ArrError> {
@@ -325,7 +347,8 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     pub async fn filesystem(&self, path: &str) -> Result<Value, ArrError> {
-        self.get_json(&format!("filesystem?path={path}")).await
+        self.get_json(&format!("filesystem?path={}", query_encode(path)))
+            .await
     }
 
     pub async fn manual_import(&self) -> Result<Value, ArrError> {
@@ -337,7 +360,8 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     pub async fn release_search(&self, query: &str) -> Result<Value, ArrError> {
-        self.get_json(&format!("release?term={query}")).await
+        self.get_json(&format!("release?term={}", query_encode(query)))
+            .await
     }
 
     pub async fn grab_release(&self, body: &Value) -> Result<Value, ArrError> {
@@ -345,19 +369,80 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     pub async fn test_indexer(&self, body: &Value) -> Result<Value, ArrError> {
-        if body
-            .get("apiKey")
-            .and_then(Value::as_str)
-            .is_some_and(is_masked_key)
-        {
+        if body_contains_masked_key(body) {
             return Err(ArrError::MaskedKey);
         }
         self.post_json("indexer/test", body).await
     }
+
+    async fn get_paged(&self, resource: &str) -> Result<Value, ArrError> {
+        const PAGE_SIZE: u32 = 200;
+        let mut page: u32 = 1;
+        let mut all = Vec::new();
+        let mut total: Option<u64> = None;
+        loop {
+            let path = format!("{resource}?page={page}&pageSize={PAGE_SIZE}");
+            let value = self.get_json(&path).await?;
+            if let Some(arr) = value.as_array() {
+                if page == 1 && all.is_empty() {
+                    return Ok(value);
+                }
+                all.extend(arr.iter().cloned());
+                break;
+            }
+            let batch = value
+                .get("records")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            total = value.get("totalRecords").and_then(Value::as_u64).or(total);
+            let n = batch.len();
+            all.extend(batch);
+            if n == 0 {
+                break;
+            }
+            if let Some(t) = total {
+                if (all.len() as u64) >= t {
+                    break;
+                }
+            } else if n < PAGE_SIZE as usize {
+                break;
+            }
+            page += 1;
+            if page > 100 {
+                return Err(ArrError::Other(format!(
+                    "paged {resource} exceeded 100 pages"
+                )));
+            }
+        }
+        Ok(serde_json::json!({"records": all, "totalRecords": all.len()}))
+    }
 }
 
-fn http_error(resp: &HttpResponse) -> ArrError {
+fn body_contains_masked_key(body: &Value) -> bool {
+    if body
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .is_some_and(is_masked_key)
+    {
+        return true;
+    }
+    let Some(fields) = body.get("fields").and_then(Value::as_array) else {
+        return false;
+    };
+    fields.iter().any(|field| {
+        let name = field.get("name").and_then(Value::as_str).unwrap_or("");
+        (name.eq_ignore_ascii_case("apiKey") || name.eq_ignore_ascii_case("api_key"))
+            && field
+                .get("value")
+                .and_then(Value::as_str)
+                .is_some_and(is_masked_key)
+    })
+}
+
+pub(crate) fn http_error(resp: &HttpResponse) -> ArrError {
     let body = String::from_utf8_lossy(&resp.body);
+    let body = redact_secrets(&body);
     let body = if is_masked_key(&body) {
         "<redacted>".into()
     } else {
@@ -373,33 +458,44 @@ fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
     } else {
-        s[..n].to_string()
+        let end = s.floor_char_boundary(n.min(s.len()));
+        s[..end].to_string()
     }
 }
 
 fn identities_from_array<T>(
     value: &Value,
-    map: fn(&Value) -> Option<T>,
+    map: fn(&Value) -> Result<T, ArrError>,
 ) -> Result<Vec<T>, ArrError> {
     let Some(items) = value.as_array() else {
         return Err(ArrError::Json("expected array".into()));
     };
-    Ok(items.iter().filter_map(map).collect())
+    items.iter().map(map).collect()
 }
 
-fn indexer_from_value(value: &Value) -> Option<IndexerIdentity> {
-    Some(IndexerIdentity {
+fn indexer_from_value(value: &Value) -> Result<IndexerIdentity, ArrError> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ArrError::Json("indexer missing name".into()))?;
+    Ok(IndexerIdentity {
         id: value.get("id").and_then(Value::as_i64),
-        name: value.get("name")?.as_str()?.to_string(),
-        priority: value.get("priority").and_then(Value::as_i64).unwrap_or(25) as i32,
+        name: name.to_string(),
+        priority: i32::try_from(value.get("priority").and_then(Value::as_i64).unwrap_or(25))
+            .unwrap_or(25),
     })
 }
 
-fn client_from_value(value: &Value) -> Option<DownloadClientIdentity> {
-    Some(DownloadClientIdentity {
+fn client_from_value(value: &Value) -> Result<DownloadClientIdentity, ArrError> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ArrError::Json("download client missing name".into()))?;
+    Ok(DownloadClientIdentity {
         id: value.get("id").and_then(Value::as_i64),
-        name: value.get("name")?.as_str()?.to_string(),
-        priority: value.get("priority").and_then(Value::as_i64).unwrap_or(1) as i32,
+        name: name.to_string(),
+        priority: i32::try_from(value.get("priority").and_then(Value::as_i64).unwrap_or(1))
+            .unwrap_or(1),
         implementation: value
             .get("implementation")
             .and_then(Value::as_str)
@@ -413,22 +509,18 @@ fn live_has_name(indexers: &[IndexerIdentity], name: &str) -> bool {
 
 pub fn parse_host_config(value: &Value) -> Result<HostConfig, ArrError> {
     Ok(HostConfig {
-        bind_address: value
-            .get("bindAddress")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        url_base: value
-            .get("urlBase")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        authentication_method: value
-            .get("authenticationMethod")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        bind_address: require_str(value, "bindAddress")?,
+        url_base: require_str(value, "urlBase")?,
+        authentication_method: require_str(value, "authenticationMethod")?,
     })
+}
+
+fn require_str(value: &Value, key: &str) -> Result<String, ArrError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| ArrError::Json(format!("missing {key}")))
 }
 
 #[cfg(test)]
@@ -450,6 +542,14 @@ mod tests {
         let err = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "********")
             .expect_err("masked");
         assert_eq!(err, ArrError::MaskedKey);
+        let err = ArrClient::new(
+            CassetteTransport::new(),
+            "http://127.0.0.1:8989/sonarr",
+            "/api/v3",
+            "",
+        )
+        .expect_err("empty");
+        assert!(matches!(err, ArrError::Other(msg) if msg.contains("empty")));
     }
 
     #[test]
@@ -491,6 +591,141 @@ mod tests {
             .await
             .expect_err("masked");
         assert_eq!(err, ArrError::MaskedKey);
+        let err = client
+            .test_indexer(&serde_json::json!({
+                "name": "NZBgeek",
+                "fields": [{"name": "apiKey", "value": "********"}]
+            }))
+            .await
+            .expect_err("fields");
+        assert_eq!(err, ArrError::MaskedKey);
+    }
+
+    #[tokio::test]
+    async fn post_indexer_maps_409_cassette_to_duplicate() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/indexer",
+            None,
+            json_ok(serde_json::json!([])),
+        );
+        let fixture = include_str!("../../../fixtures/arr/duplicate_nzbgeek.json");
+        t.push_json(fixture).expect("fixture");
+        let client = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
+        let err = client
+            .post_indexer(&serde_json::json!({"name":"NZBgeek","priority":25}))
+            .await
+            .expect_err("409");
+        assert!(matches!(err, ArrError::DuplicateIndexer(name) if name == "NZBgeek"));
+    }
+
+    #[tokio::test]
+    async fn post_download_client_maps_409() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "POST",
+            "/sonarr/api/v3/downloadclient",
+            None,
+            crate::transport::HttpResponse {
+                status: 409,
+                headers: Vec::new(),
+                body: b"{\"message\":\"Should be unique\"}".to_vec(),
+            },
+        );
+        let client = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
+        let err = client
+            .post_download_client(&serde_json::json!({"name":"SABnzbd"}))
+            .await
+            .expect_err("409");
+        assert!(matches!(err, ArrError::DuplicateDownloadClient(name) if name == "SABnzbd"));
+    }
+
+    #[tokio::test]
+    async fn test_indexer_maps_401_cassette() {
+        let mut t = CassetteTransport::new();
+        let fixture = include_str!("../../../fixtures/arr/indexer_test_unauthorized.json");
+        t.push_json(fixture).expect("fixture");
+        let client = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
+        let err = client
+            .test_indexer(&serde_json::json!({
+                "name": "NZBgeek",
+                "apiKey": "not-stars"
+            }))
+            .await
+            .expect_err("401");
+        assert!(matches!(err, ArrError::Http { status: 401, .. }));
+    }
+
+    #[tokio::test]
+    async fn nameless_indexer_is_json_error() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/indexer",
+            None,
+            json_ok(serde_json::json!([{"id": 1}])),
+        );
+        let client = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
+        let err = client.indexers().await.expect_err("name");
+        assert!(matches!(err, ArrError::Json(_)));
+    }
+
+    #[test]
+    fn parse_host_config_requires_fields() {
+        let err = parse_host_config(&serde_json::json!({})).expect_err("missing");
+        assert!(matches!(err, ArrError::Json(_)));
+    }
+
+    #[test]
+    fn truncate_does_not_panic_on_char_boundary() {
+        let s = "é".repeat(200);
+        let out = truncate(&s, 1);
+        assert!(s.is_char_boundary(out.len()));
+        assert!(out.len() <= 1);
+    }
+
+    #[test]
+    fn http_error_redacts_key_shaped_json() {
+        let err = http_error(&crate::transport::HttpResponse {
+            status: 401,
+            headers: Vec::new(),
+            body: br#"{"message":"bad","apiKey":"super-secret"}"#.to_vec(),
+        });
+        let ArrError::Http { body, .. } = err else {
+            panic!("http");
+        };
+        assert!(!body.contains("super-secret"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn paged_queue_walks_records() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/queue?page=1&pageSize=200",
+            None,
+            json_ok(serde_json::json!({
+                "records": [{"id": 1}],
+                "totalRecords": 2,
+                "page": 1,
+                "pageSize": 1
+            })),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/queue?page=2&pageSize=200",
+            None,
+            json_ok(serde_json::json!({
+                "records": [{"id": 2}],
+                "totalRecords": 2,
+                "page": 2,
+                "pageSize": 1
+            })),
+        );
+        let client = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
+        let queue = client.queue().await.expect("queue");
+        assert_eq!(queue["records"].as_array().expect("records").len(), 2);
     }
 
     #[tokio::test]

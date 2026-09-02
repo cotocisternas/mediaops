@@ -11,6 +11,8 @@ const MASKED: &str = "********";
 pub enum KeyError {
     #[error("masked API key refused")]
     MaskedKey,
+    #[error("empty API key refused")]
+    EmptyKey,
     #[error("key discovery: {0}")]
     Io(String),
 }
@@ -47,7 +49,7 @@ pub struct DiscoveredKeys {
     lidarr: Option<String>,
     prowlarr: Option<String>,
     sab: Option<String>,
-    qbit: Option<String>,
+    qbit_present: bool,
 }
 
 impl fmt::Debug for DiscoveredKeys {
@@ -58,7 +60,7 @@ impl fmt::Debug for DiscoveredKeys {
             .field("lidarr", &self.lidarr.as_ref().map(|_| true))
             .field("prowlarr", &self.prowlarr.as_ref().map(|_| true))
             .field("sab", &self.sab.as_ref().map(|_| true))
-            .field("qbit", &self.qbit.as_ref().map(|_| true))
+            .field("qbit", &self.qbit_present)
             .finish()
     }
 }
@@ -71,7 +73,7 @@ impl DiscoveredKeys {
             lidarr_key_present: self.lidarr.is_some(),
             prowlarr_key_present: self.prowlarr.is_some(),
             sab_key_present: self.sab.is_some(),
-            qbit_key_present: self.qbit.is_some(),
+            qbit_key_present: self.qbit_present,
         }
     }
 
@@ -90,8 +92,8 @@ impl DiscoveredKeys {
     pub fn sab(&self) -> Option<&str> {
         self.sab.as_deref()
     }
-    pub fn qbit(&self) -> Option<&str> {
-        self.qbit.as_deref()
+    pub fn qbit_present(&self) -> bool {
+        self.qbit_present
     }
 }
 
@@ -108,8 +110,17 @@ pub fn refuse_masked(value: &str) -> Result<(), KeyError> {
     }
 }
 
+/// Refuse masked stars and blank keys. Discovery treats empty tags as absence; clients use this.
+pub fn refuse_key(value: &str) -> Result<(), KeyError> {
+    if value.trim().is_empty() {
+        Err(KeyError::EmptyKey)
+    } else {
+        refuse_masked(value)
+    }
+}
+
 pub fn discover_servarr_key(config_xml: &str) -> Result<Option<String>, KeyError> {
-    let Some(key) = xml_tag(config_xml, "ApiKey") else {
+    let Some(key) = xml_tag(config_xml, "ApiKey")? else {
         return Ok(None);
     };
     if key.is_empty() {
@@ -142,12 +153,16 @@ pub fn discover_keys(paths: &KeyPaths) -> Result<DiscoveredKeys, KeyError> {
         lidarr: read_servarr(&paths.lidarr)?,
         prowlarr: read_servarr(&paths.prowlarr)?,
         sab,
-        qbit: if paths.qbit.is_file() {
-            Some("present".into())
-        } else {
-            None
-        },
+        qbit_present: qbit_config_present(&paths.qbit)?,
     })
+}
+
+fn qbit_config_present(path: &Path) -> Result<bool, KeyError> {
+    match std::fs::metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(KeyError::Io(err.to_string())),
+        Ok(meta) => Ok(meta.is_file()),
+    }
 }
 
 fn read_servarr(path: &Path) -> Result<Option<String>, KeyError> {
@@ -158,17 +173,35 @@ fn read_servarr(path: &Path) -> Result<Option<String>, KeyError> {
     }
 }
 
-fn xml_tag(body: &str, tag: &str) -> Option<String> {
+fn xml_tag(body: &str, tag: &str) -> Result<Option<String>, KeyError> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
-    let start = body.find(&open)? + open.len();
-    let end = body[start..].find(&close)? + start;
-    Some(body[start..end].trim().to_string())
+    let Some(start_at) = body.find(&open) else {
+        return Ok(None);
+    };
+    let start = start_at + open.len();
+    let Some(rel) = body[start..].find(&close) else {
+        return Err(KeyError::Io(format!("malformed <{tag}>")));
+    };
+    Ok(Some(body[start..start + rel].trim().to_string()))
 }
 
 fn ini_value(body: &str, key: &str) -> Option<String> {
+    let mut in_misc = false;
+    let mut saw_section = false;
     for line in body.lines() {
         let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            saw_section = true;
+            in_misc = line.eq_ignore_ascii_case("[misc]");
+            continue;
+        }
+        if saw_section && !in_misc {
+            continue;
+        }
         let Some(rest) = line.strip_prefix(key) else {
             continue;
         };
@@ -176,7 +209,12 @@ fn ini_value(body: &str, key: &str) -> Option<String> {
         let Some(value) = rest.strip_prefix('=') else {
             continue;
         };
-        return Some(value.trim().to_string());
+        let value = value
+            .split_once([';', '#'])
+            .map(|(v, _)| v)
+            .unwrap_or(value)
+            .trim();
+        return Some(value.to_string());
     }
     None
 }
@@ -198,6 +236,8 @@ mod tests {
             Err(KeyError::MaskedKey)
         );
         assert!(refuse_masked("real-key-not-stars").is_ok());
+        assert_eq!(refuse_key(""), Err(KeyError::EmptyKey));
+        assert_eq!(refuse_key("   "), Err(KeyError::EmptyKey));
     }
 
     #[test]
@@ -277,7 +317,7 @@ mod tests {
         assert_eq!(keys.lidarr(), Some("lidarr-key"));
         assert_eq!(keys.prowlarr(), Some("prowlarr-key"));
         assert_eq!(keys.sab(), Some("sab-key"));
-        assert!(keys.qbit().is_some());
+        assert!(keys.qbit_present());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -287,10 +327,26 @@ mod tests {
             discover_servarr_key("<Config><ApiKey></ApiKey></Config>").expect("empty"),
             None
         );
-        assert_eq!(discover_sab_key("api_key =\n").expect("empty"), None);
+        assert_eq!(
+            discover_sab_key("[misc]\napi_key =\n").expect("empty"),
+            None
+        );
         assert_eq!(
             discover_servarr_key("<Config></Config>").expect("none"),
             None
         );
+    }
+
+    #[test]
+    fn unclosed_apikey_is_malformed_not_absence() {
+        let err = discover_servarr_key("<Config><ApiKey>abc").expect_err("malformed");
+        assert!(matches!(err, KeyError::Io(_)));
+    }
+
+    #[test]
+    fn sab_key_comes_from_misc_not_other_sections() {
+        let ini = "[servers]\napi_key = decoy\n[misc]\napi_key = sab-secret-value ; comment\n";
+        let sab = discover_sab_key(ini).expect("ini").expect("key");
+        assert_eq!(sab, "sab-secret-value");
     }
 }

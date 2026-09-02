@@ -591,6 +591,35 @@ grabber = "servarr"
     }
 
     #[test]
+    fn lock_true_servarr_still_emits_grab_apply() {
+        let toml = r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 1
+range_len_mib = 8
+max_nvenc = 1
+lock = true
+grabber = "servarr"
+"#;
+        let desired = DesiredState::from_toml(toml).expect("ds");
+        let listings = [entry(&movie_rel("603", 1999), 10)];
+        let planned = plan_actions(PlanRequest {
+            listings: &listings,
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &desired,
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+        });
+        assert!(
+            matches!(planned.actions.first(), Some(Action::GrabApply)),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
     fn edge_frozen_emits_edge_apply_first() {
         let desired = ds();
         let listings = [entry(&movie_rel("603", 1999), 10)];

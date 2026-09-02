@@ -271,7 +271,7 @@ fn seedbox_grab_ops(
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+        .ok_or_else(|| AppError::Runtime(anyhow!("HOME unset")))?;
     let transport =
         ReqwestTransport::new().map_err(|err| AppError::Runtime(anyhow!(err.to_string())))?;
     let ops = LocalhostGrabOps::new(transport, KeyPaths::from_home(&home), &ds);

@@ -33,7 +33,7 @@ pub use control_port::{
 pub use desired_state::{
     CustomFormatPack, DesiredState, DesiredStateError, DownloadClientKind, Edge, Grab,
     GrabDownloadClient, GrabIndexer, GrabPolicy, Grabber, PathRoot, PinMatrixRow, Pins,
-    TlsIdentity, parse_semver, pin_matrix_refuse, upsert_tls_table,
+    TlsIdentity, parse_semver, pin_matrix_refuse, pin_matrix_refuse_live, upsert_tls_table,
 };
 pub use diff::{nginx_host_ok, panel_fingerprint, unified_diff};
 pub use digest::{Blake3Hex, DigestError};

@@ -30,6 +30,14 @@ pub fn check_handshake(proto_package: &str) -> Result<(), ControlError> {
     Ok(())
 }
 
+fn accept_handshake(proto_package: &str, semver: &str) -> Result<(), ControlError> {
+    check_handshake(proto_package)?;
+    if let Some(msg) = minor_skew_warning(semver, env!("CARGO_PKG_VERSION")) {
+        tracing::warn!("{msg}");
+    }
+    Ok(())
+}
+
 /// Warn when major matches and minor differs. Refuse is package-only.
 pub fn minor_skew_warning(daemon_semver: &str, cli_semver: &str) -> Option<String> {
     let (d_maj, d_min, _) = mediaops_core::parse_semver(daemon_semver)?;
@@ -380,7 +388,7 @@ where
                 .await
                 .map_err(control_error_from_status)?;
             let inner = response.into_inner();
-            check_handshake(&inner.proto_package)?;
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(DfSnapshot::from(inner))
         })
     }
@@ -393,7 +401,8 @@ where
                 .unmonitor(request)
                 .await
                 .map_err(control_error_from_status)?;
-            check_handshake(&response.into_inner().proto_package)?;
+            let inner = response.into_inner();
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(())
         })
     }
@@ -412,7 +421,7 @@ where
                 .await
                 .map_err(control_error_from_status)?;
             let inner = response.into_inner();
-            check_handshake(&inner.proto_package)?;
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             DeleteRemoteOutcome::try_from(inner).map_err(convert_to_control)
         })
     }
@@ -431,7 +440,7 @@ where
                 .await
                 .map_err(control_error_from_status)?;
             let inner = response.into_inner();
-            check_handshake(&inner.proto_package)?;
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(GrabApplyReport::from(inner))
         })
     }
@@ -444,7 +453,7 @@ where
                 .await
                 .map_err(control_error_from_status)?;
             let inner = response.into_inner();
-            check_handshake(&inner.proto_package)?;
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(EdgeApiReport::from(inner))
         })
     }
@@ -463,7 +472,7 @@ where
                 .await
                 .map_err(control_error_from_status)?;
             let inner = response.into_inner();
-            check_handshake(&inner.proto_package)?;
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(GrabApplyReport::from(inner))
         })
     }
@@ -476,7 +485,7 @@ where
                 .await
                 .map_err(control_error_from_status)?;
             let inner = response.into_inner();
-            check_handshake(&inner.proto_package)?;
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(KeyPresence::from(inner))
         })
     }
@@ -488,7 +497,8 @@ where
                 .guard_preview(GuardPreviewRequest {})
                 .await
                 .map_err(control_error_from_status)?;
-            check_handshake(&response.into_inner().proto_package)?;
+            let inner = response.into_inner();
+            accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(())
         })
     }
@@ -800,6 +810,7 @@ mod tests {
         assert!(minor_skew_warning("0.2.0", "0.1.0").is_some());
         assert!(minor_skew_warning("0.1.1", "0.1.0").is_none());
         assert!(minor_skew_warning("0.1.0", "0.1.0").is_none());
+        assert!(minor_skew_warning("1.0.0", "0.1.0").is_none());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use mediaops_core::Blake3Hex;
 use serde::Deserialize;
 
 use crate::transport::{
-    HttpRequest, HttpResponse, HttpTransport, TransportError, url_path_and_query,
+    HttpRequest, HttpResponse, HttpTransport, TransportError, cassette_path, redact_secrets,
 };
 
 #[derive(Debug, Deserialize)]
@@ -68,10 +68,14 @@ impl CassetteTransport {
     pub fn from_dir(dir: &Path) -> Result<Self, TransportError> {
         let mut transport = Self::new();
         let reader = fs::read_dir(dir).map_err(|err| TransportError::Io(err.to_string()))?;
-        let mut files: Vec<PathBuf> = reader
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-            .collect();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in reader {
+            let entry = entry.map_err(|err| TransportError::Io(err.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                files.push(path);
+            }
+        }
         files.sort();
         for path in files {
             let text =
@@ -92,7 +96,7 @@ impl CassetteTransport {
         let body = response_body(&file.response)?;
         self.entries.push(Entry {
             method: file.request.method.to_ascii_uppercase(),
-            path: file.request.path,
+            path: cassette_path(&file.request.path),
             body_digest,
             response: HttpResponse {
                 status: file.response.status,
@@ -106,7 +110,7 @@ impl CassetteTransport {
     pub fn push(&mut self, method: &str, path: &str, body: Option<&[u8]>, response: HttpResponse) {
         self.entries.push(Entry {
             method: method.to_ascii_uppercase(),
-            path: path.to_string(),
+            path: cassette_path(path),
             body_digest: body.map(cassette_body_digest),
             response,
         });
@@ -114,7 +118,7 @@ impl CassetteTransport {
 
     fn lookup(&self, req: &HttpRequest) -> Result<HttpResponse, TransportError> {
         let method = req.method.to_ascii_uppercase();
-        let path = url_path_and_query(&req.url);
+        let path = cassette_path(&req.url);
         let digest = req
             .body
             .as_deref()
@@ -134,9 +138,9 @@ impl CassetteTransport {
         }
         let matches = if exact.is_empty() { wildcard } else { exact };
         if matches.is_empty() {
-            return Err(TransportError::CassetteMiss(format!(
+            return Err(TransportError::CassetteMiss(redact_secrets(&format!(
                 "{method} {path} {digest}"
-            )));
+            ))));
         }
         let key = format!("{method} {path}");
         let mut used = self.used.lock().expect("cassette cursor");
@@ -162,7 +166,7 @@ pub fn cassette_body_digest(body: &[u8]) -> String {
 }
 
 pub fn cassette_key(req: &HttpRequest) -> String {
-    let path = url_path_and_query(&req.url);
+    let path = cassette_path(&req.url);
     let digest = req
         .body
         .as_deref()
@@ -206,6 +210,23 @@ mod tests {
             .await
             .expect_err("miss");
         assert!(matches!(err, TransportError::CassetteMiss(_)));
+    }
+
+    #[tokio::test]
+    async fn cassette_miss_redacts_apikey_in_url() {
+        let t = CassetteTransport::new();
+        let err = t
+            .send(&HttpRequest {
+                method: "GET".into(),
+                url: "http://127.0.0.1:8080/api?mode=queue&apikey=super-secret&output=json".into(),
+                headers: Vec::new(),
+                body: None,
+            })
+            .await
+            .expect_err("miss");
+        let msg = err.to_string();
+        assert!(!msg.contains("super-secret"), "{msg}");
+        assert!(msg.contains("apikey=KEY"), "{msg}");
     }
 
     #[tokio::test]

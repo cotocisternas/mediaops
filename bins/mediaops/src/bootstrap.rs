@@ -246,6 +246,18 @@ pub async fn bootstrap(
         }
     };
 
+    if let Ok(channel) = connect_home(&default_socket(), &tls_dir).await {
+        let control = ControlPortClient::new(ControlClient::new(channel));
+        if let Ok(edge) = control.edge_check().await
+            && !edge.invariant_ok
+        {
+            return Err(BootstrapError::Policy(format!(
+                "edge check after install drifted: {}",
+                edge.drift
+            )));
+        }
+    }
+
     drop(lock_file);
     Ok(BootstrapReport {
         provider: args.provider.as_str().to_string(),
@@ -287,10 +299,22 @@ pub async fn upgrade(
     let mut skew = None;
     let mut fingerprint = None;
     if !args.skip_edge {
-        let channel = connect_home(&args.socket, &args.tls_dir)
-            .await
-            .map_err(|err| BootstrapError::Io(err.to_string()))?;
-        let control = ControlPortClient::new(ControlClient::new(channel));
+        let mut last = String::from("connect failed");
+        let mut control = None;
+        for _ in 0..30 {
+            match connect_home(&args.socket, &args.tls_dir).await {
+                Ok(channel) => {
+                    let c = ControlPortClient::new(ControlClient::new(channel));
+                    if c.df().await.is_ok() {
+                        control = Some(c);
+                        break;
+                    }
+                }
+                Err(err) => last = err.to_string(),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let control = control.ok_or(BootstrapError::Io(last))?;
         let df = control
             .df()
             .await
@@ -302,14 +326,21 @@ pub async fn upgrade(
         let edge = control
             .edge_check()
             .await
-            .map_err(|err| BootstrapError::Io(err.message))?;
+            .map_err(|err| BootstrapError::Policy(err.message))?;
         if !edge.invariant_ok {
             return Err(BootstrapError::Policy(format!(
                 "edge check after upgrade drifted: {}",
                 edge.drift
             )));
         }
-        fingerprint = Some(edge.fingerprint);
+        fingerprint = Some(edge.fingerprint.clone());
+        let store = Store::open(&args.state_db)
+            .await
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+        store
+            .put_machine(crate::doctor::EDGE_FINGERPRINT_KEY, &edge.fingerprint)
+            .await
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
     }
     Ok(UpgradeReport {
         applied: true,
@@ -355,7 +386,7 @@ fn path_string(path: &Path) -> String {
 
 fn seedbox_exec_start(roots: &[(String, PathBuf)]) -> String {
     let mut cmd = String::from(
-        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls",
+        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls --desired-state %h/.config/mediaops/desired-state.toml --nginx-dir /etc/nginx/apps",
     );
     for (id, path) in roots {
         cmd.push_str(" --root ");
@@ -848,6 +879,10 @@ mod tests {
         assert!(unit.contains("--tls-dir"));
         assert!(unit.contains("--bind 0.0.0.0:50051"));
         assert!(unit.contains("--root media=/data/media"));
+        assert!(
+            unit.contains("--nginx-dir /etc/nginx/apps"),
+            "seedbox unit must fingerprint panel nginx, got {unit}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1027,6 +1062,45 @@ refuse_above = "2.14.5"
         .expect("upgrade");
         assert!(report.applied);
         assert!(exec.recorded().iter().any(|c| c.program_name() == "scp"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn upgrade_runs_edge_check_and_persists_fingerprint() {
+        let _g = crate::test_support::serial_net();
+        let dir = crate::test_support::scratch("upgrade-edge");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let lb = crate::test_support::start_pair(None, b"").await;
+        let exec = mediaops_ssh::TranscriptExec::new().reply(
+            "cargo",
+            mediaops_core::ExecOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+        let report = upgrade(
+            UpgradeArgs {
+                yes: true,
+                config_dir: dir.clone(),
+                desired_state: ds,
+                ssh_config: dir.join("ssh"),
+                state_db: dir.join("state.db"),
+                socket: lb.sock.clone(),
+                tls_dir: lb.tls_dir.clone(),
+                skip_edge: false,
+            },
+            &exec,
+        )
+        .await
+        .expect("upgrade");
+        assert!(report.fingerprint.is_some(), "{report:?}");
+        let store = crate::test_support::open_store(&dir).await;
+        let pin = store
+            .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+            .await
+            .expect("pin");
+        assert_eq!(pin, report.fingerprint);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

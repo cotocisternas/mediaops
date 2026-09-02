@@ -138,17 +138,20 @@ mod tests {
             .put_machine(crate::doctor::EDGE_FINGERPRINT_KEY, "old-fingerprint")
             .await
             .expect("pin");
-        // Empty live fingerprint does not freeze; persist a matching last so
-        // freeze requires a non-empty live hash. Covered by doctor::is_frozen.
-        let _ = (ds, lb, store);
-        assert!(crate::doctor::is_frozen(
-            &mediaops_core::EdgeApiReport {
-                fingerprint: "new".into(),
-                invariant_ok: true,
-                drift: String::new(),
-            },
-            Some("old-fingerprint"),
-        ));
+        let err = seedbox_apply(
+            true,
+            Some(ds),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            Some(dir.clone()),
+            Some(dir.join("state.db")),
+        )
+        .await
+        .expect_err("freeze");
+        assert!(
+            matches!(err, AppError::Policy(ref m) if m.contains("fingerprint freeze")),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
