@@ -1,5 +1,7 @@
 //! Desired-state document. Serde TOML, `deny_unknown_fields`, `schema_version` 1.
 
+use std::collections::{BTreeMap, HashSet};
+
 use serde::Deserialize;
 
 use crate::bytes::Bytes;
@@ -35,14 +37,237 @@ struct DesiredStateToml {
     underlay: UnderlayMode,
     #[serde(default)]
     tls: Option<TlsIdentity>,
+    #[serde(default)]
+    paths: PathsToml,
+    #[serde(default)]
+    grab: GrabToml,
+    #[serde(default)]
+    edge: Option<Edge>,
+    #[serde(default)]
+    pins: Pins,
 }
 
-/// *arr is optional. `none` means no live grabber HTTP (Epic 5).
+/// *arr is optional. `none` means no live grabber HTTP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Grabber {
     #[default]
     None,
+    Servarr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PathsToml {
+    #[serde(default)]
+    roots: Vec<PathRoot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRoot {
+    pub id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrabToml {
+    #[serde(default)]
+    indexers: Vec<GrabIndexer>,
+    #[serde(default)]
+    download_clients: Vec<GrabDownloadClient>,
+    #[serde(default)]
+    custom_format_packs: Vec<CustomFormatPack>,
+    #[serde(default)]
+    policy: GrabPolicy,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrabIndexer {
+    pub name: String,
+    pub priority: i32,
+    pub app: String,
+    pub implementation: String,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub config_contract: Option<String>,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadClientKind {
+    Sabnzbd,
+    Qbittorrent,
+}
+
+impl DownloadClientKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sabnzbd => "sabnzbd",
+            Self::Qbittorrent => "qbittorrent",
+        }
+    }
+
+    pub fn implementation(self) -> &'static str {
+        match self {
+            Self::Sabnzbd => "Sabnzbd",
+            Self::Qbittorrent => "QBittorrent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrabDownloadClient {
+    pub name: String,
+    pub priority: i32,
+    pub kind: DownloadClientKind,
+    #[serde(default)]
+    pub implementation: Option<String>,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
+}
+
+impl GrabDownloadClient {
+    pub fn implementation_name(&self) -> &str {
+        self.implementation
+            .as_deref()
+            .unwrap_or_else(|| self.kind.implementation())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomFormatPack {
+    pub name: String,
+    pub scores: BTreeMap<String, i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrabPolicy {
+    #[serde(default)]
+    pub delay_minutes: Option<u32>,
+    #[serde(default)]
+    pub quality_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Grab {
+    pub indexers: Vec<GrabIndexer>,
+    pub download_clients: Vec<GrabDownloadClient>,
+    pub custom_format_packs: Vec<CustomFormatPack>,
+    pub policy: GrabPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Edge {
+    #[serde(default)]
+    pub url_bases: BTreeMap<String, String>,
+    pub bind: String,
+    pub auth: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pins {
+    #[serde(default)]
+    pub lidarr: Option<String>,
+    #[serde(default)]
+    pub matrix: Vec<PinMatrixRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinMatrixRow {
+    pub package: String,
+    pub os: String,
+    pub glibc_min: String,
+    pub refuse_above: String,
+}
+
+/// Compare `major.minor.patch` (missing patch = 0). Extra segments and non-numeric patch refuse.
+pub fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.strip_prefix('v').unwrap_or(s);
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+        None => 0,
+        Some(p) => p.parse().ok()?,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Exit 5 when a pin is above `refuse_above` (Lidarr glibc trap).
+pub fn pin_matrix_refuse(pins: &Pins) -> Option<String> {
+    pin_matrix_refuse_live(pins, None, None)
+}
+
+/// Same as [`pin_matrix_refuse`], consulting live OS/glibc when provided.
+pub fn pin_matrix_refuse_live(
+    pins: &Pins,
+    live_os: Option<&str>,
+    live_glibc: Option<&str>,
+) -> Option<String> {
+    for row in &pins.matrix {
+        if let Some(os) = live_os
+            && !row.os.is_empty()
+            && row.os != os
+        {
+            continue;
+        }
+        if let Some(glibc) = live_glibc
+            && let (Some(have), Some(need)) = (parse_semver(glibc), parse_semver(&row.glibc_min))
+            && have < need
+        {
+            return Some(format!(
+                "Lidarr glibc trap: live glibc {glibc} < {} on {}",
+                row.glibc_min, row.os
+            ));
+        }
+        let current = match row.package.to_ascii_lowercase().as_str() {
+            "lidarr" => match pins.lidarr.as_deref() {
+                Some(v) => v,
+                None => {
+                    return Some(format!("matrix row {} needs pins.lidarr", row.package));
+                }
+            },
+            other => {
+                return Some(format!("unknown matrix package {other}"));
+            }
+        };
+        let Some(cur) = parse_semver(current) else {
+            return Some(format!("unparseable pin {current}"));
+        };
+        let Some(limit) = parse_semver(&row.refuse_above) else {
+            return Some(format!("unparseable refuse_above {}", row.refuse_above));
+        };
+        if cur > limit {
+            return Some(format!(
+                "Lidarr glibc trap: refusing {} {} above {} on {} (glibc_min {})",
+                row.package, current, row.refuse_above, row.os, row.glibc_min
+            ));
+        }
+    }
+    None
 }
 
 /// Paths + SHA-256-of-DER fingerprints. Never PEMs (AD-14).
@@ -73,6 +298,10 @@ pub struct DesiredState {
     seedbox_address: Option<String>,
     underlay: UnderlayMode,
     tls: Option<TlsIdentity>,
+    paths: Vec<PathRoot>,
+    grab: Grab,
+    edge: Option<Edge>,
+    pins: Pins,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -91,6 +320,8 @@ pub enum DesiredStateError {
     InvalidFingerprint { field: &'static str },
     #[error("{field} must not contain a PEM body")]
     PemInDesiredState { field: &'static str },
+    #[error("duplicate {field} `{name}`")]
+    DuplicateName { field: &'static str, name: String },
 }
 
 impl DesiredState {
@@ -119,6 +350,30 @@ impl DesiredState {
         if let Some(tls) = raw.tls.as_ref() {
             validate_tls(tls)?;
         }
+        reject_duplicate_names(
+            raw.paths.roots.iter().map(|r| r.id.as_str()),
+            "paths.roots.id",
+        )?;
+        {
+            let mut seen = HashSet::new();
+            for idx in &raw.grab.indexers {
+                let key = format!("{}/{}", idx.app, idx.name);
+                if !seen.insert(key) {
+                    return Err(DesiredStateError::DuplicateName {
+                        field: "grab.indexers.app+name",
+                        name: format!("{}@{}", idx.name, idx.app),
+                    });
+                }
+            }
+        }
+        reject_duplicate_names(
+            raw.grab.download_clients.iter().map(|c| c.name.as_str()),
+            "grab.download_clients.name",
+        )?;
+        reject_duplicate_names(
+            raw.grab.custom_format_packs.iter().map(|p| p.name.as_str()),
+            "grab.custom_format_packs.name",
+        )?;
         Ok(Self {
             schema_version: raw.schema_version,
             max_copy: gib(raw.max_copy_gib, "max_copy_gib")?,
@@ -131,6 +386,15 @@ impl DesiredState {
             seedbox_address: raw.seedbox_address,
             underlay: raw.underlay,
             tls: raw.tls,
+            paths: raw.paths.roots,
+            grab: Grab {
+                indexers: raw.grab.indexers,
+                download_clients: raw.grab.download_clients,
+                custom_format_packs: raw.grab.custom_format_packs,
+                policy: raw.grab.policy,
+            },
+            edge: raw.edge,
+            pins: raw.pins,
         })
     }
 
@@ -185,6 +449,38 @@ impl DesiredState {
     pub fn tls(&self) -> Option<&TlsIdentity> {
         self.tls.as_ref()
     }
+
+    pub fn paths(&self) -> &[PathRoot] {
+        &self.paths
+    }
+
+    pub fn grab(&self) -> &Grab {
+        &self.grab
+    }
+
+    pub fn edge(&self) -> Option<&Edge> {
+        self.edge.as_ref()
+    }
+
+    pub fn pins(&self) -> &Pins {
+        &self.pins
+    }
+}
+
+fn reject_duplicate_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    field: &'static str,
+) -> Result<(), DesiredStateError> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(DesiredStateError::DuplicateName {
+                field,
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -463,5 +759,200 @@ lock = false
         assert!(!encoded.contains("BEGIN "));
         let ds = DesiredState::from_toml(&encoded).expect("reparse");
         assert_eq!(ds.tls().expect("tls").ca_path, "/cfg/tls/ca.pem");
+    }
+
+    #[test]
+    fn happy_toml_still_parses_with_empty_grab_tables() {
+        let ds = DesiredState::from_toml(HAPPY_TOML).expect("parse");
+        assert!(ds.paths().is_empty());
+        assert!(ds.grab().indexers.is_empty());
+        assert!(ds.edge().is_none());
+        assert!(ds.pins().lidarr.is_none());
+        assert_eq!(ds.grabber(), Grabber::None);
+    }
+
+    #[test]
+    fn servarr_tables_parse_and_duplicate_nzbgeek_is_conflict() {
+        let toml = format!(
+            r#"
+{HAPPY_TOML}
+grabber = "servarr"
+
+[[paths.roots]]
+id = "complete"
+path = "/data/complete"
+
+[[grab.indexers]]
+name = "NZBgeek"
+priority = 25
+app = "prowlarr"
+implementation = "Newznab"
+
+[[grab.download_clients]]
+name = "SABnzbd"
+priority = 1
+kind = "sabnzbd"
+
+[[grab.custom_format_packs]]
+name = "prefer-h264"
+scores = {{ "x264" = 100, "x265" = -10000 }}
+
+[grab.policy]
+delay_minutes = 0
+
+[edge]
+url_bases = {{ sonarr = "/sonarr", radarr = "/radarr" }}
+bind = "127.0.0.1"
+auth = "forms"
+
+[pins]
+lidarr = "2.14.5"
+
+[[pins.matrix]]
+package = "lidarr"
+os = "ubuntu-20.04"
+glibc_min = "2.31"
+refuse_above = "2.14.5"
+"#
+        );
+        let ds = DesiredState::from_toml(&toml).expect("parse");
+        assert_eq!(ds.grabber(), Grabber::Servarr);
+        assert_eq!(ds.paths()[0].id, "complete");
+        assert_eq!(ds.grab().indexers[0].name, "NZBgeek");
+        assert_eq!(
+            ds.grab().download_clients[0].kind,
+            DownloadClientKind::Sabnzbd
+        );
+        assert_eq!(ds.edge().expect("edge").bind, "127.0.0.1");
+        assert_eq!(ds.pins().lidarr.as_deref(), Some("2.14.5"));
+
+        let dup = format!(
+            r#"
+{HAPPY_TOML}
+[[grab.indexers]]
+name = "NZBgeek"
+priority = 25
+app = "prowlarr"
+implementation = "Newznab"
+[[grab.indexers]]
+name = "NZBgeek"
+priority = 50
+app = "prowlarr"
+implementation = "Newznab"
+"#
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&dup),
+            Err(DesiredStateError::DuplicateName {
+                field: "grab.indexers.app+name",
+                ..
+            })
+        ));
+        let two_apps = format!(
+            r#"
+{HAPPY_TOML}
+[[grab.indexers]]
+name = "NZBgeek"
+priority = 25
+app = "sonarr"
+implementation = "Newznab"
+[[grab.indexers]]
+name = "NZBgeek"
+priority = 25
+app = "radarr"
+implementation = "Newznab"
+"#
+        );
+        assert!(DesiredState::from_toml(&two_apps).is_ok());
+
+        let dup_client = format!(
+            r#"
+{HAPPY_TOML}
+[[grab.download_clients]]
+name = "SABnzbd"
+priority = 1
+kind = "sabnzbd"
+[[grab.download_clients]]
+name = "SABnzbd"
+priority = 2
+kind = "sabnzbd"
+"#
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&dup_client),
+            Err(DesiredStateError::DuplicateName {
+                field: "grab.download_clients.name",
+                name
+            }) if name == "SABnzbd"
+        ));
+        let dup_pack = format!(
+            r#"
+{HAPPY_TOML}
+[[grab.custom_format_packs]]
+name = "prefer-h264"
+scores = {{ "x264" = 1 }}
+[[grab.custom_format_packs]]
+name = "prefer-h264"
+scores = {{ "x265" = 1 }}
+"#
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&dup_pack),
+            Err(DesiredStateError::DuplicateName {
+                field: "grab.custom_format_packs.name",
+                name
+            }) if name == "prefer-h264"
+        ));
+        let dup_root = format!(
+            r#"
+{HAPPY_TOML}
+[[paths.roots]]
+id = "complete"
+path = "/a"
+[[paths.roots]]
+id = "complete"
+path = "/b"
+"#
+        );
+        assert!(matches!(
+            DesiredState::from_toml(&dup_root),
+            Err(DesiredStateError::DuplicateName {
+                field: "paths.roots.id",
+                name
+            }) if name == "complete"
+        ));
+    }
+
+    #[test]
+    fn lidarr_glibc_trap_refuses_above_pin() {
+        let ok = Pins {
+            lidarr: Some("2.14.5".into()),
+            matrix: vec![PinMatrixRow {
+                package: "lidarr".into(),
+                os: "ubuntu-20.04".into(),
+                glibc_min: "2.31".into(),
+                refuse_above: "2.14.5".into(),
+            }],
+        };
+        assert!(pin_matrix_refuse(&ok).is_none());
+        let trap = Pins {
+            lidarr: Some("2.15.0".into()),
+            matrix: ok.matrix.clone(),
+        };
+        let msg = pin_matrix_refuse(&trap).expect("refuse");
+        assert!(msg.contains("Lidarr glibc trap"), "{msg}");
+        assert!(msg.contains("2.15.0"), "{msg}");
+        let bad = Pins {
+            lidarr: Some("latest".into()),
+            matrix: ok.matrix.clone(),
+        };
+        assert!(
+            pin_matrix_refuse(&bad)
+                .expect("unparseable")
+                .contains("unparseable"),
+        );
+        assert_eq!(parse_semver("2.14.x"), None);
+        assert_eq!(parse_semver("2.14.5.9"), None);
+        assert_eq!(parse_semver("v2.14.5"), Some((2, 14, 5)));
     }
 }

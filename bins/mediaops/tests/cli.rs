@@ -116,12 +116,29 @@ fn help_exits_ok() {
         stdout.contains("seedbox"),
         "help must mention seedbox: {stdout}"
     );
-    for verb in ["plan", "run", "watch", "why", "status", "encode"] {
+    for verb in ["plan", "run", "watch", "why", "status", "encode", "doctor"] {
         assert!(stdout.contains(verb), "help must mention {verb}: {stdout}");
     }
     assert!(
         serde_json::from_str::<Value>(stdout.trim()).is_err(),
         "help must not be a JSON envelope: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_repair_unattended_from_a_public_laptop() {
+    let output = bin()
+        .args(["--json", "doctor", "--repair"])
+        .output()
+        .expect("doctor repair");
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("public laptop") || message.contains("unattended"),
+        "got {message}"
     );
 }
 

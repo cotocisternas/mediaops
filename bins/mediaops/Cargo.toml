@@ -11,6 +11,7 @@ directories.workspace = true
 fs4.workspace = true
 mediaops-core.workspace = true
 mediaops-encode.workspace = true
+mediaops-proto.workspace = true
 mediaops-ssh.workspace = true
 mediaops-store.workspace = true
 mediaops-sync.workspace = true

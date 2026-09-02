@@ -1,0 +1,17 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/sonarr/api/v3/indexer",
+    "body_json": {
+      "name": "NZBgeek",
+      "priority": 25
+    }
+  },
+  "response": {
+    "status": 409,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "message": "Should be unique"
+    }
+  }
+}

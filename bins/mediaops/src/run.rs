@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    Action, DesiredState, Envelope, JobState, Plan, Probe, TitleId, WantState, free_bytes,
+    Action, ControlPort, DesiredState, Envelope, JobState, Plan, Probe, TitleId, WantState,
+    free_bytes,
 };
 use mediaops_ssh::SystemExec;
 use mediaops_store::Store;
@@ -102,12 +103,25 @@ pub async fn cmd_run(
         .iter()
         .filter(|a| matches!(a, Action::Copy { .. }))
         .count();
+    if prepared
+        .planned
+        .actions
+        .iter()
+        .any(|a| matches!(a, Action::EdgeApply))
+    {
+        return Err(AppError::Policy(
+            "panel fingerprint freeze; run mediaops repair edge --repair --confirm".into(),
+        ));
+    }
     refuse_empty_apply(copies, prepared.planned.first_candidate_breaches)?;
 
     let channel = connect_home(&prepared.socket, &prepared.tls_dir)
         .await
         .map_err(runtime_display)?;
     let n = configure_from_probes(&prepared.store, channel.clone()).await?;
+    let control = mediaops_proto::ControlPortClient::new(
+        mediaops_proto::control_client::ControlClient::new(channel.clone()),
+    );
     let active =
         std::fs::read(&prepared.desired_state).map_err(|err| AppError::Runtime(err.into()))?;
     let bytes = std::fs::read(&prepared.path).map_err(|err| AppError::Runtime(err.into()))?;
@@ -121,6 +135,7 @@ pub async fn cmd_run(
             source: grpc_source(channel),
             library_root: &prepared.library_root,
             concurrency: n as usize,
+            control: Some(&control),
         },
     )
     .await
@@ -252,6 +267,15 @@ async fn prepare(
         .into_iter()
         .filter(|j| matches!(j.state(), JobState::Want(WantState::Open)))
         .collect();
+    let control = mediaops_proto::ControlPortClient::new(
+        mediaops_proto::control_client::ControlClient::new(channel.clone()),
+    );
+    let edge = control.edge_check().await.map_err(runtime_display)?;
+    let last = store
+        .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+        .await
+        .map_err(runtime_display)?;
+    let edge_frozen = crate::doctor::is_frozen(&edge, last.as_deref());
     let planned = plan_actions(PlanRequest {
         listings: &listings,
         title_index: &title_index,
@@ -259,6 +283,7 @@ async fn prepare(
         open_wants: &open_wants,
         desired: &ds,
         free_bytes: free,
+        edge_frozen,
     });
     let plan = Plan::from_toml_bytes(toml_bytes)
         .map_err(runtime_display)?

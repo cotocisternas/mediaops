@@ -4,12 +4,14 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    DesiredState, Envelope, EnvelopeError, ExecPort, ExitCode, Probe, ProviderKind, TlsIdentity,
-    endpoint_fingerprint, upsert_tls_table,
+    ControlPort, DesiredState, Envelope, EnvelopeError, ExecPort, ExitCode, Probe, ProviderKind,
+    TlsIdentity, endpoint_fingerprint, pin_matrix_refuse, upsert_tls_table,
 };
+use mediaops_proto::ControlPortClient;
+use mediaops_proto::control_client::ControlClient;
 use mediaops_ssh::{
-    SshHost, install_provider, musl_binary_path, parse_ssh_config, refuse_git_work_tree,
-    systemd_user_unit,
+    SshHost, copy_binary_and_restart_unit, install_provider, musl_binary_path, parse_ssh_config,
+    refuse_git_work_tree, systemd_user_unit,
 };
 use mediaops_store::Store;
 use mediaops_transfer::{IdentityBundle, connect_home, mint, probe_range, probe_range_n};
@@ -36,6 +38,26 @@ pub struct BootstrapReport {
     pub range_concurrency: u32,
     pub steps: Vec<String>,
     pub applied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpgradeArgs {
+    pub yes: bool,
+    pub config_dir: PathBuf,
+    pub desired_state: PathBuf,
+    pub ssh_config: PathBuf,
+    pub state_db: PathBuf,
+    pub socket: PathBuf,
+    pub tls_dir: PathBuf,
+    pub skip_edge: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpgradeReport {
+    pub applied: bool,
+    pub steps: Vec<String>,
+    pub skew: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 pub fn parse_root(raw: &str) -> Result<(String, PathBuf), String> {
@@ -224,6 +246,18 @@ pub async fn bootstrap(
         }
     };
 
+    if let Ok(channel) = connect_home(&default_socket(), &tls_dir).await {
+        let control = ControlPortClient::new(ControlClient::new(channel));
+        if let Ok(edge) = control.edge_check().await
+            && !edge.invariant_ok
+        {
+            return Err(BootstrapError::Policy(format!(
+                "edge check after install drifted: {}",
+                edge.drift
+            )));
+        }
+    }
+
     drop(lock_file);
     Ok(BootstrapReport {
         provider: args.provider.as_str().to_string(),
@@ -232,6 +266,87 @@ pub async fn bootstrap(
         range_concurrency: n,
         steps,
         applied: true,
+    })
+}
+
+pub async fn upgrade(
+    args: UpgradeArgs,
+    exec: &impl ExecPort,
+) -> Result<UpgradeReport, BootstrapError> {
+    std::fs::create_dir_all(&args.config_dir).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let _lock = exclusive_lock(&lock_path(&args.state_db))?;
+    let toml_text = std::fs::read_to_string(&args.desired_state)
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    let ds =
+        DesiredState::from_toml(&toml_text).map_err(|err| BootstrapError::Io(err.to_string()))?;
+    if let Some(msg) = pin_matrix_refuse(ds.pins()) {
+        return Err(BootstrapError::Policy(msg));
+    }
+    let steps = vec![
+        "copy musl-static mediaopsd over ssh".into(),
+        "restart mediaopsd.service".into(),
+        "edge check".into(),
+    ];
+    if !args.yes {
+        return Err(BootstrapError::Policy(format!(
+            "refusing seedbox upgrade without --yes: {}",
+            steps.join("; ")
+        )));
+    }
+    copy_binary_and_restart_unit(exec, &musl_binary_path(), &args.ssh_config)
+        .await
+        .map_err(BootstrapError::from_ssh)?;
+    let mut skew = None;
+    let mut fingerprint = None;
+    if !args.skip_edge {
+        let mut last = String::from("connect failed");
+        let mut control = None;
+        for _ in 0..30 {
+            match connect_home(&args.socket, &args.tls_dir).await {
+                Ok(channel) => {
+                    let c = ControlPortClient::new(ControlClient::new(channel));
+                    if c.df().await.is_ok() {
+                        control = Some(c);
+                        break;
+                    }
+                }
+                Err(err) => last = err.to_string(),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let control = control.ok_or(BootstrapError::Io(last))?;
+        let df = control
+            .df()
+            .await
+            .map_err(|err| BootstrapError::Io(err.message))?;
+        skew = mediaops_proto::minor_skew_warning(&df.semver, env!("CARGO_PKG_VERSION"));
+        if let Some(msg) = &skew {
+            tracing::warn!("{msg}");
+        }
+        let edge = control
+            .edge_check()
+            .await
+            .map_err(|err| BootstrapError::Policy(err.message))?;
+        if !edge.invariant_ok {
+            return Err(BootstrapError::Policy(format!(
+                "edge check after upgrade drifted: {}",
+                edge.drift
+            )));
+        }
+        fingerprint = Some(edge.fingerprint.clone());
+        let store = Store::open(&args.state_db)
+            .await
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+        store
+            .put_machine(crate::doctor::EDGE_FINGERPRINT_KEY, &edge.fingerprint)
+            .await
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    }
+    Ok(UpgradeReport {
+        applied: true,
+        steps,
+        skew,
+        fingerprint,
     })
 }
 
@@ -271,7 +386,7 @@ fn path_string(path: &Path) -> String {
 
 fn seedbox_exec_start(roots: &[(String, PathBuf)]) -> String {
     let mut cmd = String::from(
-        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls",
+        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls --desired-state %h/.config/mediaops/desired-state.toml --nginx-dir /etc/nginx/apps",
     );
     for (id, path) in roots {
         cmd.push_str(" --root ");
@@ -364,6 +479,18 @@ impl BootstrapError {
             Self::LockConflict => ExitCode::LockConflict,
             Self::Ssh(_) | Self::Io(_) => ExitCode::Runtime,
         }
+    }
+}
+
+pub fn render_upgrade(json: bool, report: &UpgradeReport) -> Result<String, serde_json::Error> {
+    if json {
+        serde_json::to_string(&Envelope::ok(report))
+    } else {
+        Ok(format!(
+            "seedbox upgrade {} steps={}",
+            if report.applied { "applied" } else { "planned" },
+            report.steps.len()
+        ))
     }
 }
 
@@ -752,6 +879,10 @@ mod tests {
         assert!(unit.contains("--tls-dir"));
         assert!(unit.contains("--bind 0.0.0.0:50051"));
         assert!(unit.contains("--root media=/data/media"));
+        assert!(
+            unit.contains("--nginx-dir /etc/nginx/apps"),
+            "seedbox unit must fingerprint panel nginx, got {unit}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -823,6 +954,153 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(after.trim()).expect("json");
         assert_eq!(parsed["pid"], std::process::id());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn lidarr_glibc_trap_refuses_upgrade() {
+        let dir = scratch("upgrade-pin");
+        let ds = dir.join("desired-state.toml");
+        std::fs::write(
+            &ds,
+            r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 0
+range_len_mib = 1
+max_nvenc = 1
+lock = false
+[pins]
+lidarr = "2.15.0"
+[[pins.matrix]]
+package = "lidarr"
+os = "ubuntu-20.04"
+glibc_min = "2.31"
+refuse_above = "2.14.5"
+"#,
+        )
+        .expect("ds");
+        let err = upgrade(
+            UpgradeArgs {
+                yes: true,
+                config_dir: dir.clone(),
+                desired_state: ds,
+                ssh_config: dir.join("ssh"),
+                state_db: dir.join("state.db"),
+                socket: dir.join("sock"),
+                tls_dir: dir.join("tls"),
+                skip_edge: true,
+            },
+            &mediaops_ssh::TranscriptExec::new(),
+        )
+        .await
+        .expect_err("pin");
+        assert!(matches!(err, BootstrapError::Policy(ref m) if m.contains("Lidarr glibc trap")));
+        assert_eq!(err.exit_code(), ExitCode::PolicyRefusal);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn upgrade_without_yes_is_policy_refusal() {
+        let dir = scratch("upgrade-yes");
+        let ds = dir.join("desired-state.toml");
+        std::fs::write(
+            &ds,
+            "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\n",
+        )
+        .expect("ds");
+        let err = upgrade(
+            UpgradeArgs {
+                yes: false,
+                config_dir: dir.clone(),
+                desired_state: ds,
+                ssh_config: dir.join("ssh"),
+                state_db: dir.join("state.db"),
+                socket: dir.join("sock"),
+                tls_dir: dir.join("tls"),
+                skip_edge: true,
+            },
+            &mediaops_ssh::TranscriptExec::new(),
+        )
+        .await
+        .expect_err("yes");
+        assert!(matches!(err, BootstrapError::Policy(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn upgrade_with_yes_copies_binary_skipping_edge() {
+        let dir = scratch("upgrade-yes-run");
+        let ds = dir.join("desired-state.toml");
+        std::fs::write(
+            &ds,
+            "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\n",
+        )
+        .expect("ds");
+        let exec = mediaops_ssh::TranscriptExec::new().reply(
+            "cargo",
+            mediaops_core::ExecOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+        let report = upgrade(
+            UpgradeArgs {
+                yes: true,
+                config_dir: dir.clone(),
+                desired_state: ds,
+                ssh_config: dir.join("ssh"),
+                state_db: dir.join("state.db"),
+                socket: dir.join("sock"),
+                tls_dir: dir.join("tls"),
+                skip_edge: true,
+            },
+            &exec,
+        )
+        .await
+        .expect("upgrade");
+        assert!(report.applied);
+        assert!(exec.recorded().iter().any(|c| c.program_name() == "scp"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn upgrade_runs_edge_check_and_persists_fingerprint() {
+        let _g = crate::test_support::serial_net();
+        let dir = crate::test_support::scratch("upgrade-edge");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let lb = crate::test_support::start_pair(None, b"").await;
+        let exec = mediaops_ssh::TranscriptExec::new().reply(
+            "cargo",
+            mediaops_core::ExecOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+        let report = upgrade(
+            UpgradeArgs {
+                yes: true,
+                config_dir: dir.clone(),
+                desired_state: ds,
+                ssh_config: dir.join("ssh"),
+                state_db: dir.join("state.db"),
+                socket: lb.sock.clone(),
+                tls_dir: lb.tls_dir.clone(),
+                skip_edge: false,
+            },
+            &exec,
+        )
+        .await
+        .expect("upgrade");
+        assert!(report.fingerprint.is_some(), "{report:?}");
+        let store = crate::test_support::open_store(&dir).await;
+        let pin = store
+            .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+            .await
+            .expect("pin");
+        assert_eq!(pin, report.fingerprint);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

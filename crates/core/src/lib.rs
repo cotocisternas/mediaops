@@ -12,6 +12,7 @@
 pub mod bytes;
 pub mod control_port;
 pub mod desired_state;
+pub mod diff;
 pub mod digest;
 pub mod exec;
 pub mod install;
@@ -25,8 +26,16 @@ pub mod title_index;
 pub mod walker;
 
 pub use bytes::Bytes;
-pub use control_port::{ControlError, ControlPort, DeleteRemoteOutcome};
-pub use desired_state::{DesiredState, DesiredStateError, Grabber, TlsIdentity, upsert_tls_table};
+pub use control_port::{
+    BoxFuture, ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, EdgeApiReport,
+    GrabApplyReport, GrabOps, KeyPresence,
+};
+pub use desired_state::{
+    CustomFormatPack, DesiredState, DesiredStateError, DownloadClientKind, Edge, Grab,
+    GrabDownloadClient, GrabIndexer, GrabPolicy, Grabber, PathRoot, PinMatrixRow, Pins,
+    TlsIdentity, parse_semver, pin_matrix_refuse, pin_matrix_refuse_live, upsert_tls_table,
+};
+pub use diff::{nginx_host_ok, panel_fingerprint, unified_diff};
 pub use digest::{Blake3Hex, DigestError};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};
 pub use install::{

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use mediaops_core::{
-    Action, DesiredState, Job, JobState, RemoteEntry, SKIP_DUPLICATE_TITLE, SKIP_LOCK,
+    Action, DesiredState, Grabber, Job, JobState, RemoteEntry, SKIP_DUPLICATE_TITLE, SKIP_LOCK,
     SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK, TitleId, TitleIndexEntry, TitleKind,
     WantState, parse_placement,
 };
@@ -17,6 +17,8 @@ pub struct PlanRequest<'a> {
     pub open_wants: &'a [Job],
     pub desired: &'a DesiredState,
     pub free_bytes: u64,
+    /// When doctor would freeze/drift, emit EdgeApply.
+    pub edge_frozen: bool,
 }
 
 pub struct Planned {
@@ -125,6 +127,12 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         }
         actions.extend(upgrade_never);
         actions.extend(duplicates);
+        if req.desired.grabber() == Grabber::Servarr {
+            actions.insert(0, Action::GrabApply);
+        }
+        if req.edge_frozen {
+            actions.insert(0, Action::EdgeApply);
+        }
         return Planned {
             actions,
             first_candidate_breaches: false,
@@ -175,6 +183,12 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
 
     actions.extend(upgrade_never);
     actions.extend(duplicates);
+    if req.desired.grabber() == Grabber::Servarr {
+        actions.insert(0, Action::GrabApply);
+    }
+    if req.edge_frozen {
+        actions.insert(0, Action::EdgeApply);
+    }
     Planned {
         actions,
         first_candidate_breaches,
@@ -261,6 +275,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -297,6 +312,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -326,6 +342,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: Bytes::GIB + 100,
+            edge_frozen: false,
         });
         assert!(
             planned.actions.iter().all(|a| matches!(
@@ -352,6 +369,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 4 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -381,6 +399,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert_eq!(planned.actions.len(), 1);
         assert!(matches!(planned.actions[0], Action::Copy { .. }));
@@ -401,6 +420,7 @@ lock = false
             open_wants: &wants,
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -426,6 +446,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert_eq!(copies(&planned.actions).len(), 1);
         assert!(
@@ -452,6 +473,7 @@ lock = false
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -486,6 +508,7 @@ lock = true
             open_wants: &[],
             desired: &desired,
             free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -521,6 +544,7 @@ lock = false
             open_wants: &[],
             desired: &desired,
             free_bytes: 10,
+            edge_frozen: false,
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -535,5 +559,83 @@ lock = false
             planned.actions
         );
         assert!(planned.first_candidate_breaches);
+    }
+
+    #[test]
+    fn servarr_grabber_emits_grab_apply() {
+        let toml = r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 1
+range_len_mib = 8
+max_nvenc = 1
+lock = false
+grabber = "servarr"
+"#;
+        let desired = DesiredState::from_toml(toml).expect("ds");
+        let listings = [entry(&movie_rel("603", 1999), 10)];
+        let planned = plan_actions(PlanRequest {
+            listings: &listings,
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &desired,
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+        });
+        assert!(
+            matches!(planned.actions.first(), Some(Action::GrabApply)),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn lock_true_servarr_still_emits_grab_apply() {
+        let toml = r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 1
+range_len_mib = 8
+max_nvenc = 1
+lock = true
+grabber = "servarr"
+"#;
+        let desired = DesiredState::from_toml(toml).expect("ds");
+        let listings = [entry(&movie_rel("603", 1999), 10)];
+        let planned = plan_actions(PlanRequest {
+            listings: &listings,
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &desired,
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+        });
+        assert!(
+            matches!(planned.actions.first(), Some(Action::GrabApply)),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn edge_frozen_emits_edge_apply_first() {
+        let desired = ds();
+        let listings = [entry(&movie_rel("603", 1999), 10)];
+        let planned = plan_actions(PlanRequest {
+            listings: &listings,
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &desired,
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: true,
+        });
+        assert!(
+            matches!(planned.actions.first(), Some(Action::EdgeApply)),
+            "{:?}",
+            planned.actions
+        );
     }
 }

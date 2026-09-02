@@ -1,17 +1,23 @@
 //! Seedbox Control + Transfer over the walker.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use mediaops_core::{Allowlist, ControlError, ExitCode, Grabber, RemoteRef, WalkerError};
+use mediaops_core::{
+    Allowlist, ControlError, DesiredState, ExitCode, GrabOps, Grabber, RemoteRef, WalkerError,
+    nginx_host_ok, panel_fingerprint,
+};
 use mediaops_proto::control_server::Control;
 use mediaops_proto::transfer_server::Transfer;
 use mediaops_proto::{
-    DeleteRemoteRequest, DeleteRemoteResponse, DfRequest, DfResponse, EdgeCheckRequest,
-    EdgeCheckResponse, ErrorDetail, GetRangeRequest, GetRangeResponse, GrabApplyRequest,
-    GrabApplyResponse, GuardPreviewRequest, GuardPreviewResponse, KeyDiscoveryRequest,
-    KeyDiscoveryResponse, ListRequest, ListResponse, PROTO_PACKAGE, RemoteEntry as WireEntry,
-    StatRequest, StatResponse, UnmonitorRequest, UnmonitorResponse, status_from_error_detail,
+    DeleteRemoteRequest, DeleteRemoteResponse, DfRequest, DfResponse, EdgeApplyRequest,
+    EdgeApplyResponse, EdgeCheckRequest, EdgeCheckResponse, ErrorDetail, GetRangeRequest,
+    GetRangeResponse, GrabApplyRequest, GrabApplyResponse, GuardPreviewRequest,
+    GuardPreviewResponse, KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest, ListResponse,
+    PROTO_PACKAGE, RemoteEntry as WireEntry, StatRequest, StatResponse, UnmonitorRequest,
+    UnmonitorResponse, status_from_error_detail,
 };
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -21,6 +27,8 @@ pub struct Seedbox {
     allowlist: Allowlist,
     semver: String,
     grabber: Grabber,
+    grab_ops: Option<Arc<dyn GrabOps>>,
+    nginx_dir: Option<PathBuf>,
 }
 
 impl Seedbox {
@@ -29,7 +37,19 @@ impl Seedbox {
             allowlist,
             semver: semver.into(),
             grabber,
+            grab_ops: None,
+            nginx_dir: None,
         }
+    }
+
+    pub fn with_grab_ops(mut self, grab_ops: Option<Arc<dyn GrabOps>>) -> Self {
+        self.grab_ops = grab_ops;
+        self
+    }
+
+    pub fn with_nginx_dir(mut self, nginx_dir: PathBuf) -> Self {
+        self.nginx_dir = Some(nginx_dir);
+        self
     }
 
     fn handshake(&self) -> (String, String) {
@@ -56,6 +76,36 @@ fn status_from_join(err: tokio::task::JoinError) -> Status {
         exit_code: ExitCode::Runtime,
         message: err.to_string(),
     }))
+}
+
+fn nginx_fingerprint(dir: &std::path::Path) -> Result<(String, Vec<String>), String> {
+    let mut files = Vec::new();
+    let mut drift = Vec::new();
+    let reader = std::fs::read_dir(dir).map_err(|err| err.to_string())?;
+    for entry in reader {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("conf") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app.conf")
+            .to_string();
+        let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
+        let text = String::from_utf8_lossy(&bytes);
+        if !nginx_host_ok(&text) {
+            drift.push(format!("panel Host rewrite in {name}"));
+        }
+        files.push((name, bytes));
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let refs: Vec<(String, &[u8])> = files
+        .iter()
+        .map(|(n, b)| (n.clone(), b.as_slice()))
+        .collect();
+    Ok((panel_fingerprint(&refs), drift))
 }
 
 fn unused(name: &str) -> Status {
@@ -97,15 +147,36 @@ impl Control for Seedbox {
 
     async fn grab_apply(
         &self,
-        _request: Request<GrabApplyRequest>,
+        request: Request<GrabApplyRequest>,
     ) -> Result<Response<GrabApplyResponse>, Status> {
-        if self.grabber != Grabber::None {
+        let (semver, proto_package) = self.handshake();
+        if self.grabber == Grabber::None {
+            return Ok(Response::new(GrabApplyResponse {
+                semver,
+                proto_package,
+                noop: true,
+                diff: String::new(),
+            }));
+        }
+        if self.grab_ops.is_none() {
             return Err(unused("GrabApply"));
         }
-        let (semver, proto_package) = self.handshake();
+        let toml = request.into_inner().desired_state_toml;
+        let desired = DesiredState::from_toml_bytes(&toml).map_err(|err| {
+            status_from_error_detail(&ErrorDetail::from(ControlError::runtime(err.to_string())))
+        })?;
+        let report = self
+            .grab_ops
+            .as_ref()
+            .expect("checked")
+            .grab_apply(&desired)
+            .await
+            .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
         Ok(Response::new(GrabApplyResponse {
             semver,
             proto_package,
+            noop: report.noop,
+            diff: report.diff,
         }))
     }
 
@@ -113,14 +184,90 @@ impl Control for Seedbox {
         &self,
         _request: Request<EdgeCheckRequest>,
     ) -> Result<Response<EdgeCheckResponse>, Status> {
-        Err(unused("EdgeCheck"))
+        let (semver, proto_package) = self.handshake();
+        let (fingerprint, mut drift) = match &self.nginx_dir {
+            Some(dir) => nginx_fingerprint(dir).map_err(|err| {
+                status_from_error_detail(&ErrorDetail::from(ControlError::runtime(err)))
+            })?,
+            None => {
+                return Err(status_from_error_detail(&ErrorDetail::from(
+                    ControlError::runtime("nginx_dir required for panel fingerprint"),
+                )));
+            }
+        };
+        if let Some(ops) = &self.grab_ops {
+            let api = ops
+                .edge_api_check()
+                .await
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
+            if !api.drift.is_empty() {
+                drift.push(api.drift);
+            }
+        }
+        let drift = drift.join("; ");
+        Ok(Response::new(EdgeCheckResponse {
+            semver,
+            proto_package,
+            fingerprint,
+            invariant_ok: drift.is_empty(),
+            drift,
+        }))
+    }
+
+    async fn edge_apply(
+        &self,
+        request: Request<EdgeApplyRequest>,
+    ) -> Result<Response<EdgeApplyResponse>, Status> {
+        let (semver, proto_package) = self.handshake();
+        if self.grab_ops.is_none() {
+            return Ok(Response::new(EdgeApplyResponse {
+                semver,
+                proto_package,
+                noop: true,
+                diff: String::new(),
+            }));
+        }
+        let toml = request.into_inner().desired_state_toml;
+        let desired = DesiredState::from_toml_bytes(&toml).map_err(|err| {
+            status_from_error_detail(&ErrorDetail::from(ControlError::runtime(err.to_string())))
+        })?;
+        let report = self
+            .grab_ops
+            .as_ref()
+            .expect("checked")
+            .edge_apply(&desired)
+            .await
+            .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
+        Ok(Response::new(EdgeApplyResponse {
+            semver,
+            proto_package,
+            noop: report.noop,
+            diff: report.diff,
+        }))
     }
 
     async fn key_discovery(
         &self,
         _request: Request<KeyDiscoveryRequest>,
     ) -> Result<Response<KeyDiscoveryResponse>, Status> {
-        Err(unused("KeyDiscovery"))
+        let (semver, proto_package) = self.handshake();
+        let presence = if let Some(ops) = &self.grab_ops {
+            ops.key_discovery()
+                .await
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?
+        } else {
+            mediaops_core::KeyPresence::default()
+        };
+        Ok(Response::new(KeyDiscoveryResponse {
+            semver,
+            proto_package,
+            sonarr_key_present: presence.sonarr_key_present,
+            radarr_key_present: presence.radarr_key_present,
+            lidarr_key_present: presence.lidarr_key_present,
+            prowlarr_key_present: presence.prowlarr_key_present,
+            sab_key_present: presence.sab_key_present,
+            qbit_key_present: presence.qbit_key_present,
+        }))
     }
 
     async fn guard_preview(
@@ -214,7 +361,7 @@ mod tests {
     use super::*;
     use mediaops_core::{Allowlist, Grabber};
     use mediaops_proto::{
-        DeleteRemoteRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
+        DeleteRemoteRequest, EdgeApplyRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
         GuardPreviewRequest, KeyDiscoveryRequest, PROTO_PACKAGE, RemoteRef as WireRef, StatRequest,
         UnmonitorRequest,
     };
@@ -268,18 +415,6 @@ mod tests {
                     .err(),
             ),
             (
-                "EdgeCheck",
-                seed.edge_check(Request::new(EdgeCheckRequest {}))
-                    .await
-                    .err(),
-            ),
-            (
-                "KeyDiscovery",
-                seed.key_discovery(Request::new(KeyDiscoveryRequest {}))
-                    .await
-                    .err(),
-            ),
-            (
                 "GuardPreview",
                 seed.guard_preview(Request::new(GuardPreviewRequest {}))
                     .await
@@ -302,12 +437,55 @@ mod tests {
         let root = scratch("grab");
         let seed = seedbox_with(root.clone());
         let resp = seed
-            .grab_apply(Request::new(GrabApplyRequest {}))
+            .grab_apply(Request::new(GrabApplyRequest::default()))
             .await
             .expect("grab none")
             .into_inner();
         assert_eq!(resp.semver, "0.1.0");
         assert_eq!(resp.proto_package, PROTO_PACKAGE);
+        assert!(resp.noop);
+        let keys = seed
+            .key_discovery(Request::new(KeyDiscoveryRequest {}))
+            .await
+            .expect("keys")
+            .into_inner();
+        assert!(!keys.sonarr_key_present);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn panel_host_rewrite_changes_fingerprint_and_drifts() {
+        let root = scratch("nginx");
+        let nginx = root.join("nginx");
+        std::fs::create_dir_all(&nginx).expect("mkdir");
+        std::fs::write(
+            nginx.join("sonarr.conf"),
+            "proxy_set_header Host 127.0.0.1;\n",
+        )
+        .expect("write");
+        let seed = seedbox_with(root.clone()).with_nginx_dir(nginx.clone());
+        let check = seed
+            .edge_check(Request::new(EdgeCheckRequest {}))
+            .await
+            .expect("check")
+            .into_inner();
+        assert!(!check.invariant_ok);
+        assert!(check.drift.contains("Host rewrite"));
+        let good = "proxy_set_header Host $host;\n";
+        std::fs::write(nginx.join("sonarr.conf"), good).expect("rewrite");
+        let repaired = seed
+            .edge_check(Request::new(EdgeCheckRequest {}))
+            .await
+            .expect("repaired")
+            .into_inner();
+        assert!(repaired.invariant_ok);
+        assert_ne!(check.fingerprint, repaired.fingerprint);
+        let apply = seed
+            .edge_apply(Request::new(EdgeApplyRequest::default()))
+            .await
+            .expect("edge apply none")
+            .into_inner();
+        assert!(apply.noop);
         let _ = std::fs::remove_dir_all(root);
     }
 

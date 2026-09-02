@@ -144,6 +144,139 @@ pub fn scp_file_command(local: &Path, remote: &str, ssh_config: &Path) -> ExecCo
     )
 }
 
+/// Desired Swizzin nginx app snippet. Host `$host` is EdgeInvariant.
+pub fn desired_nginx_app(url_base: &str, port: u16) -> String {
+    format!(
+        "location {url_base} {{\n    proxy_pass http://127.0.0.1:{port}{url_base};\n    proxy_set_header Host $host;\n}}\n"
+    )
+}
+
+/// Keep live Swizzin conf; only ensure `proxy_set_header Host $host`.
+pub fn splice_host_dollar_host(live: &str) -> String {
+    if mediaops_core::nginx_host_ok(live) {
+        return live.to_string();
+    }
+    let mut out = Vec::new();
+    let mut replaced = false;
+    for line in live.lines() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("proxy_set_header host ") {
+            out.push(format!("{indent}proxy_set_header Host $host;"));
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        let mut inserted = false;
+        let mut with_insert = Vec::new();
+        for line in &out {
+            with_insert.push(line.clone());
+            if !inserted
+                && line
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("proxy_pass ")
+            {
+                let indent_len = line.len() - line.trim_start().len();
+                with_insert.push(format!(
+                    "{}proxy_set_header Host $host;",
+                    " ".repeat(indent_len)
+                ));
+                inserted = true;
+            }
+        }
+        out = with_insert;
+        if !inserted {
+            out.push("    proxy_set_header Host $host;".into());
+        }
+    }
+    let mut text = out.join("\n");
+    if live.ends_with('\n') && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+/// Write a small remote file over ssh (not bulk copy). Contents ride argv.
+pub async fn write_remote_file(
+    exec: &impl ExecPort,
+    ssh_config: &Path,
+    remote_path: &str,
+    contents: &str,
+) -> Result<String, SshError> {
+    let old = exec
+        .run(&ssh_exec(ssh_config, &["sudo", "cat", remote_path]))
+        .await?;
+    let old_text = if old.status == 0 {
+        String::from_utf8_lossy(&old.stdout).into_owned()
+    } else {
+        let err = String::from_utf8_lossy(&old.stderr);
+        if err.contains("No such file") || err.contains("not found") {
+            String::new()
+        } else {
+            return Err(SshError::Other(format!(
+                "sudo cat {remote_path} failed: {err}"
+            )));
+        }
+    };
+    let diff = mediaops_core::unified_diff(&old_text, contents, remote_path);
+    if diff.is_empty() {
+        return Ok(diff);
+    }
+    let escaped = contents.replace('\'', "'\\''");
+    let script = format!("printf '%s' '{escaped}' > {remote_path}");
+    exec.run(&ssh_exec(ssh_config, &["sudo", "/bin/sh", "-c", &script]))
+        .await?;
+    Ok(diff)
+}
+
+/// Read live app conf, splice `Host $host`, write if needed.
+pub async fn write_spliced_nginx_app(
+    exec: &impl ExecPort,
+    ssh_config: &Path,
+    remote_path: &str,
+    url_base: &str,
+    port: u16,
+) -> Result<String, SshError> {
+    let old = exec
+        .run(&ssh_exec(ssh_config, &["sudo", "cat", remote_path]))
+        .await?;
+    let live = if old.status == 0 {
+        String::from_utf8_lossy(&old.stdout).into_owned()
+    } else {
+        let err = String::from_utf8_lossy(&old.stderr);
+        if err.contains("No such file") || err.contains("not found") {
+            String::new()
+        } else {
+            return Err(SshError::Other(format!(
+                "sudo cat {remote_path} failed: {err}"
+            )));
+        }
+    };
+    let desired = if live.trim().is_empty() {
+        desired_nginx_app(url_base, port)
+    } else {
+        splice_host_dollar_host(&live)
+    };
+    write_remote_file(exec, ssh_config, remote_path, &desired).await
+}
+
+/// `nginx -t` then reload. Repair calls this after writing app confs.
+pub async fn nginx_test_and_reload(
+    exec: &impl ExecPort,
+    ssh_config: &Path,
+) -> Result<(), SshError> {
+    exec.run(&ssh_exec(ssh_config, &["sudo", "nginx", "-t"]))
+        .await?;
+    exec.run(&ssh_exec(ssh_config, &["sudo", "nginx", "-s", "reload"]))
+        .await?;
+    Ok(())
+}
+
 pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
     let mut args = vec![
         "-F".into(),
@@ -152,6 +285,34 @@ pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
     ];
     args.extend(remote_argv.iter().map(|arg| (*arg).to_string()));
     ExecCommand::new("ssh", args)
+}
+
+/// Bootstrap/upgrade install step: musl `mediaopsd` copy + unit restart. Never apt/panel.
+pub async fn copy_binary_and_restart_unit(
+    exec: &impl ExecPort,
+    local_binary: &Path,
+    ssh_config: &Path,
+) -> Result<(), SshError> {
+    exec.run(&musl_build_command()).await?;
+    exec.run(&ssh_exec(ssh_config, &["mkdir", "-p", ".local/bin"]))
+        .await?;
+    exec.run(&scp_file_command(
+        local_binary,
+        ".local/bin/mediaopsd",
+        ssh_config,
+    ))
+    .await?;
+    exec.run(&ssh_exec(
+        ssh_config,
+        &["systemctl", "--user", "daemon-reload"],
+    ))
+    .await?;
+    exec.run(&ssh_exec(
+        ssh_config,
+        &["systemctl", "--user", "restart", "mediaopsd.service"],
+    ))
+    .await?;
+    Ok(())
 }
 
 pub async fn install_provider(
@@ -368,6 +529,93 @@ mod tests {
         .await
         .expect("noop");
         assert!(exec.recorded().is_empty());
+    }
+
+    #[test]
+    fn desired_nginx_app_uses_host_dollar_host() {
+        let conf = desired_nginx_app("/sonarr", 8989);
+        assert!(conf.contains("Host $host"));
+        assert!(conf.contains("127.0.0.1:8989/sonarr"));
+        assert!(!conf.contains("Host 127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_copies_binary_and_restarts_never_apt_or_panel() {
+        let exec = TranscriptExec::new().reply(
+            "cargo",
+            ExecOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+        copy_binary_and_restart_unit(&exec, Path::new("/tmp/mediaopsd"), Path::new("/tmp/ssh"))
+            .await
+            .expect("upgrade");
+        let calls = exec.recorded();
+        assert!(
+            calls.iter().any(
+                |c| c.program_name() == "scp" && c.args.iter().any(|a| a.contains("mediaopsd"))
+            ),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.args.iter().any(|a| a == "restart")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.program_name() != "apt" && c.program_name() != "apt-get"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c
+                .args
+                .iter()
+                .any(|a| a.contains("panel") || a.contains("swizzin"))),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| {
+                c.program_name() == "cargo"
+                    && c.args
+                        .iter()
+                        .any(|a| a.contains("x86_64-unknown-linux-musl"))
+            }),
+            "musl cargo argv missing: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn splice_host_keeps_surrounding_conf() {
+        let live = "location /sonarr {\n    proxy_pass http://127.0.0.1:8989/sonarr;\n    proxy_set_header Host 127.0.0.1;\n    proxy_http_version 1.1;\n}\n";
+        let out = splice_host_dollar_host(live);
+        assert!(out.contains("proxy_http_version 1.1"));
+        assert!(out.contains("Host $host"));
+        assert!(!out.contains("Host 127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn nginx_repair_is_exec_not_bulk_copy() {
+        let exec = TranscriptExec::new();
+        let diff = write_remote_file(
+            &exec,
+            Path::new("/tmp/ssh_config"),
+            "/etc/nginx/apps/sonarr.conf",
+            &desired_nginx_app("/sonarr", 8989),
+        )
+        .await
+        .expect("write");
+        assert!(!diff.is_empty());
+        let calls = exec.recorded();
+        assert!(calls.iter().all(|c| c.program_name() == "ssh"), "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.args.iter().any(|a| a.contains("sonarr.conf"))),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test]

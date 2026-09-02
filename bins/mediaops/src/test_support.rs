@@ -84,7 +84,13 @@ pub async fn start_pair(rel: Option<&str>, body: &[u8]) -> Loopback {
     allowlist
         .add_root("seedbox", remote_root.clone())
         .expect("root");
-    let seed = Seedbox::new(allowlist, "0.1.0", Grabber::None);
+    let nginx = scratch("nginx");
+    std::fs::write(
+        nginx.join("sonarr.conf"),
+        "location /sonarr {\n    proxy_pass http://127.0.0.1:8989/sonarr;\n    proxy_set_header Host $host;\n}\n",
+    )
+    .expect("nginx");
+    let seed = Seedbox::new(allowlist, "0.1.0", Grabber::None).with_nginx_dir(nginx);
     let server = id.server_config().expect("server");
     let seed_task = tokio::spawn(async move {
         let _ = serve_tcp(tcp, server, seed).await;

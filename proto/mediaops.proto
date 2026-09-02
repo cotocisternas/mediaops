@@ -56,6 +56,7 @@ service Control {
   rpc DeleteRemote(DeleteRemoteRequest) returns (DeleteRemoteResponse);
   rpc GrabApply(GrabApplyRequest) returns (GrabApplyResponse);
   rpc EdgeCheck(EdgeCheckRequest) returns (EdgeCheckResponse);
+  rpc EdgeApply(EdgeApplyRequest) returns (EdgeApplyResponse);
   rpc KeyDiscovery(KeyDiscoveryRequest) returns (KeyDiscoveryResponse);
   rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
 }
@@ -123,11 +124,15 @@ message DeleteRemoteResponse {
   DeleteRemoteResult result = 3;
 }
 
-message GrabApplyRequest {}
+message GrabApplyRequest {
+  bytes desired_state_toml = 1;
+}
 
 message GrabApplyResponse {
   string semver = 1;
   string proto_package = 2;
+  bool noop = 3;
+  string diff = 4;
 }
 
 message EdgeCheckRequest {}
@@ -135,6 +140,20 @@ message EdgeCheckRequest {}
 message EdgeCheckResponse {
   string semver = 1;
   string proto_package = 2;
+  string fingerprint = 3;
+  bool invariant_ok = 4;
+  string drift = 5;
+}
+
+message EdgeApplyRequest {
+  bytes desired_state_toml = 1;
+}
+
+message EdgeApplyResponse {
+  string semver = 1;
+  string proto_package = 2;
+  bool noop = 3;
+  string diff = 4;
 }
 
 message KeyDiscoveryRequest {}
@@ -142,6 +161,12 @@ message KeyDiscoveryRequest {}
 message KeyDiscoveryResponse {
   string semver = 1;
   string proto_package = 2;
+  bool sonarr_key_present = 3;
+  bool radarr_key_present = 4;
+  bool lidarr_key_present = 5;
+  bool prowlarr_key_present = 6;
+  bool sab_key_present = 7;
+  bool qbit_key_present = 8;
 }
 
 message GuardPreviewRequest {}
