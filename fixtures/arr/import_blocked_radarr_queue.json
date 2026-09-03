@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/radarr/api/v3/queue?includeMovie=true&page=1&pageSize=200"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "page": 1,
+      "pageSize": 200,
+      "totalRecords": 1,
+      "records": [
+        {
+          "title": "Inception.2010.nzb",
+          "size": 4444,
+          "protocol": "usenet",
+          "trackedDownloadState": "importBlocked",
+          "added": "2020-01-04T00:00:00Z",
+          "statusMessages": [
+            {"messages": ["Movie file is a sample"]}
+          ],
+          "movie": {"tmdbId": 27205}
+        }
+      ]
+    }
+  }
+}

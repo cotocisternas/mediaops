@@ -11,6 +11,7 @@ mod apply_cmd;
 mod bootstrap;
 mod doctor;
 mod encode_cmd;
+mod hold;
 mod home;
 mod library;
 mod repair;
@@ -145,6 +146,8 @@ enum Command {
         config_dir: Option<PathBuf>,
     },
     Encode(EncodeArgs),
+    /// Import-blocked inbox (lock-free).
+    Hold(HoldArgs),
     /// Read-only EdgeInvariant + key presence + PEM-in-git scan.
     Doctor {
         #[arg(long)]
@@ -202,6 +205,27 @@ enum RepairCommand {
 struct EncodeArgs {
     #[command(subcommand)]
     command: EncodeCommand,
+}
+
+#[derive(Args, Debug)]
+struct HoldArgs {
+    #[command(subcommand)]
+    command: HoldCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum HoldCommand {
+    /// List undecided import-blocked releases (live ⊖ decided). Lock-free.
+    List {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -753,6 +777,18 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             command: EncodeCommand::Pause { off, state_db },
         })) => {
             let line = encode_cmd::pause(cli.json, off, state_db).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Hold(HoldArgs {
+            command:
+                HoldCommand::List {
+                    socket,
+                    tls_dir,
+                    config_dir,
+                    state_db,
+                },
+        })) => {
+            let line = hold::list(cli.json, socket, tls_dir, config_dir, state_db).await?;
             write_stdout(&line)
         }
         Some(Command::Doctor {

@@ -5,7 +5,7 @@
 //! and [`install`] are the only modules permitted to touch the filesystem, and
 //! only through caller-supplied roots -- `crates/arch-tests` enforces that
 //! boundary the way it enforces AD-2. [`ControlPort`], [`ExecPort`],
-//! [`JobsRepo`], [`ProbeRepo`], and [`TitleIndexRepo`] are ports (async
+//! [`JobsRepo`], [`ProbeRepo`], [`TitleIndexRepo`], and [`HoldsRepo`] are ports (async
 //! signatures, no I/O types). There is still no tokio runtime, no tonic, no
 //! rusqlite, and no network.
 
@@ -15,6 +15,7 @@ pub mod desired_state;
 pub mod diff;
 pub mod digest;
 pub mod exec;
+pub mod hold;
 pub mod install;
 pub mod jobs;
 pub mod pathschema;
@@ -38,6 +39,7 @@ pub use desired_state::{
 pub use diff::{nginx_host_ok, panel_fingerprint, unified_diff};
 pub use digest::{Blake3Hex, DigestError};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};
+pub use hold::{HoldDecision, HoldError, HoldKey, HoldLiveItem, HoldsRepo, ReleaseId};
 pub use install::{
     InstallError, InstallOutcome, VerifiedConvertingHandle, VerifiedStagingHandle, free_bytes,
     install, replace,

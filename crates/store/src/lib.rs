@@ -1,22 +1,23 @@
-//! sqlite adapter (AD-8). Schema `user_version` 5: `probes` (v1), `title_index` /
+//! sqlite adapter (AD-8). Schema `user_version` 6: `probes` (v1), `title_index` /
 //! `jobs` (v2) with `jobs.title_id` (v3), `machine` kv (v4), `title_index.path`
-//! (v5). `holds_decisions` waits on Epic 6.
+//! (v5), `holds_decisions` (v6).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mediaops_core::{
-    Blake3Hex, Job, JobEvent, JobId, JobKind, JobsRepo, Probe, ProbeRepo, TitleId, TitleIndexEntry,
-    TitleIndexRepo,
+    Blake3Hex, HoldDecision, HoldKey, HoldsRepo, Job, JobEvent, JobId, JobKind, JobsRepo, Probe,
+    ProbeRepo, TitleId, TitleIndexEntry, TitleIndexRepo,
 };
 use rusqlite::Connection;
 
+mod holds;
 mod jobs;
 mod machine;
 mod probes;
 mod title_index;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const JOBS_DDL: &str = "CREATE TABLE jobs (
                 id INTEGER PRIMARY KEY NOT NULL,
@@ -41,6 +42,8 @@ pub enum StoreError {
     Digest(#[from] mediaops_core::DigestError),
     #[error(transparent)]
     TitleId(#[from] mediaops_core::TitleIdError),
+    #[error(transparent)]
+    Hold(#[from] mediaops_core::HoldError),
     #[error("job {0} not found")]
     JobNotFound(JobId),
     #[error("job {0} state changed during advance")]
@@ -174,6 +177,21 @@ impl Store {
         self.with(move |conn| machine::put(conn, &key, &value))
             .await
     }
+
+    pub async fn get_hold(&self, key: &HoldKey) -> Result<Option<HoldDecision>, StoreError> {
+        let key = key.clone();
+        self.with(move |conn| holds::get_decision(conn, &key)).await
+    }
+
+    pub async fn list_decided(&self) -> Result<Vec<HoldKey>, StoreError> {
+        self.with(|conn| holds::list_decided(conn)).await
+    }
+
+    pub async fn put_hold(&self, key: &HoldKey, decision: HoldDecision) -> Result<(), StoreError> {
+        let key = key.clone();
+        self.with(move |conn| holds::put_decision(conn, &key, decision))
+            .await
+    }
 }
 
 impl ProbeRepo for Store {
@@ -246,6 +264,22 @@ impl JobsRepo for Store {
     }
 }
 
+impl HoldsRepo for Store {
+    type Error = StoreError;
+
+    async fn get(&self, key: &HoldKey) -> Result<Option<HoldDecision>, StoreError> {
+        Store::get_hold(self, key).await
+    }
+
+    async fn list_decided(&self) -> Result<Vec<HoldKey>, StoreError> {
+        Store::list_decided(self).await
+    }
+
+    async fn put(&self, key: &HoldKey, decision: HoldDecision) -> Result<(), StoreError> {
+        Store::put_hold(self, key, decision).await
+    }
+}
+
 fn open_conn(path: &Path) -> Result<Connection, StoreError> {
     let conn = Connection::open(path).map_err(sqlite)?;
     conn.busy_timeout(Duration::from_secs(5)).map_err(sqlite)?;
@@ -311,6 +345,18 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         ensure_title_index_path(conn)?;
         conn.pragma_update(None, "user_version", 5)
             .map_err(sqlite)?;
+    }
+    if version < 6 {
+        conn.execute_batch(
+            "CREATE TABLE holds_decisions (
+                title_id TEXT NOT NULL,
+                release_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                PRIMARY KEY (title_id, release_id)
+            );
+            PRAGMA user_version = 6;",
+        )
+        .map_err(sqlite)?;
     }
     Ok(())
 }
@@ -446,7 +492,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         conn.query_row("SELECT COUNT(*) FROM title_index", [], |row| {
             row.get::<_, i64>(0)
         })
@@ -459,6 +505,8 @@ mod tests {
             .expect("jobs.title_id exists");
         conn.prepare("SELECT path FROM title_index")
             .expect("title_index.path exists");
+        conn.prepare("SELECT title_id, release_id, decision FROM holds_decisions")
+            .expect("holds_decisions exists");
         drop(conn);
 
         let title = TitleId::movie("603").expect("title");
@@ -495,7 +543,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -599,6 +647,73 @@ mod tests {
         let listed = store.list_titles().await.expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path(), schema);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn write_v5(path: &Path) {
+        let conn = Connection::open(path).expect("raw");
+        conn.execute_batch(
+            "CREATE TABLE probes (
+                endpoint_fingerprint TEXT PRIMARY KEY NOT NULL,
+                range_concurrency INTEGER NOT NULL
+            );
+            CREATE TABLE title_index (
+                title_id TEXT PRIMARY KEY NOT NULL,
+                path TEXT NOT NULL DEFAULT '',
+                install_b3 TEXT NOT NULL,
+                current_b3 TEXT NOT NULL
+            );
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY NOT NULL,
+                title_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                state TEXT NOT NULL,
+                parent_job_id INTEGER,
+                FOREIGN KEY (parent_job_id) REFERENCES jobs(id)
+            );
+            CREATE TABLE machine (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+            PRAGMA user_version = 5;",
+        )
+        .expect("v5");
+    }
+
+    #[tokio::test]
+    async fn v5_migrates_holds_decisions_keyed_by_title_and_release() {
+        let dir = scratch("v5-holds");
+        let path = dir.join("state.db");
+        write_v5(&path);
+        let store = Store::open(&path).await.expect("open");
+        let conn = Connection::open(&path).expect("raw");
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 6);
+        let info: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='holds_decisions'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table");
+        assert!(
+            info.contains("PRIMARY KEY")
+                && info.contains("title_id")
+                && info.contains("release_id"),
+            "{info}"
+        );
+        drop(conn);
+        let key = mediaops_core::HoldKey::new(
+            TitleId::movie("603").expect("title"),
+            mediaops_core::ReleaseId::torrent("deadbeef").expect("release"),
+        );
+        store
+            .put_hold(&key, mediaops_core::HoldDecision::Rejected)
+            .await
+            .expect("put");
+        assert_eq!(store.list_decided().await.expect("list"), vec![key]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use mediaops_core::{Bytes, Placement, TitleId, free_bytes, parse_placement};
 
 mod apply;
+mod hold;
 mod plan;
 
 pub use apply::{ApplyCtx, ApplyError, ApplyReport, InstalledCopy, apply};
+pub use hold::inbox;
 pub use plan::{PlanRequest, Planned, plan_actions};
 
 pub const SCHEMA_DIRS: &[&str] = &["movies", "series", "music", "_ops", "_incoming"];

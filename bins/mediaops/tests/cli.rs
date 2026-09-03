@@ -116,7 +116,9 @@ fn help_exits_ok() {
         stdout.contains("seedbox"),
         "help must mention seedbox: {stdout}"
     );
-    for verb in ["plan", "run", "watch", "why", "status", "encode", "doctor"] {
+    for verb in [
+        "plan", "run", "watch", "why", "status", "encode", "hold", "doctor",
+    ] {
         assert!(stdout.contains(verb), "help must mention {verb}: {stdout}");
     }
     assert!(
@@ -692,4 +694,155 @@ fn encode_pause_is_lock_free_json_envelope() {
     let off_v = stdout_json(&off);
     assert_eq!(off_v["data"]["encode_pause"], false);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hold_help_mentions_list() {
+    let output = bin().args(["hold", "--help"]).output().expect("hold help");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    assert!(
+        stdout.contains("list"),
+        "hold help must mention list: {stdout}"
+    );
+}
+
+#[test]
+fn hold_list_lock_free_json_empty_on_loopback() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let _g = HOLD_NET.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("hold-cli");
+        let library = dir.join("library");
+        for name in ["movies", "series", "music", "_incoming"] {
+            std::fs::create_dir_all(library.join(name)).expect("layout");
+        }
+        let lb = start_hold_loopback().await;
+        let lock_path = dir.join("mediaops.lock");
+        let file = std::fs::File::create(&lock_path).expect("lock file");
+        fs4::FileExt::try_lock(&file).expect("hold lock");
+        let output = bin()
+            .args([
+                "--json",
+                "hold",
+                "list",
+                "--socket",
+                lb.sock.to_str().unwrap(),
+                "--tls-dir",
+                lb.tls_dir.to_str().unwrap(),
+                "--state-db",
+                dir.join("state.db").to_str().unwrap(),
+            ])
+            .output()
+            .expect("hold list");
+        drop(file);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "hold list must be lock-free (holds rotting as a junk drawer): stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = stdout_json(&output);
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["holds"], serde_json::json!([]));
+        for name in ["movies", "series", "music", "_incoming"] {
+            let empty = std::fs::read_dir(library.join(name))
+                .expect("read")
+                .next()
+                .is_none();
+            assert!(empty, "{name} must not become a hold folder");
+        }
+        drop(lb);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+static HOLD_NET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct HoldLoopback {
+    sock: std::path::PathBuf,
+    tls_dir: std::path::PathBuf,
+    remote_root: std::path::PathBuf,
+    seed_task: tokio::task::JoinHandle<()>,
+    uds_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HoldLoopback {
+    fn drop(&mut self) {
+        self.seed_task.abort();
+        self.uds_task.abort();
+        let _ = std::fs::remove_file(&self.sock);
+        let _ = std::fs::remove_dir_all(&self.tls_dir);
+        let _ = std::fs::remove_dir_all(&self.remote_root);
+    }
+}
+
+async fn start_hold_loopback() -> HoldLoopback {
+    use mediaops_core::{Allowlist, Grabber, UnderlayMode, endpoint_fingerprint};
+    use mediaops_transfer::{
+        HomeGateway, Seedbox, connect_home, connect_tcp, mint, serve_home_unix, serve_tcp,
+    };
+    use tokio::net::{TcpListener, UnixListener};
+
+    let remote_root = scratch("hold-remote");
+    let id = mint().expect("mint");
+    let tls_dir = scratch("hold-tls");
+    id.write_to_dir(&tls_dir).expect("write tls");
+    let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+    let addr = tcp.local_addr().expect("addr");
+    let mut allowlist = Allowlist::new();
+    allowlist
+        .add_root("seedbox", remote_root.clone())
+        .expect("root");
+    let seed = Seedbox::new(allowlist, "0.1.0", Grabber::None);
+    let server = id.server_config().expect("server");
+    let seed_task = tokio::spawn(async move {
+        let _ = serve_tcp(tcp, server, seed).await;
+    });
+    let client = id.client_config().expect("client");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match connect_tcp(addr, client.clone()).await {
+            Ok(_) => break,
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("tcp connect: {err}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+    let fingerprint = endpoint_fingerprint(&addr.to_string(), UnderlayMode::Direct);
+    let gateway = HomeGateway::connect(addr, client, fingerprint, 1)
+        .await
+        .expect("gw");
+    let sock = scratch("hold-uds").join("mediaops.sock");
+    let unix = UnixListener::bind(&sock).expect("bind uds");
+    let uds_server = id.server_config().expect("server");
+    let uds_task = tokio::spawn(async move {
+        let _ = serve_home_unix(unix, uds_server, gateway).await;
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match connect_home(&sock, &tls_dir).await {
+            Ok(_) => break,
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("home gateway: {err}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+    HoldLoopback {
+        sock,
+        tls_dir,
+        remote_root,
+        seed_task,
+        uds_task,
+    }
 }

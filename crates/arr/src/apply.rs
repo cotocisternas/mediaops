@@ -2,7 +2,8 @@
 
 use mediaops_core::{
     BoxFuture, ControlError, DesiredState, EdgeApiReport, GrabApplyReport, GrabDownloadClient,
-    GrabIndexer, GrabOps, Grabber, KeyPresence, unified_diff,
+    GrabIndexer, GrabOps, Grabber, HoldKey, HoldLiveItem, KeyPresence, ReleaseId, TitleId,
+    unified_diff,
 };
 use serde_json::{Value, json};
 
@@ -151,6 +152,44 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
                 noop: diffs.is_empty(),
                 diff: diffs.join("\n"),
             })
+        })
+    }
+
+    fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>> {
+        Box::pin(async move {
+            let keys = discover_keys(&self.key_paths).map_err(key_to_control)?;
+            let mut out = Vec::new();
+            if let Some(key) = keys.sonarr() {
+                let client =
+                    ArrClient::new(self.transport.clone(), &self.sonarr_base, "/api/v3", key)
+                        .map_err(arr_to_control)?;
+                let queue = client
+                    .get_paged_with("queue", "includeSeries=true&includeEpisode=true")
+                    .await
+                    .map_err(arr_to_control)?;
+                out.extend(hold_items_from_queue(&queue));
+            }
+            if let Some(key) = keys.radarr() {
+                let client =
+                    ArrClient::new(self.transport.clone(), &self.radarr_base, "/api/v3", key)
+                        .map_err(arr_to_control)?;
+                let queue = client
+                    .get_paged_with("queue", "includeMovie=true")
+                    .await
+                    .map_err(arr_to_control)?;
+                out.extend(hold_items_from_queue(&queue));
+            }
+            if let Some(key) = keys.lidarr() {
+                let client =
+                    ArrClient::new(self.transport.clone(), &self.lidarr_base, "/api/v1", key)
+                        .map_err(arr_to_control)?;
+                let queue = client
+                    .get_paged_with("queue", "includeArtist=true&includeAlbum=true")
+                    .await
+                    .map_err(arr_to_control)?;
+                out.extend(hold_items_from_queue(&queue));
+            }
+            Ok(out)
         })
     }
 }
@@ -812,6 +851,210 @@ fn key_to_control(err: crate::keys::KeyError) -> ControlError {
     }
 }
 
+/// Map a Servarr queue JSON document to live hold items. Only `arr` parses queue JSON.
+///
+/// Include when `trackedDownloadState` is `importBlocked` (ci). Skip missing TitleId
+/// or `release_id` without error. Path fields are ignored so blocked NZBs never look
+/// like library.
+pub fn hold_items_from_queue(queue: &Value) -> Vec<HoldLiveItem> {
+    let records = queue
+        .get("records")
+        .and_then(Value::as_array)
+        .or_else(|| queue.as_array());
+    let Some(records) = records else {
+        return Vec::new();
+    };
+    records.iter().filter_map(hold_item_from_record).collect()
+}
+
+fn hold_item_from_record(item: &Value) -> Option<HoldLiveItem> {
+    let state = item.get("trackedDownloadState").and_then(Value::as_str)?;
+    if !state.eq_ignore_ascii_case("importBlocked") {
+        return None;
+    }
+    let title_id = title_id_from_queue_item(item)?;
+    let release_id = release_id_from_queue_item(item)?;
+    Some(HoldLiveItem {
+        key: HoldKey::new(title_id, release_id),
+        added_unix: item
+            .get("added")
+            .and_then(parse_added)
+            .unwrap_or_else(current_unix),
+        size: item.get("size").and_then(json_u64).unwrap_or(0),
+        reason: reason_from_queue_item(item),
+    })
+}
+
+fn title_id_from_queue_item(item: &Value) -> Option<TitleId> {
+    if let Some(id) = item
+        .get("movie")
+        .and_then(|m| m.get("tmdbId"))
+        .and_then(json_id)
+    {
+        return TitleId::movie(id).ok();
+    }
+    if let Some(id) = item
+        .get("series")
+        .and_then(|s| s.get("tvdbId"))
+        .and_then(json_id)
+    {
+        return TitleId::series(id).ok();
+    }
+    if let Some(id) = item
+        .get("album")
+        .and_then(|a| a.get("foreignAlbumId"))
+        .and_then(Value::as_str)
+    {
+        return TitleId::album(id).ok();
+    }
+    None
+}
+
+fn release_id_from_queue_item(item: &Value) -> Option<ReleaseId> {
+    let protocol = item.get("protocol").and_then(Value::as_str)?;
+    if protocol.eq_ignore_ascii_case("torrent") {
+        let download_id = item.get("downloadId").and_then(Value::as_str)?;
+        ReleaseId::torrent(download_id).ok()
+    } else if protocol.eq_ignore_ascii_case("usenet") {
+        let title = item.get("title").and_then(Value::as_str)?;
+        ReleaseId::usenet(title).ok()
+    } else {
+        None
+    }
+}
+
+fn reason_from_queue_item(item: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(msgs) = item.get("statusMessages").and_then(Value::as_array) {
+        for msg in msgs {
+            if let Some(arr) = msg.get("messages").and_then(Value::as_array) {
+                for line in arr {
+                    if let Some(s) = line.as_str()
+                        && !s.is_empty()
+                    {
+                        parts.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let joined = parts.join("; ");
+    if !joined.is_empty() {
+        return joined;
+    }
+    item.get("errorMessage")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn json_id(value: &Value) -> Option<String> {
+    if let Some(n) = value.as_u64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = value.as_i64() {
+        if n < 0 {
+            return None;
+        }
+        return Some(n.to_string());
+    }
+    value.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .or_else(|| {
+            value.as_f64().and_then(|n| {
+                if n.is_finite() && n >= 0.0 {
+                    Some(n as u64)
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn current_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn parse_added(value: &Value) -> Option<i64> {
+    parse_rfc3339(value.as_str()?)
+}
+
+fn parse_rfc3339(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let year: i32 = s.get(0..4)?.parse().ok()?;
+    if b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't') {
+        return None;
+    }
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: u32 = s.get(11..13)?.parse().ok()?;
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let min: u32 = s.get(14..16)?.parse().ok()?;
+    let sec: u32 = s.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let mut idx = 19;
+    if b.get(idx) == Some(&b'.') {
+        idx += 1;
+        while idx < b.len() && b[idx].is_ascii_digit() {
+            idx += 1;
+        }
+    }
+    let rest = s.get(idx..)?;
+    let offset_secs: i64 = if rest.is_empty() || rest.eq_ignore_ascii_case("Z") {
+        0
+    } else if rest.starts_with('+') || rest.starts_with('-') {
+        let sign = if rest.starts_with('+') { 1 } else { -1 };
+        let rest = &rest[1..];
+        let (hh, mm) = if rest.len() >= 5 && rest.as_bytes().get(2) == Some(&b':') {
+            (rest.get(0..2)?, rest.get(3..5)?)
+        } else if rest.len() >= 4 {
+            (rest.get(0..2)?, rest.get(2..4)?)
+        } else {
+            return None;
+        };
+        let hh: i64 = hh.parse().ok()?;
+        let mm: i64 = mm.parse().ok()?;
+        sign * (hh * 3600 + mm * 60)
+    } else {
+        return None;
+    };
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(sec) - offset_secs)
+}
+
+fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = i64::from(y);
+    let m = i64::from(m);
+    let d = i64::from(d);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
+    Some(era * 146097 + doe as i64 - 719468)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,6 +1558,228 @@ auth = "forms"
         let report = ops.edge_api_check().await.expect("check");
         assert!(!report.invariant_ok);
         assert!(report.drift.contains("missing /sonarr"), "{}", report.drift);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn import_blocked_queue() -> Value {
+        json!({
+            "records": [
+                {
+                    "title": "The.Matrix.1999.nzb",
+                    "size": 12345,
+                    "protocol": "usenet",
+                    "trackedDownloadState": "importBlocked",
+                    "added": "2020-01-01T00:00:00Z",
+                    "outputPath": "/data/_incoming/The.Matrix.1999",
+                    "statusMessages": [{
+                        "title": "The Matrix",
+                        "messages": ["No files found are eligible for import"]
+                    }],
+                    "movie": {"tmdbId": 603}
+                },
+                {
+                    "title": "The.Wire.S01E01",
+                    "size": 999,
+                    "protocol": "torrent",
+                    "downloadId": "DEADBEEF",
+                    "trackedDownloadState": "importBlocked",
+                    "added": "2020-01-02T00:00:00Z",
+                    "statusMessages": [{
+                        "messages": ["Sample file only"]
+                    }],
+                    "series": {"tvdbId": 79126}
+                },
+                {
+                    "title": "Relayer",
+                    "size": 50,
+                    "protocol": "usenet",
+                    "trackedDownloadState": "importBlocked",
+                    "added": "2020-01-03T00:00:00Z",
+                    "album": {"foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63"}
+                },
+                {
+                    "title": "Downloading",
+                    "size": 1,
+                    "protocol": "usenet",
+                    "trackedDownloadState": "downloading",
+                    "movie": {"tmdbId": 604}
+                },
+                {
+                    "title": "Missing.TitleId.nzb",
+                    "size": 1,
+                    "protocol": "usenet",
+                    "trackedDownloadState": "importBlocked"
+                },
+                {
+                    "title": "Missing.DownloadId",
+                    "size": 1,
+                    "protocol": "torrent",
+                    "trackedDownloadState": "importBlocked",
+                    "movie": {"tmdbId": 605}
+                }
+            ],
+            "totalRecords": 6
+        })
+    }
+
+    #[test]
+    fn hold_items_from_queue_maps_import_blocked_and_omits_incomplete() {
+        let items = hold_items_from_queue(&import_blocked_queue());
+        assert_eq!(
+            items.len(),
+            3,
+            "missing TitleId/release_id and non-blocked omitted"
+        );
+        assert_eq!(items[0].key.title_id.render(), "movie:tmdb:603");
+        assert_eq!(
+            items[0].key.release_id,
+            ReleaseId::usenet("The.Matrix.1999.nzb").expect("usenet")
+        );
+        assert_eq!(items[0].added_unix, 1_577_836_800);
+        assert_eq!(items[0].size, 12345);
+        assert_eq!(items[0].reason, "No files found are eligible for import");
+        assert_eq!(items[1].key.title_id.render(), "series:tvdb:79126");
+        assert_eq!(
+            items[1].key.release_id,
+            ReleaseId::torrent("DEADBEEF").expect("torrent")
+        );
+        assert_eq!(items[1].reason, "Sample file only");
+        assert_eq!(
+            items[2].key.title_id.render(),
+            "album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63"
+        );
+        for item in &items {
+            let debug = format!("{item:?}");
+            assert!(
+                !debug.contains("_incoming") && !debug.contains("outputPath"),
+                "blocked NZBs must not rot as a junk drawer of library paths: {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc3339_added_is_unix() {
+        assert_eq!(parse_rfc3339("2020-01-01T00:00:00Z"), Some(1_577_836_800));
+        assert_eq!(
+            parse_rfc3339("2020-01-01T00:00:00.1234567Z"),
+            Some(1_577_836_800)
+        );
+        assert_eq!(
+            parse_rfc3339("2020-01-01T01:00:00+01:00"),
+            Some(1_577_836_800)
+        );
+        assert_eq!(parse_rfc3339("2020-01-01T00:00:00"), Some(1_577_836_800));
+        assert!(parse_rfc3339("not-a-date").is_none());
+    }
+
+    fn one_blocked(extra: Value) -> Value {
+        let mut rec = json!({
+            "title": "X.nzb",
+            "protocol": "usenet",
+            "trackedDownloadState": "importBlocked",
+            "movie": {"tmdbId": 1}
+        });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                rec[k] = v.clone();
+            }
+        }
+        json!({"records": [rec], "totalRecords": 1})
+    }
+
+    #[test]
+    fn missing_or_unparsable_added_yields_near_zero_age() {
+        for extra in [json!({}), json!({"added": "not-a-date"})] {
+            let items = hold_items_from_queue(&one_blocked(extra));
+            assert_eq!(items.len(), 1);
+            let now = current_unix();
+            assert!(
+                items[0].age_secs(now) <= 2,
+                "age_secs={} added_unix={}",
+                items[0].age_secs(now),
+                items[0].added_unix
+            );
+        }
+    }
+
+    #[test]
+    fn float_size_truncates_toward_zero() {
+        let items = hold_items_from_queue(&one_blocked(json!({"size": 12345.9})));
+        assert_eq!(items[0].size, 12345);
+    }
+
+    #[test]
+    fn empty_status_messages_use_error_message() {
+        let items = hold_items_from_queue(&one_blocked(json!({
+            "statusMessages": [],
+            "errorMessage": "Download client timed out"
+        })));
+        assert_eq!(items[0].reason, "Download client timed out");
+        let items = hold_items_from_queue(&one_blocked(json!({
+            "statusMessages": [{"messages": ["Eligible mismatch"]}],
+            "errorMessage": "ignored"
+        })));
+        assert_eq!(items[0].reason, "Eligible mismatch");
+    }
+
+    fn write_arr_key(home: &std::path::Path, app: &str, key: &str) {
+        let path = home.join(format!(".config/{app}/config.xml"));
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, format!("<Config><ApiKey>{key}</ApiKey></Config>")).expect("xml");
+    }
+
+    #[tokio::test]
+    async fn grab_ops_hold_list_pages_sonarr_radarr_lidarr_cassette() {
+        let home = scratch("hold-list");
+        write_arr_key(&home, "Sonarr", "k");
+        write_arr_key(&home, "Radarr", "k");
+        write_arr_key(&home, "Lidarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/import_blocked_queue.json"
+        ))
+        .expect("sonarr cassette");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/import_blocked_radarr_queue.json"
+        ))
+        .expect("radarr cassette");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/import_blocked_lidarr_queue.json"
+        ))
+        .expect("lidarr cassette");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let items = ops.hold_list().await.expect("hold list");
+        let ids: Vec<String> = items.iter().map(|i| i.key.title_id.render()).collect();
+        assert!(
+            ids.contains(&"movie:tmdb:603".into()),
+            "sonarr movie missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"series:tvdb:79126".into()),
+            "sonarr series missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"movie:tmdb:27205".into()),
+            "radarr movie missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"album:mbid:12345678-1234-1234-1234-123456789012".into()),
+            "lidarr album missing: {ids:?}"
+        );
+        assert_eq!(items.len(), 4);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_hold_list_without_keys_is_empty() {
+        let home = scratch("hold-empty");
+        let ops = LocalhostGrabOps::new(
+            CassetteTransport::new(),
+            KeyPaths::from_home(&home),
+            &ds_servarr(),
+        );
+        let items = ops.hold_list().await.expect("empty");
+        assert!(items.is_empty());
         let _ = fs::remove_dir_all(home);
     }
 }

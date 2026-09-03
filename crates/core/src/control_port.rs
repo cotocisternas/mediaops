@@ -6,6 +6,7 @@ use std::pin::Pin;
 use crate::ExitCode;
 use crate::bytes::Bytes;
 use crate::desired_state::DesiredState;
+use crate::hold::HoldLiveItem;
 use crate::title_id::TitleId;
 use crate::walker::RemoteRef;
 
@@ -31,6 +32,7 @@ pub trait ControlPort: Send + Sync {
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
     fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>>;
     fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>>;
+    fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>>;
 }
 
 /// Seedbox-local grabber HTTP. Injected into `net::Seedbox`; `net` does not name HTTP.
@@ -45,6 +47,7 @@ pub trait GrabOps: Send + Sync {
         &'a self,
         desired: &'a DesiredState,
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
+    fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>>;
 }
 
 /// `df` payload for handshake + free space. Wire still splits the fields.

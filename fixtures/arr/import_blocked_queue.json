@@ -1,0 +1,44 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/sonarr/api/v3/queue?includeSeries=true&includeEpisode=true&page=1&pageSize=200"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "page": 1,
+      "pageSize": 200,
+      "totalRecords": 2,
+      "records": [
+        {
+          "title": "The.Matrix.1999.nzb",
+          "size": 12345,
+          "protocol": "usenet",
+          "trackedDownloadState": "importBlocked",
+          "added": "2020-01-01T00:00:00Z",
+          "outputPath": "/data/_incoming/The.Matrix.1999",
+          "statusMessages": [
+            {
+              "title": "The Matrix",
+              "messages": ["No files found are eligible for import"]
+            }
+          ],
+          "movie": {"tmdbId": 603}
+        },
+        {
+          "title": "The.Wire.S01E01",
+          "size": 999,
+          "protocol": "torrent",
+          "downloadId": "DEADBEEF",
+          "trackedDownloadState": "importBlocked",
+          "added": "2020-01-02T00:00:00Z",
+          "statusMessages": [
+            {"messages": ["Sample file only"]}
+          ],
+          "series": {"tvdbId": 79126}
+        }
+      ]
+    }
+  }
+}

@@ -314,6 +314,10 @@ impl<T: HttpTransport> ArrClient<T> {
         self.get_paged("queue").await
     }
 
+    pub async fn get_paged_with(&self, resource: &str, extra: &str) -> Result<Value, ArrError> {
+        self.paged(resource, extra).await
+    }
+
     pub async fn history(&self) -> Result<Value, ArrError> {
         self.get_paged("history").await
     }
@@ -376,12 +380,20 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     async fn get_paged(&self, resource: &str) -> Result<Value, ArrError> {
+        self.paged(resource, "").await
+    }
+
+    async fn paged(&self, resource: &str, extra: &str) -> Result<Value, ArrError> {
         const PAGE_SIZE: u32 = 200;
         let mut page: u32 = 1;
         let mut all = Vec::new();
         let mut total: Option<u64> = None;
         loop {
-            let path = format!("{resource}?page={page}&pageSize={PAGE_SIZE}");
+            let path = if extra.is_empty() {
+                format!("{resource}?page={page}&pageSize={PAGE_SIZE}")
+            } else {
+                format!("{resource}?{extra}&page={page}&pageSize={PAGE_SIZE}")
+            };
             let value = self.get_json(&path).await?;
             if let Some(arr) = value.as_array() {
                 if page == 1 && all.is_empty() {
@@ -726,6 +738,23 @@ mod tests {
         let client = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
         let queue = client.queue().await.expect("queue");
         assert_eq!(queue["records"].as_array().expect("records").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn paged_with_extra_query_is_before_page() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/radarr/api/v3/queue?includeMovie=true&page=1&pageSize=200",
+            None,
+            json_ok(serde_json::json!({"records": [{"id": 1}], "totalRecords": 1})),
+        );
+        let client = ArrClient::new(t, "http://127.0.0.1:7878/radarr", "/api/v3", "k").expect("c");
+        let queue = client
+            .get_paged_with("queue", "includeMovie=true")
+            .await
+            .expect("paged with");
+        assert_eq!(queue["records"].as_array().expect("records").len(), 1);
     }
 
     #[tokio::test]
