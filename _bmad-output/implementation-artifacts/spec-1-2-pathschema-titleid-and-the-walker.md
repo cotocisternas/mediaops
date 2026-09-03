@@ -33,7 +33,7 @@ deferred:
 **Always:**
 - TitleId serializes `kind:source:id` with kinds `movie`+`tmdb`, `series`+`tvdb`, `album`+`mbid` (example `movie:tmdb:603`). Identity is TitleId, never a path string. Music remasters key by MBID, not folder year.
 - Only `core::pathschema` renders/parses library paths. `parse(render(id)) == id`. Year is identical in the title folder and the file stem. Spaces are refused. Strip scene tags `REPACJ`, `REPACK`, `PROPER`. Reject bins include `needs-split` and `needs-year`.
-- Staging paths only from `core::pathschema::staging_path` → `_incoming/<TitleId serialized>/…`.
+- Staging paths only from `core::pathschema::staging_path` → `_incoming/<TitleId::staging_token()>/…` (hyphen form, e.g. `movie-tmdb-603`).
 - One walker is the sole producer of `RemoteRef {root_id, rel_path}` and `RemoteEntry {ref, len, mtime, nlink}`. Unknown paths error. Never follow symlinks off the allowlist. Do not list torrent save paths or `torrents/incomplete`.
 - Install gate: `install(TitleId, verified staging handle) -> installed path` and `replace(TitleId, verified .converting handle, backup destination) -> installed path`. `replace` is encode's path and the only writer of `current_b3` (persistence of digests is story 1.3; this story returns the path). Callers other than tests may wait.
 - TitleId/PathSchema stay pure functions. Walker and install gate use caller-supplied filesystem roots (tempdir fixtures). No tokio, network, rusqlite, reqwest, or proto codegen. `thiserror` in core. Default tests offline.
@@ -52,7 +52,7 @@ deferred:
 | Remaster | Two album folders `Relayer.(1974)` and `Relayer.(2013)` sharing one MBID | `parse` yields that album TitleId for both; year is not identity | Must not treat year as a different album |
 | Scene strip | Names containing REPACJ, REPACK, or PROPER | Those tags are removed | Leftover tag in a library path is not a successful parse |
 | Reject bins | Paths using `needs-split` or `needs-year` | Classified as those reject bins, not a TitleId | Not a silent title parse |
-| staging_path | TitleId + final name | `_incoming/<kind:source:id>/<final name>` | Empty/invalid TitleId → error |
+| staging_path | TitleId + final name | `_incoming/<TitleId::staging_token()>/<final name>` (e.g. `movie-tmdb-603`) | Empty/invalid TitleId → error |
 | Walker happy | Tempdir allowlisted root with files | Only `RemoteRef`/`RemoteEntry` under that root (`len`/`mtime`/`nlink` from metadata) | No error expected |
 | Unknown path | List or resolve outside the allowlist | Error | Do not return an entry |
 | Symlink escape | Symlink inside allowlist pointing outside | Do not follow; outside contents are not listed | No entries for the escaped target |
@@ -85,7 +85,7 @@ Read-only evidence: epic-1-context Identity and paths; AD-11 staging layout; AD-
 - Given TitleIds `movie:tmdb:…`, `series:tvdb:…`, and `album:mbid:…`, when PathSchema renders then parses, then `parse(render(id)) == id`, year matches in folder and file stem, spaces are refused, and album parse keys by MBID not folder year.
 - Given names with REPACJ, REPACK, or PROPER, when the scene-tag strip runs, then those tags are gone, and `needs-split` / `needs-year` are reject bins.
 - Given a remote-root allowlist in a tempdir, when the walker lists, then it emits only typed `RemoteRef`/`RemoteEntry`, unknown paths error, symlinks off the allowlist are not followed, and torrent save paths plus `torrents/incomplete` are not listed.
-- Given staging and the install gate, when any path is built, then it uses only `staging_path` (`_incoming/<TitleId>/…`), and `install` / `replace` exist as the two library-path writers (tests call them; other crates may wait).
+- Given staging and the install gate, when any path is built, then it uses only `staging_path` (`_incoming/<TitleId::staging_token()>/…`, e.g. `movie-tmdb-603`), and `install` / `replace` exist as the two library-path writers (tests call them; other crates may wait).
 - Given `cargo test -p mediaops-core` and `cargo test -p mediaops-arch-tests` with default features, when they run, then they pass offline, binaries still match the 1.1 CLI matrix, and core has no tokio/rusqlite/reqwest.
 
 ### Review Findings
@@ -131,7 +131,7 @@ Adversarial code review of commit `35a4f03`, 2026-08-29. Four layers (blind-hunt
 - [x] [Review][Defer] Non-unix builds fabricate `nlink = 1` and both test modules use `std::os::unix` unguarded [crates/core/src/walker.rs:229] — deferred, no non-unix target today
 - [x] [Review][Defer] Legitimate titles containing "Proper" or "Repack" can never be rendered or parsed [crates/core/src/pathschema.rs:377] — deferred, the spec mandates the tag list; needs a product call on positional stripping
 - [x] [Review][Defer] No `fsync` of the parent directory after rename, so "atomic" is not crash-durable [crates/core/src/install.rs:146] — deferred, beyond a types-and-offline-tests story
-- [x] [Review][Defer] Nothing constrains the staged source to a staging root; any dir ending in the `_incoming/<TitleId>/<name>` tail verifies [crates/core/src/install.rs:76] — deferred, adding a staging-root parameter changes the gate signature
+- [x] [Review][Defer] Nothing constrains the staged source to a staging root; any dir ending in the `_incoming/<TitleId::staging_token()>/<name>` tail verifies [crates/core/src/install.rs:76] — deferred, adding a staging-root parameter changes the gate signature
 - [x] [Review][Defer] `REPACJ` is frozen into a public const, doc, and test as a scene tag [crates/core/src/pathschema.rs:15] — deferred, it reads as a typo of `REPACK` but both the spec and epic context list it; confirm upstream
 
 **Review closed (2026-08-30).** Patches from the 2026-08-29 adversarial pass are in `main`. No follow-up review is queued. The eight deferrals stay on the ledger in [deferred-work.md](deferred-work.md); they are not open story work. Epic 2 later closed a walker hole this story's listing tests did not cover: `Stat`/`GetRange`/`entry`/`open` now refuse intermediate directory symlinks and open with `O_NOFOLLOW`.

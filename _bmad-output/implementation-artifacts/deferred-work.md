@@ -78,3 +78,29 @@ Uncommitted Epic 3 working tree (home gateway, pull/resume, library bootstrap).
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-approve-and-reject.md`
   summary: Concurrent lock-free approve/reject on the same HoldKey last-write-wins via ON CONFLICT upsert.
   evidence: holds_decisions upserts decision; no insert-if-absent.
+
+## Deferred from: bmad-build split of retro action items (2026-09-02)
+
+- source_spec: none
+  summary: Run Epic 4 live demo after operator confirm; do not claim FTP-PASV beaten until measured.
+  evidence: Split from closing Epic 1–6 retro items because live SeedIt4Me/GPU requires operator confirm; remaining retro items proceed without it.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-close-retros-1-6-action-items.md`
+  summary: Sidecar `file_len` is trusted for buffer size even when the on-disk `.partial` is shorter.
+  evidence: `verify_recorded_ranges` calls `range_buf_len(sidecar.file_len, …)` then seeks/reads the partial; a lying sidecar can still allocate a huge buffer. Out of this story’s OOB/overflow bound.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-close-retros-1-6-action-items.md`
+  summary: Bootstrap’s `musl_build_command()` does not match `make musl` (`-p mediaopsd`, `--locked`, `crt-static`).
+  evidence: `crates/ssh/src/lib.rs` still issues a bare `cargo build --release --target x86_64-unknown-linux-musl --bin mediaopsd`. The new gate proves Make/CI, not the command bootstrap/upgrade runs.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-close-retros-1-6-action-items.md`
+  summary: `encode run TITLE` maps ffprobe failure without the `probe_error:` prefix used by scan/`after_install`.
+  evidence: TITLE path already returned Err; this pass only fixed scan/`after_install`/`cmd_run`. Prefix alignment is leftover.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-close-retros-1-6-action-items.md`
+  summary: No commit-msg hook or CI lint for `N-M` story keys in subjects.
+  evidence: README states the future-subject rule; old SHAs were not rewritten. Squash merges can still produce `git_evidence.py` `stories: []`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-close-retros-1-6-action-items.md`
+  summary: `range_buf_len`’s `usize::try_from(len)` overflow branch is dead on 64-bit CI.
+  evidence: `u64::MAX` fits `usize` on the hosts that run tests; 32-bit is not a v1 target.

@@ -68,7 +68,24 @@ pub fn load(path: &Path) -> Result<Option<Sidecar>, TransferError> {
     if sidecar.range_len == 0 {
         return Err(TransferError::Sidecar("range_len must be > 0".into()));
     }
+    for range in &sidecar.ranges {
+        range_buf_len(sidecar.file_len, range.offset, range.len)?;
+    }
     Ok(Some(sidecar))
+}
+
+/// Bound-check a sidecar range before allocating a verify buffer.
+pub(crate) fn range_buf_len(file_len: u64, offset: u64, len: u64) -> Result<usize, TransferError> {
+    let end = offset.checked_add(len).ok_or_else(|| {
+        TransferError::Sidecar(format!("range offset {offset} + len {len} overflows u64"))
+    })?;
+    if end > file_len {
+        return Err(TransferError::Sidecar(format!(
+            "range offset {offset} + len {len} exceeds file_len {file_len}"
+        )));
+    }
+    usize::try_from(len)
+        .map_err(|_| TransferError::Sidecar(format!("range len {len} overflows usize")))
 }
 
 pub fn save(path: &Path, sidecar: &Sidecar) -> Result<(), TransferError> {
@@ -143,6 +160,46 @@ mod tests {
             other => panic!("expected Sidecar, got {other:?}"),
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_range_past_file_len_is_sidecar_error() {
+        let dir = scratch("oob");
+        let path = dir.join("a.partial.b3");
+        fs::write(
+            &path,
+            r#"{"version":1,"file_len":10,"range_len":4,"ranges":[{"offset":8,"len":8,"blake3":"abc"}]}"#,
+        )
+        .expect("write");
+        let err = load(&path).expect_err("oob");
+        match err {
+            TransferError::Sidecar(message) => {
+                assert!(message.contains("exceeds file_len"), "{message}");
+            }
+            other => panic!("expected Sidecar, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn range_buf_len_overflow_and_usize() {
+        let err = range_buf_len(10, u64::MAX, 1).expect_err("add overflow");
+        match err {
+            TransferError::Sidecar(message) => {
+                assert!(message.contains("overflows u64"), "{message}");
+            }
+            other => panic!("expected Sidecar, got {other:?}"),
+        }
+        if usize::try_from(u64::MAX).is_err() {
+            let err = range_buf_len(u64::MAX, 0, u64::MAX).expect_err("usize");
+            match err {
+                TransferError::Sidecar(message) => {
+                    assert!(message.contains("overflows usize"), "{message}");
+                }
+                other => panic!("expected Sidecar, got {other:?}"),
+            }
+        }
+        assert_eq!(range_buf_len(10, 4, 4).expect("in range"), 4);
     }
 
     #[test]

@@ -68,6 +68,12 @@ impl DaemonRole {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn serial_net() -> std::sync::MutexGuard<'static, ()> {
+    static NET_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    NET_TEST.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn check_pool_n(n: usize) -> Result<(), NetError> {
     if n == 0 || n > 64 {
         Err(NetError::Pool(format!(
@@ -317,6 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_and_uds_share_rustls_config() {
+        let _serial = serial_net();
         let root = scratch("tree");
         write_file(&root.join("a.bin"), b"abcdefghij");
         let id = mint().expect("mint");
@@ -376,6 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_is_n_independent_channels() {
+        let _serial = serial_net();
         let root = scratch("pool");
         write_file(&root.join("a.bin"), b"abcdefghij");
         let id = mint().expect("mint");
@@ -431,6 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn grabber_none_is_a_noop_apply() {
+        let _serial = serial_net();
         let root = scratch("grab");
         write_file(&root.join("a.bin"), b"x");
         let id = mint().expect("mint");
@@ -453,6 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn negative_mtls_rejects_unauthenticated_and_foreign_clients() {
+        let _serial = serial_net();
         let root = scratch("mtls");
         write_file(&root.join("a.bin"), b"x");
         let id = mint().expect("mint");
@@ -478,6 +488,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_to_dir_from_dir_and_server_only_dir_serve() {
+        let _serial = serial_net();
         let root = scratch("tls-rt");
         write_file(&root.join("a.bin"), b"x");
         let id = mint().expect("mint");
@@ -530,6 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_range_n_against_in_process_server() {
+        let _serial = serial_net();
         let root = scratch("probe");
         write_file(&root.join("a.bin"), b"abcdefghij");
         let id = mint().expect("mint");
@@ -550,6 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn stat_round_trip_matches_list() {
+        let _serial = serial_net();
         let root = scratch("stat");
         write_file(&root.join("a.bin"), b"abcdefghij");
         let id = mint().expect("mint");

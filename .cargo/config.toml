@@ -1,0 +1,5 @@
+# Musl-static mediaopsd (AD-22). `make musl` uses this pin; `make test` does not.
+# Ubuntu/Debian musl-tools installs `musl-gcc`. Arch may ship `x86_64-linux-musl-gcc` as an alias.
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

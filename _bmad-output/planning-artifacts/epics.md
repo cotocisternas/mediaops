@@ -122,11 +122,11 @@ NFR14 (Identity): Identity is TitleId (kind + TMDB/TVDB/MBID), never a path stri
 - AD-8: One home `state.db` touched only by `store` (rusqlite behind spawn_blocking, embedded forward-only migrations via PRAGMA user_version); repository traits in `core`; tables `title_index` (dual digests: immutable `install_b3`, gate-updated `current_b3`), `jobs`, `probes`, `holds_decisions` (keyed by `HoldKey {title_id, release_id}`); seedbox daemon role links no sqlite.
 - AD-9: A Plan embeds the exact raw TOML bytes of the snapshotted desired-state plus blake3(bytes); apply re-parses only from embedded bytes and refuses on hash mismatch; `Action` is one exhaustive enum with a `never` default arm.
 - AD-10: Every long-running operation (want, pull, encode, hold) is a `jobs` row; `core::jobs` owns state enums and pure `advance()`; readiness predicates evaluated in `core::jobs`; planner links action jobs to wants via `parent_job_id`; crash recovery derives from job state + runtime artifacts.
-- AD-11: `.partial` staging format — `<final>.partial` + sidecar `<final>.partial.b3` (versioned JSON: file_len, range_len, ranges with offset/len/blake3, all bytes); a range counts completed only after fsync + hash recorded; staging layout `_incoming/<TitleId>/…` rendered solely by `core::pathschema::staging_path`; any dir under `_incoming/` containing `*.partial*` is sacred to prune/GC.
+- AD-11: `.partial` staging format — `<final>.partial` + sidecar `<final>.partial.b3` (versioned JSON: file_len, range_len, ranges with offset/len/blake3, all bytes); a range counts completed only after fsync + hash recorded; staging layout `_incoming/<TitleId::staging_token()>/…` (hyphen form, e.g. `movie-tmdb-603`) rendered solely by `core::pathschema::staging_path`; any dir under `_incoming/` containing `*.partial*` is sacred to prune/GC.
 - AD-12: Parallelism is a channel pool owned by the home gateway — N independent TCP+TLS channels, one GetRange stream per channel, N+1th refused ResourceExhausted; CLI sets N via gateway-only `ConfigurePool` UDS RPC; `probes` keyed by `endpoint_fingerprint`, re-probe on mismatch; range_len default 64 MiB from desired-state.
 - AD-13: `core::pathschema` is the only renderer/parser of library paths; install gate has exactly two entry points (`install`, `replace` — replace is encode's path and sole `current_b3` writer); one allowlist walker produces typed `RemoteRef`/`RemoteEntry`; the Transfer service and planner consume the same shapes; `docs render` renders from PathSchema.
 - AD-14: TLS mechanics — rcgen ECDSA P-256 CA/server/client at bootstrap into `tls/`; SHA-256-of-DER lowercase-hex fingerprints in desired-state; server requires-and-verifies client certs against the minted CA.
-- AD-15: All grabber HTTP through an `HttpTransport` trait; reqwest impl linked only in mediaopsd; tests replay cassettes; every named grabber failure gets a cassette.
+- AD-15: All grabber HTTP through an `HttpTransport` trait; reqwest is a direct dependency of `mediaops-arr` (AD-2); only mediaopsd constructs `ReqwestTransport`; tests replay cassettes; every named grabber failure gets a cassette.
 - AD-16: ffmpeg/ffprobe/ssh/systemctl invoked through a single exec port with probed absolute paths persisted in machine state; no lib bindings (no ffmpeg-next, ssh2, russh); system ssh honors `Host seedbox`.
 - AD-17: `core` owns an exhaustive ExitCode enum (0 ok, 1 runtime, 2 usage, 3 lock conflict, 4 drift/verify, 5 policy refusal); libraries return thiserror and never exit; each binary maps error→ExitCode in one place; ExitCode reflects the command's own contract (refusals inside an apply loop are data, not exit 5).
 - AD-18: stdout carries only the result (human or single JSON envelope); stderr carries tracing; progress is tracing events (the deferred TUI attaches there).
@@ -151,13 +151,13 @@ N/A — no UX design contract exists and none is required: the product is CLI-fi
 FR1: Epic 4 — `watch TITLE` records a per-title want
 FR2: Epic 3 (timer) + Epic 4 (`run`) — unattended delivery
 FR3: Epic 4 — budgets and upgrade-class default never
-FR4: Epic 5 — Edge/Grab/Paths apply; second apply is a no-op
+FR4: Epic 5 — Edge/Grab apply (nginx splice + grab/edge API); second apply is a no-op. Paths root-folder apply is later, not Epic 5.
 FR5: Epic 5 — unified diffs of ini/xml/nginx before write
 FR6: Epic 4 (pull/encode/lock/watermark) + Epic 7 (grab/hold/reclaim) — `why` / `status` chain
 FR7: Epic 7 — Unmonitor when local exists and *arr thinks missing
 FR8: Epic 7 — seedbox df + ranked reclaim preview
 FR9: Epic 3 — `.partial` resume; GC never deletes partials
-FR10: Epic 2 (daemon, mTLS, probe) + Epic 5 (packages, edge, grabber sets)
+FR10: Epic 2 (daemon, mTLS, probe) + Epic 5 (edge, grabber sets). Swizzin package install is later, not Epic 5.
 FR11: Epic 5 — API key discovery, never paste/store/echo
 FR12: Epic 2 — probe N until plateau; persist; re-probe on endpoint change
 FR13: Epic 3 — `library bootstrap`
@@ -194,8 +194,8 @@ Home mediaopsd is a unix-socket gateway. `library bootstrap` stands up schema di
 **FRs covered:** FR1, FR2, FR3, FR6 (pull/encode/lock/watermark slice), FR15 (Copy/Skip/Encode apply), FR16, FR19, FR20, FR25, NFR7, NFR12
 
 ### Epic 5: Quiet box without the panel
-Edge, Grab, and Paths apply from git-readable desired-state with diffs first. Keys are discovered, never pasted. Scheduled doctor is read-only; repair and upgrade are explicit transactions.
-**FRs covered:** FR4, FR5, FR10 (packages/edge/grabber slice), FR11, FR22, FR23, FR26, NFR2, NFR5, NFR13, AD-15
+Nginx splice plus grab/edge API from git-readable desired-state with diffs first. Keys are discovered, never pasted. Scheduled doctor is read-only; repair and upgrade are explicit transactions. Paths root-folder apply and Swizzin package install are later stories — they were not Epic 5.
+**FRs covered:** FR4 (Grab/Edge apply; Paths later), FR5, FR10 (edge/grabber slice; packages later), FR11, FR22, FR23, FR26, NFR2, NFR5, NFR13, AD-15
 
 ### Epic 6: Holds are an inbox
 Import-blocked releases are a typed inbox with age, size, and reason. Approve promotes through PathSchema; Reject means never-this-release. Auto-approve is impossible.
@@ -267,7 +267,7 @@ So that library names cannot lie and remote walks cannot leave the allowlist.
 
 **Given** staging
 **When** any crate needs a staging path
-**Then** it calls only `core::pathschema::staging_path` (`_incoming/<TitleId>/…`)
+**Then** it calls only `core::pathschema::staging_path` (`_incoming/<TitleId::staging_token()>/…`, e.g. `movie-tmdb-603`)
 **And** the install gate exists as two entry points (`install`, `replace`) even if callers other than tests wait for later stories
 
 ### Story 1.3: DesiredState, Plan, jobs, and store
@@ -564,7 +564,7 @@ So that bootstrap → plan → parallel pull → `.partial` resume → schema in
 
 ## Epic 5: Quiet box without the panel
 
-Operator keeps grabber, edge, and path desired-state correct from a git-readable file. Packages/nginx that bootstrap skipped beyond daemon install land here.
+Operator keeps grabber and edge desired-state correct from a git-readable file. Epic 5 is nginx splice plus grab/edge API. Paths root-folder apply and Swizzin package install are later stories; they were not delivered here.
 
 ### Story 5.1: arr crate over HttpTransport
 
@@ -576,7 +576,7 @@ So that grabber failures are cassettes, not live clicks.
 
 **Given** the `arr` crate
 **When** it speaks HTTP
-**Then** it uses only `HttpTransport`; the reqwest impl is linked only inside mediaopsd
+**Then** it uses only `HttpTransport`; reqwest is a direct dependency of `mediaops-arr` (AD-2); only mediaopsd constructs `ReqwestTransport`
 **And** tests replay JSON request/response cassettes; every named grabber failure in `failure-history-tests.md` that is an HTTP failure has a cassette
 
 **Given** Autobrr or Bazarr

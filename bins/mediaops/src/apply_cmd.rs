@@ -93,12 +93,97 @@ fn map_control(err: mediaops_core::ControlError) -> AppError {
 mod tests {
     use super::*;
 
+    struct DiffThenNoop {
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl mediaops_core::GrabOps for DiffThenNoop {
+        fn grab_apply<'a>(
+            &'a self,
+            _: &'a mediaops_core::DesiredState,
+        ) -> mediaops_core::BoxFuture<
+            'a,
+            Result<mediaops_core::GrabApplyReport, mediaops_core::ControlError>,
+        > {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Ok(mediaops_core::GrabApplyReport {
+                        noop: false,
+                        diff: "indexers: +nzbgeek\n".into(),
+                    })
+                } else {
+                    Ok(mediaops_core::GrabApplyReport {
+                        noop: true,
+                        diff: String::new(),
+                    })
+                }
+            })
+        }
+        fn key_discovery(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<mediaops_core::KeyPresence, mediaops_core::ControlError>,
+        > {
+            Box::pin(async { Ok(mediaops_core::KeyPresence::default()) })
+        }
+        fn edge_api_check(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<mediaops_core::EdgeApiReport, mediaops_core::ControlError>,
+        > {
+            Box::pin(async {
+                Ok(mediaops_core::EdgeApiReport {
+                    fingerprint: String::new(),
+                    invariant_ok: true,
+                    drift: String::new(),
+                })
+            })
+        }
+        fn edge_apply<'a>(
+            &'a self,
+            _: &'a mediaops_core::DesiredState,
+        ) -> mediaops_core::BoxFuture<
+            'a,
+            Result<mediaops_core::GrabApplyReport, mediaops_core::ControlError>,
+        > {
+            Box::pin(async {
+                Ok(mediaops_core::GrabApplyReport {
+                    noop: true,
+                    diff: String::new(),
+                })
+            })
+        }
+        fn hold_list(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<Vec<mediaops_core::HoldLiveItem>, mediaops_core::ControlError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn hold_reject<'a>(
+            &'a self,
+            _: &'a mediaops_core::HoldKey,
+        ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn seedbox_apply_second_call_is_noop() {
         let _g = crate::test_support::serial_net();
         let dir = crate::test_support::scratch("seedbox-apply");
         let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
-        let lb = crate::test_support::start_pair(None, b"").await;
+        let lb = crate::test_support::start_pair_with_grab_ops(
+            mediaops_core::Grabber::Servarr,
+            Some(std::sync::Arc::new(DiffThenNoop {
+                calls: std::sync::atomic::AtomicU32::new(0),
+            })),
+        )
+        .await;
         let json = seedbox_apply(
             true,
             Some(ds.clone()),
@@ -111,7 +196,14 @@ mod tests {
         .expect("first");
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["ok"], true);
-        assert_eq!(value["data"]["noop"], true);
+        assert_eq!(value["data"]["noop"], false, "{json}");
+        assert!(
+            value["data"]["diff"]
+                .as_str()
+                .expect("diff")
+                .contains("nzbgeek"),
+            "{json}"
+        );
         let json = seedbox_apply(
             true,
             Some(ds),
@@ -123,7 +215,7 @@ mod tests {
         .await
         .expect("second");
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["data"]["noop"], true);
+        assert_eq!(value["data"]["noop"], true, "{json}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

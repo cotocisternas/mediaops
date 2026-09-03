@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-29-2026 01:26
-last_updated: 09-02-2026 23:18
+last_updated: 09-03-2026 00:10
 project: mediaops
 project_key: NOKEY
 tracking_system: file-system
@@ -88,74 +88,74 @@ action_items:
     action: "Reconcile staging-path wording to _incoming/<TitleId::staging_token()>/
       (hyphen form) in epics.md Story 1.2 and ARCHITECTURE-SPINE.md AD-11"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-1-retro-09-02-2026.md"
   - id: "epic-1-retro-item-2-put-story-keys-in-commit-subjects-1-1-1"
     epic: 1
     action: "Put story keys in commit subjects (1-1, 1-2, 1-4 not story 1.4) so git_evidence.py
       --stories can attribute"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-1-retro-09-02-2026.md"
   - id: "epic-1-retro-item-3-resolve-stale-followup_review_recommende"
     epic: 1
     action: "Resolve stale followup_review_recommended: true on spec-1-1 and spec-1-4"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-1-retro-09-02-2026.md"
   - id: "epic-2-retro-item-4-prove-musl-static-mediaopsd-links-for-x8"
     epic: 2
     action: "Prove musl-static mediaopsd links for x86_64-unknown-linux-musl (tls-aws-lc
       / .cargo/config.toml) and add an offline gate"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-2-retro-09-02-2026.md"
   - id: "epic-2-retro-item-5-refuse-remint-when-tls-is-a-partial-bund"
     epic: 2
     action: "Refuse remint when tls/ is a partial bundle (or place server certs on
       AlreadyThere remint)"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-2-retro-09-02-2026.md"
   - id: "epic-2-retro-item-6-name-story-keys-in-commit-subjects-2-1-2"
     epic: 2
     action: "Name story keys in commit subjects (2-1, 2-2, 2-3) and add spec-2-* story
       files so git_evidence.py can attribute"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-2-retro-09-02-2026.md"
   - id: "epic-3-retro-item-7-reject-sidecar-ranges-whose-offset-len-e"
     epic: 3
     action: "Reject sidecar ranges whose offset+len exceeds file_len or whose len
       overflows usize before allocating in verify_recorded_ranges/load"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-3-retro-09-02-2026.md"
   - id: "epic-3-retro-item-8-add-a-homegateway-test-that-n-concurrent"
     epic: 3
     action: "Add a HomeGateway test that N concurrent proxied GetRange streams produce
       N WAN connections; cite collapsing Range onto one TCP"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-3-retro-09-02-2026.md"
   - id: "epic-3-retro-item-9-name-story-ids-3-1-3-2-3-3-in-commit-sub"
     epic: 3
     action: "Name story ids (3-1/3-2/3-3) in commit subjects so git_evidence can attribute"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-3-retro-09-02-2026.md"
   - id: "epic-4-retro-item-10-surface-encode-outcome-on-mediaops-run-s"
     epic: 4
     action: "Surface encode outcome on mediaops run (stop discarding after_install;
       envelope + test)"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-4-retro-09-02-2026.md"
   - id: "epic-4-retro-item-11-treat-ffprobe-failure-as-error-probe_err"
     epic: 4
     action: "Treat ffprobe failure as error/probe_error, never Keep/silent skip"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-4-retro-09-02-2026.md"
   - id: "epic-4-retro-item-12-run-epic-4-live-demo-after-operator-conf"
     epic: 4
@@ -168,38 +168,38 @@ action_items:
     epic: 5
     action: "Fail-closed edge check after seedbox bootstrap install"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-5-retro-09-02-2026.md"
   - id: "epic-5-retro-item-14-reconcile-ad-15-story-5-1-ac-with-ad-2-r"
     epic: 5
     action: "Reconcile AD-15 / story 5.1 AC with AD-2 reqwest-under-arr as-built"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-5-retro-09-02-2026.md"
   - id: "epic-5-retro-item-15-reconcile-fr4-paths-apply-and-fr10-packa"
     epic: 5
     action: "Reconcile FR4 Paths apply and FR10 packages (later story or drop from
       Epic 5 FRs)"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-5-retro-09-02-2026.md"
   - id: "epic-5-retro-item-16-observe-servarr-set-diff-on-cli-seedbox"
     epic: 5
     action: "Observe Servarr set-diff on CLI seedbox apply second-call test via start_pair_with_grab_ops"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-5-retro-09-02-2026.md"
   - id: "epic-6-retro-item-17-add-an-exclusive-run-apply-test-that-ins"
     epic: 6
     action: "Add an exclusive run/apply test that installs an Approved hold onto a
       PathSchema path (scene-named remote → library path without leftover scene tags)"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-6-retro-09-02-2026.md"
   - id: "epic-6-retro-item-18-put-story-keys-6-1-6-2-in-commit-subject"
     epic: 6
     action: "Put story keys (6-1, 6-2, …) in commit subjects so git_evidence.py can
       attribute"
     owner: "Coto"
-    status: open
+    status: done
     ref: "/home/coto/work/dev/mediaops/_bmad-output/implementation-artifacts/epic-6-retro-09-02-2026.md"

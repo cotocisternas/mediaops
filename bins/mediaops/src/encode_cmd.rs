@@ -66,10 +66,10 @@ pub async fn scan(
                 continue;
             }
             let path = library_root.join(&rel);
-            let decision = match probe_media(exec, &path).await {
-                Ok(media) => classify(title_id.kind(), &media),
-                Err(_) => EncodeDecision::Keep,
-            };
+            let media = probe_media(exec, &path)
+                .await
+                .map_err(|err| AppError::Runtime(anyhow::anyhow!("probe_error: {err}")))?;
+            let decision = classify(title_id.kind(), &media);
             files.push(ScanFile {
                 path: rel.display().to_string(),
                 title_id: title_id.render(),
@@ -295,6 +295,12 @@ pub async fn run(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterInstall {
+    Ran,
+    Skipped,
+}
+
 pub async fn after_install(
     exec: &impl ExecPort,
     store: &Store,
@@ -305,26 +311,26 @@ pub async fn after_install(
     ffmpeg: &str,
     cap: u32,
     paused: bool,
-) -> Result<(), AppError> {
+) -> Result<AfterInstall, AppError> {
     if paused || cap == 0 {
-        return Ok(());
+        return Ok(AfterInstall::Skipped);
     }
-    let media = match probe_media(exec, dest).await {
-        Ok(m) => m,
-        Err(_) => return Ok(()),
-    };
+    let media = probe_media(exec, dest)
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("probe_error: {err}")))?;
     match classify(title_id.kind(), &media) {
         EncodeDecision::NvencH264 => {}
-        EncodeDecision::Keep | EncodeDecision::Refuse => return Ok(()),
+        EncodeDecision::Keep | EncodeDecision::Refuse => return Ok(AfterInstall::Skipped),
     }
     let encode = store
         .create_job(JobKind::Encode, title_id, Some(pull.id()))
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
     if !encode_ready(&encode, Some(pull), true) {
-        return Ok(());
+        return Ok(AfterInstall::Skipped);
     }
-    encode_one(exec, store, library_root, &encode, ffmpeg).await
+    encode_one(exec, store, library_root, &encode, ffmpeg).await?;
+    Ok(AfterInstall::Ran)
 }
 
 async fn encode_one(
@@ -598,6 +604,54 @@ mod tests {
         assert_eq!(files.len(), 1, "scan walks movies/ only: {files:?}");
         assert_eq!(files[0]["title_id"], "movie:tmdb:603");
         assert_eq!(files[0]["decision"], "nvenc_h264");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct FailExec;
+
+    impl ExecPort for FailExec {
+        async fn run(&self, command: &ExecCommand) -> Result<ExecOutput, ExecError> {
+            Err(ExecError::Failed {
+                program: command.program.clone(),
+                message: "boom".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_ffprobe_error_is_not_keep() {
+        let dir = crate::test_support::scratch("encode-scan-probe-err");
+        let library = crate::test_support::library_root(&dir);
+        write_schema(&library, crate::test_support::MOVIE_REL);
+        let db = dir.join("state.db");
+        let err = scan(&FailExec, true, Some(library), Some(db))
+            .await
+            .expect_err("probe");
+        let msg = err.to_string();
+        assert!(msg.contains("probe_error"), "{msg}");
+        assert!(!msg.to_ascii_lowercase().contains("keep"), "{msg}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn after_install_ffprobe_error_is_not_silent_ok() {
+        let dir = crate::test_support::scratch("encode-after-probe-err");
+        let library = crate::test_support::library_root(&dir);
+        write_schema(&library, crate::test_support::MOVIE_REL);
+        let store = Store::open(dir.join("state.db")).await.expect("store");
+        let title_id = TitleId::movie("603").expect("id");
+        let pull = store
+            .create_job(JobKind::Pull, &title_id, None)
+            .await
+            .expect("pull");
+        let dest = library.join(crate::test_support::MOVIE_REL);
+        let err = after_install(
+            &FailExec, &store, &library, &title_id, &dest, &pull, "ffmpeg", 1, false,
+        )
+        .await
+        .expect_err("probe");
+        let msg = err.to_string();
+        assert!(msg.contains("probe_error"), "{msg}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

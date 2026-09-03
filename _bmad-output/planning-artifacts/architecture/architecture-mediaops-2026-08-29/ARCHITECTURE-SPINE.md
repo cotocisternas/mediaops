@@ -132,7 +132,7 @@ flowchart TB
 
 - **Binds:** CAP-4; transfer, core
 - **Prevents:** two incompatible resume formats; a "completed" range that never hit disk; GC misjudging what is sacred
-- **Rule:** staging writes `<final-name>.partial` plus sidecar `<final-name>.partial.b3` (JSON with a version field: `{file_len, range_len, ranges:[{offset, len, blake3}]}`) — **all sidecar lengths and offsets are bytes**, and resume uses the sidecar's `range_len`, never the current config's (AD-9's plan-carries-config principle extended to the sidecar). A range counts completed only after its bytes are fsynced **and** its hash is recorded. Install = whole-file BLAKE3 over the staged file, atomic rename into the schema path via the install gate, digest recorded in `title_index`. **Staging layout is fixed:** `_incoming/<TitleId serialized>/<final-name>.partial{,.b3}`, rendered by exactly one function `core::pathschema::staging_path`; `transfer` (write), `sync` (resume scan), GC/empty-dir prune, and `library bootstrap` (mkdir) all call it. The prune spare rule: any dir under `_incoming/` containing `*.partial*` is sacred — a sidecar-only dir counts; stale-staging GC is an explicit command, never implicit.
+- **Rule:** staging writes `<final-name>.partial` plus sidecar `<final-name>.partial.b3` (JSON with a version field: `{file_len, range_len, ranges:[{offset, len, blake3}]}`) — **all sidecar lengths and offsets are bytes**, and resume uses the sidecar's `range_len`, never the current config's (AD-9's plan-carries-config principle extended to the sidecar). A range counts completed only after its bytes are fsynced **and** its hash is recorded. Install = whole-file BLAKE3 over the staged file, atomic rename into the schema path via the install gate, digest recorded in `title_index`. **Staging layout is fixed:** `_incoming/<TitleId::staging_token()>/<final-name>.partial{,.b3}` (hyphen form, e.g. `movie-tmdb-603`), rendered by exactly one function `core::pathschema::staging_path`; `transfer` (write), `sync` (resume scan), GC/empty-dir prune, and `library bootstrap` (mkdir) all call it. The prune spare rule: any dir under `_incoming/` containing `*.partial*` is sacred — a sidecar-only dir counts; stale-staging GC is an explicit command, never implicit.
 
 ### AD-12 — Parallelism = channel pool, never one TCP
 
@@ -156,7 +156,7 @@ flowchart TB
 
 - **Binds:** CAP-2, CAP-3, CAP-8, CAP-9, CAP-12; arr
 - **Prevents:** untestable clients; per-app mocking styles; cassettes that can't express the named failures
-- **Rule:** the `arr` crate speaks HTTP only through an `HttpTransport` trait. Production impl is reqwest, linked only inside `mediaopsd`. Tests replay recorded cassettes (JSON request/response fixtures) through the same trait; every named grabber failure in failure-history-tests.md gets a cassette.
+- **Rule:** the `arr` crate speaks HTTP only through an `HttpTransport` trait. Production impl is reqwest, a direct dependency of `mediaops-arr` (AD-2). Only `mediaopsd` constructs `ReqwestTransport`. Tests replay recorded cassettes (JSON request/response fixtures) through the same trait; every named grabber failure in failure-history-tests.md gets a cassette.
 
 ### AD-16 — External binaries through one exec port
 

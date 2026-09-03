@@ -162,7 +162,8 @@ fn verify_recorded_ranges(mut sidecar: Sidecar, partial: &Path) -> Result<Sideca
     let mut file = File::open(partial).map_err(|err| TransferError::io(partial, err))?;
     let mut kept = Vec::new();
     for range in sidecar.ranges.drain(..) {
-        let mut buf = vec![0_u8; range.len as usize];
+        let n = sidecar::range_buf_len(sidecar.file_len, range.offset, range.len)?;
+        let mut buf = vec![0_u8; n];
         if file.seek(SeekFrom::Start(range.offset)).is_err() {
             continue;
         }
@@ -262,6 +263,58 @@ mod tests {
         let mut leftover = out.staged.clone();
         leftover.as_mut_os_string().push(".partial");
         assert!(!leftover.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn resume_oob_sidecar_range_is_sidecar_error() {
+        let root = scratch("resume-oob");
+        let title = TitleId::movie("603").expect("id");
+        let rel = staging_path(&title, "The.Matrix.(1999).mkv").expect("staging");
+        let staged = root.join(&rel);
+        let mut partial = staged.clone();
+        partial.as_mut_os_string().push(".partial");
+        let mut sidecar_path = staged.clone();
+        sidecar_path.as_mut_os_string().push(".partial.b3");
+        fs::create_dir_all(partial.parent().expect("parent")).expect("mkdir");
+        let body = b"abcdefghij".to_vec();
+        {
+            let mut f = File::create(&partial).expect("partial");
+            f.set_len(body.len() as u64).expect("len");
+            f.write_all(&body).expect("write");
+            f.sync_all().expect("sync");
+        }
+        fs::write(
+            &sidecar_path,
+            r#"{"version":1,"file_len":10,"range_len":4,"ranges":[{"offset":0,"len":999,"blake3":"abc"}]}"#,
+        )
+        .expect("sidecar");
+
+        let src = Arc::new(Mem {
+            body: body.clone(),
+            hits: Mutex::new(Vec::new()),
+        });
+        let spec = PullSpec {
+            library_root: root.clone(),
+            title_id: title,
+            final_name: "The.Matrix.(1999).mkv".into(),
+            remote: remote(),
+            file_len: body.len() as u64,
+            range_len: 4,
+            concurrency: 1,
+        };
+        let err = match pull_file(src.clone(), &spec).await {
+            Err(err) => err,
+            Ok(_) => panic!("OOB sidecar must fail"),
+        };
+        assert!(
+            matches!(err, TransferError::Sidecar(_)),
+            "OOB sidecar must be Sidecar, got {err}"
+        );
+        assert!(
+            src.hits.lock().expect("hits").is_empty(),
+            "must not allocate/fetch after OOB sidecar"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

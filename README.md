@@ -4,17 +4,23 @@ Home-disk library of record plus a disposable seedbox. The CLI (`mediaops`) talk
 
 This repo is a Cargo workspace. The product contract lives under `_bmad-output/specs/spec-mediaops/`. This file is how to build and run it.
 
+Story commits put the story key in the subject as `N-M` (hyphen, e.g. `2-1`), so `git_evidence.py --stories` can attribute. Do not rewrite published commits to backfill old subjects.
+
 ## Requirements
 
 - Rust **1.98** (`rust-toolchain.toml` pins it)
 - `protobuf-compiler` (`protoc`) — `crates/proto` builds the gRPC stubs
 - A lockfile-aware Cargo (`make` passes `--locked`)
+- `musl-tools` + `cmake` — only for `make musl` (not `make test`)
 
 On Debian/Arch:
 
 ```bash
 sudo apt-get install -y protobuf-compiler   # Debian/Ubuntu
 # sudo pacman -S protobuf                    # Arch
+# make musl only:
+sudo apt-get install -y musl-tools cmake    # Debian/Ubuntu (`musl-gcc`)
+# sudo pacman -S musl cmake                  # Arch (may ship x86_64-linux-musl-gcc as an alias)
 ```
 
 ## Make targets
@@ -31,7 +37,8 @@ make clippy
 make fmt
 make mediaops ARGS='--help'
 make daemon  ARGS='--help'
-make ci            # fetch + test --offline --locked (same as GitHub Actions)
+make ci            # fetch + test --offline --locked, then make musl (same as GitHub Actions)
+make musl          # link musl-static mediaopsd (needs musl-gcc + cmake; not part of make test)
 make install       # both binaries into ~/.cargo/bin
 ```
 

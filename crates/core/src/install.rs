@@ -30,7 +30,7 @@ impl AsRef<Path> for InstallOutcome {
     }
 }
 
-/// Verified file under `_incoming/<TitleId>/…`.
+/// Verified file under `_incoming/<TitleId::staging_token()>/…`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedStagingHandle {
     source: PathBuf,

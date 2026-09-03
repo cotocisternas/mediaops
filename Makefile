@@ -15,7 +15,7 @@ endif
 .DEFAULT_GOAL := help
 
 .PHONY: help fetch build release check test test-arch test-live coverage clippy fmt fmt-check \
-	run mediaops daemon ci install clean
+	run mediaops daemon musl ci install clean
 
 help: ## Show this list
 	@awk 'BEGIN {FS = ":.*##"; printf "mediaops\n\nTargets:\n"} \
@@ -63,8 +63,12 @@ mediaops: ## cargo run -p mediaops -- $(ARGS)
 daemon: ## cargo run -p mediaopsd -- $(ARGS)
 	$(CARGO) run -p $(PKG_DAEMON) $(CARGO_FLAGS) -- $(if $(ARGS),$(ARGS),--help)
 
+musl: ## Link musl-static mediaopsd (needs musl-gcc from musl-tools + cmake). Not part of make test.
+	$(CARGO) build --release --target x86_64-unknown-linux-musl -p $(PKG_DAEMON) --bin $(PKG_DAEMON) $(CARGO_FLAGS)
+
 ci: fetch ## Same sequence as .github/workflows/ci.yml
 	$(CARGO) test --locked --offline --workspace
+	$(MAKE) musl OFFLINE=1
 
 install: ## Install mediaops and mediaopsd into ~/.cargo/bin
 	$(CARGO) install --path bins/mediaops --locked --force

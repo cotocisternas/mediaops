@@ -3,10 +3,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    Action, ControlPort, DesiredState, Envelope, HoldDecision, JobState, Plan, Probe, TitleId,
-    WantState, free_bytes,
+    Action, ControlPort, DesiredState, Envelope, ExecPort, HoldDecision, JobState, Plan, Probe,
+    TitleId, WantState, free_bytes,
 };
-use mediaops_ssh::SystemExec;
 use mediaops_store::Store;
 use mediaops_sync::{ApplyCtx, ApplyError, PlanRequest, apply, plan_actions, scan_schema_files};
 use mediaops_transfer::{
@@ -16,6 +15,7 @@ use serde::Serialize;
 
 use crate::AppError;
 use crate::bootstrap;
+use crate::encode_cmd::AfterInstall;
 
 #[derive(Debug, Serialize)]
 struct PlanData {
@@ -25,11 +25,19 @@ struct PlanData {
 }
 
 #[derive(Debug, Serialize)]
+struct EncodeData {
+    ran: usize,
+    skipped: usize,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct RunData {
     path: String,
     copies: usize,
     skips: usize,
     installed: Vec<String>,
+    encode: EncodeData,
 }
 
 struct PreparedPlan {
@@ -78,6 +86,7 @@ pub async fn cmd_plan(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn cmd_run(
+    exec: &impl ExecPort,
     json: bool,
     state_db: Option<PathBuf>,
     desired_state: Option<PathBuf>,
@@ -166,6 +175,11 @@ pub async fn cmd_run(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "ffmpeg".into());
     let cap = mediaops_encode::session_cap(ds.max_nvenc(), nvenc_cap, nvenc_cap > 0);
+    let mut encode = EncodeData {
+        ran: 0,
+        skipped: 0,
+        error: None,
+    };
     for inst in &report.installed {
         if let Some(pull) = prepared
             .store
@@ -173,8 +187,8 @@ pub async fn cmd_run(
             .await
             .map_err(runtime_display)?
         {
-            let _ = crate::encode_cmd::after_install(
-                &SystemExec,
+            match crate::encode_cmd::after_install(
+                exec,
                 &prepared.store,
                 &prepared.library_root,
                 &inst.title_id,
@@ -184,7 +198,18 @@ pub async fn cmd_run(
                 cap,
                 paused,
             )
-            .await;
+            .await
+            {
+                Ok(AfterInstall::Ran) => encode.ran += 1,
+                Ok(AfterInstall::Skipped) => encode.skipped += 1,
+                Err(err) => {
+                    encode.error = Some(err.to_string());
+                    let _ = std::fs::remove_file(&prepared.path);
+                    return Err(err);
+                }
+            }
+        } else {
+            encode.skipped += 1;
         }
     }
 
@@ -198,6 +223,7 @@ pub async fn cmd_run(
             .iter()
             .map(|i| i.path.display().to_string())
             .collect(),
+        encode,
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
@@ -506,6 +532,7 @@ mod tests {
         crate::test_support::seed_probe(&store, &lb.fingerprint).await;
         let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
         let json = cmd_run(
+            &mediaops_ssh::TranscriptExec::new(),
             true,
             Some(dir.join("state.db")),
             Some(ds),
@@ -530,6 +557,142 @@ mod tests {
             .expect("title")
             .expect("indexed");
         assert!(!title.path_missing());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    const HEVC10: &str = r#"{
+        "streams": [{
+            "codec_type": "video",
+            "codec_name": "hevc",
+            "width": 1920,
+            "height": 1080,
+            "bits_per_raw_sample": "10",
+            "pix_fmt": "yuv420p10le",
+            "color_transfer": "bt709"
+        }],
+        "format": { "format_name": "mp4" }
+    }"#;
+
+    struct EncodeTranscript {
+        stdout: String,
+        write_converting: bool,
+        fail_probe: bool,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ExecPort for EncodeTranscript {
+        async fn run(
+            &self,
+            command: &mediaops_core::ExecCommand,
+        ) -> Result<mediaops_core::ExecOutput, mediaops_core::ExecError> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(command.program.clone());
+            if self.fail_probe && command.program_name() == "ffprobe" {
+                return Err(mediaops_core::ExecError::Failed {
+                    program: command.program.clone(),
+                    message: "boom".into(),
+                });
+            }
+            if command.program_name() == "ffmpeg" && self.write_converting {
+                if let Some(out) = command.args.last() {
+                    let path = std::path::PathBuf::from(out);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).expect("mkdir");
+                    }
+                    std::fs::write(&path, b"encoded-h264").expect("converting");
+                }
+            }
+            Ok(mediaops_core::ExecOutput {
+                status: 0,
+                stdout: self.stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cmd_run_after_install_reports_encode_and_changes_current_b3() {
+        let _serial = crate::test_support::serial_net();
+        let lb =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"abcdefghij")
+                .await;
+        let dir = crate::test_support::scratch("run-encode");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        store.put_machine("nvenc_cap", "1").await.expect("cap");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let exec = EncodeTranscript {
+            stdout: HEVC10.into(),
+            write_converting: true,
+            fail_probe: false,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let json = cmd_run(
+            &exec,
+            true,
+            Some(dir.join("state.db")),
+            Some(ds),
+            Some(library.clone()),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect("run");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true, "{json}");
+        assert_eq!(value["data"]["encode"]["ran"], 1, "{json}");
+        assert_eq!(value["data"]["encode"]["error"], serde_json::Value::Null);
+        let title = store
+            .get_title(&TitleId::movie("603").expect("id"))
+            .await
+            .expect("title")
+            .expect("indexed");
+        assert_ne!(
+            title.current_b3().as_str(),
+            title.install_b3().as_str(),
+            "current_b3 must change after nvenc replace"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cmd_run_after_install_ffprobe_error_fails_visibly() {
+        let _serial = crate::test_support::serial_net();
+        let lb =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"abcdefghij")
+                .await;
+        let dir = crate::test_support::scratch("run-encode-probe-err");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        store.put_machine("nvenc_cap", "1").await.expect("cap");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let exec = EncodeTranscript {
+            stdout: HEVC10.into(),
+            write_converting: false,
+            fail_probe: true,
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let err = cmd_run(
+            &exec,
+            true,
+            Some(dir.join("state.db")),
+            Some(ds),
+            Some(library),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect_err("probe");
+        let msg = err.to_string();
+        assert!(msg.contains("probe_error"), "{msg}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -603,6 +766,82 @@ mod tests {
             "Copy must land on PathSchema, not the scene name: {dest}"
         );
         assert_eq!(copy["remote"]["rel_path"], scene);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cmd_run_approved_hold_installs_schema_path_not_scene_name() {
+        let _serial = crate::test_support::serial_net();
+        let scene = "The.Matrix.1999.REPACK.mkv";
+        let mut item = mediaops_core::HoldLiveItem::new(
+            mediaops_core::HoldKey::new(
+                TitleId::movie("603").expect("id"),
+                mediaops_core::ReleaseId::parse("deadbeef").expect("id"),
+            ),
+            1,
+            10,
+            "blocked",
+        );
+        item.remote = Some(
+            mediaops_core::RemoteRef::from_wire_parts(
+                "seedbox".into(),
+                std::path::PathBuf::from(scene),
+            )
+            .expect("ref"),
+        );
+        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
+        let dir = crate::test_support::scratch("run-hold");
+        let library = crate::test_support::library_root(&dir);
+        let schema = mediaops_core::render(
+            &TitleId::movie("603").expect("id"),
+            &mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"),
+        )
+        .expect("schema");
+        assert!(!library.join(&schema).exists(), "approve must not install");
+        let lb = crate::test_support::start_pair_with_grab_ops(
+            mediaops_core::Grabber::Servarr,
+            Some(std::sync::Arc::new(HoldGrabOps {
+                items: vec![item.clone()],
+            })),
+        )
+        .await;
+        std::fs::write(lb.remote_root.join(scene), b"abcdefghij").expect("scene file");
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        store.put_machine("nvenc_cap", "0").await.expect("cap");
+        store
+            .put_hold(&item.key, HoldDecision::Approved)
+            .await
+            .expect("put");
+        assert!(
+            !library.join(&schema).exists(),
+            "Approved hold must not install until exclusive run"
+        );
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = cmd_run(
+            &mediaops_ssh::TranscriptExec::new(),
+            true,
+            Some(dir.join("state.db")),
+            Some(ds),
+            Some(library.clone()),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect("run");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true, "{json}");
+        let installed = value["data"]["installed"].as_array().expect("installed");
+        assert_eq!(installed.len(), 1, "{json}");
+        let path = installed[0].as_str().expect("path");
+        assert!(
+            path.contains("The.Matrix.(1999)") && !path.contains("REPACK"),
+            "library path must be PathSchema without leftover scene tag: {path}"
+        );
+        assert!(!path.contains(scene), "{path}");
+        assert!(std::path::Path::new(path).is_file(), "{path}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

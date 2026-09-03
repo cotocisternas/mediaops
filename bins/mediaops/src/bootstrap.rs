@@ -14,7 +14,9 @@ use mediaops_ssh::{
     refuse_git_work_tree, systemd_user_unit,
 };
 use mediaops_store::Store;
-use mediaops_transfer::{IdentityBundle, connect_home, mint, probe_range, probe_range_n};
+use mediaops_transfer::{
+    HomeChannel, IdentityBundle, connect_home, connect_tcp, mint, probe_range, probe_range_n,
+};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,8 @@ pub struct BootstrapArgs {
     pub address: Option<String>,
     pub skip_probe: bool,
     pub roots: Vec<(String, PathBuf)>,
+    pub socket: PathBuf,
+    pub skip_edge: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,7 +177,15 @@ pub async fn bootstrap(
         }
     };
 
-    let reuse_tls = tls_bundle_on_disk(&tls_dir);
+    let reuse_tls = match tls_bundle_state(&tls_dir)? {
+        TlsDisk::Complete => true,
+        TlsDisk::Empty => false,
+        TlsDisk::Partial => {
+            return Err(BootstrapError::Policy(
+                "tls/ is a partial bundle; refusing to remint or overwrite".into(),
+            ));
+        }
+    };
     let bundle = if reuse_tls {
         IdentityBundle::from_dir(&tls_dir).map_err(|err| BootstrapError::Io(err.to_string()))?
     } else {
@@ -246,16 +258,25 @@ pub async fn bootstrap(
         }
     };
 
-    if let Ok(channel) = connect_home(&default_socket(), &tls_dir).await {
-        let control = ControlPortClient::new(ControlClient::new(channel));
-        if let Ok(edge) = control.edge_check().await
-            && !edge.invariant_ok
-        {
-            return Err(BootstrapError::Policy(format!(
-                "edge check after install drifted: {}",
-                edge.drift
-            )));
-        }
+    if !args.skip_edge {
+        let control = match connect_control_uds(&args.socket, &tls_dir).await {
+            Ok(c) => c,
+            Err(uds_err) => {
+                let sock = resolve_socket_addr(&address)?;
+                let client = bundle
+                    .client_config()
+                    .map_err(|err| BootstrapError::Io(err.to_string()))?;
+                let channel = connect_tcp(sock, client)
+                    .await
+                    .map_err(|err| BootstrapError::Io(format!("{uds_err}; tcp fallback: {err}")))?;
+                let c = ControlPortClient::new(ControlClient::new(channel));
+                c.df()
+                    .await
+                    .map_err(|err| BootstrapError::Io(err.message))?;
+                c
+            }
+        };
+        persist_edge_fingerprint(&store, &control, "install").await?;
     }
 
     drop(lock_file);
@@ -299,22 +320,9 @@ pub async fn upgrade(
     let mut skew = None;
     let mut fingerprint = None;
     if !args.skip_edge {
-        let mut last = String::from("connect failed");
-        let mut control = None;
-        for _ in 0..30 {
-            match connect_home(&args.socket, &args.tls_dir).await {
-                Ok(channel) => {
-                    let c = ControlPortClient::new(ControlClient::new(channel));
-                    if c.df().await.is_ok() {
-                        control = Some(c);
-                        break;
-                    }
-                }
-                Err(err) => last = err.to_string(),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        let control = control.ok_or(BootstrapError::Io(last))?;
+        let control = connect_control_uds(&args.socket, &args.tls_dir)
+            .await
+            .map_err(BootstrapError::Io)?;
         let df = control
             .df()
             .await
@@ -323,24 +331,10 @@ pub async fn upgrade(
         if let Some(msg) = &skew {
             tracing::warn!("{msg}");
         }
-        let edge = control
-            .edge_check()
-            .await
-            .map_err(|err| BootstrapError::Policy(err.message))?;
-        if !edge.invariant_ok {
-            return Err(BootstrapError::Policy(format!(
-                "edge check after upgrade drifted: {}",
-                edge.drift
-            )));
-        }
-        fingerprint = Some(edge.fingerprint.clone());
         let store = Store::open(&args.state_db)
             .await
             .map_err(|err| BootstrapError::Io(err.to_string()))?;
-        store
-            .put_machine(crate::doctor::EDGE_FINGERPRINT_KEY, &edge.fingerprint)
-            .await
-            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+        fingerprint = Some(persist_edge_fingerprint(&store, &control, "upgrade").await?);
     }
     Ok(UpgradeReport {
         applied: true,
@@ -355,16 +349,90 @@ enum ProbePlan {
     Sweep,
 }
 
-fn tls_bundle_on_disk(dir: &Path) -> bool {
-    [
-        "ca.pem",
-        "server.pem",
-        "server.key",
-        "client.pem",
-        "client.key",
-    ]
-    .into_iter()
-    .all(|name| dir.join(name).is_file())
+const TLS_BUNDLE_NAMES: [&str; 5] = [
+    "ca.pem",
+    "server.pem",
+    "server.key",
+    "client.pem",
+    "client.key",
+];
+
+enum TlsDisk {
+    Empty,
+    Complete,
+    Partial,
+}
+
+fn tls_bundle_state(dir: &Path) -> Result<TlsDisk, BootstrapError> {
+    let present = TLS_BUNDLE_NAMES
+        .iter()
+        .filter(|name| dir.join(name).is_file())
+        .count();
+    if present == TLS_BUNDLE_NAMES.len() {
+        return Ok(TlsDisk::Complete);
+    }
+    if present > 0 {
+        return Ok(TlsDisk::Partial);
+    }
+    if !dir.is_dir() {
+        return Ok(TlsDisk::Empty);
+    }
+    // Listing failure is not Empty: reminting would clobber an unreadable tls/.
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            if rd.filter_map(Result::ok).next().is_some() {
+                Ok(TlsDisk::Partial)
+            } else {
+                Ok(TlsDisk::Empty)
+            }
+        }
+        Err(err) => Err(BootstrapError::Io(format!(
+            "cannot list tls/ {}: {err}",
+            dir.display()
+        ))),
+    }
+}
+
+async fn connect_control_uds(
+    socket: &Path,
+    tls_dir: &Path,
+) -> Result<ControlPortClient<HomeChannel>, String> {
+    let mut last = String::from("connect failed");
+    for _ in 0..30 {
+        match connect_home(socket, tls_dir).await {
+            Ok(channel) => {
+                let c = ControlPortClient::new(ControlClient::new(channel));
+                if c.df().await.is_ok() {
+                    return Ok(c);
+                }
+            }
+            Err(err) => last = err.to_string(),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    Err(last)
+}
+
+async fn persist_edge_fingerprint(
+    store: &Store,
+    control: &impl ControlPort,
+    when: &str,
+) -> Result<String, BootstrapError> {
+    let edge = control
+        .edge_check()
+        .await
+        .map_err(|err| BootstrapError::Policy(err.message))?;
+    if !edge.invariant_ok {
+        return Err(BootstrapError::Policy(format!(
+            "edge check after {when} drifted: {}",
+            edge.drift
+        )));
+    }
+    store
+        .put_machine(crate::doctor::EDGE_FINGERPRINT_KEY, &edge.fingerprint)
+        .await
+        .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    Ok(edge.fingerprint)
 }
 
 fn tls_identity_from_bundle(tls_dir: &Path, bundle: &IdentityBundle) -> TlsIdentity {
@@ -761,6 +829,8 @@ mod tests {
             address: None,
             skip_probe,
             roots: Vec::new(),
+            socket: dir.join("missing.sock"),
+            skip_edge: true,
         }
     }
 
@@ -822,6 +892,148 @@ mod tests {
         assert_eq!(ca, std::fs::read(tls.join("ca.pem")).expect("ca2"));
         let toml2 = std::fs::read_to_string(dir.join("desired-state.toml")).expect("ds2");
         assert_eq!(toml_text, toml2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn partial_tls_bundle_is_policy_and_leaves_files() {
+        let dir = scratch("tls-partial");
+        seed_probe(&dir.join("state.db"), 8).await;
+        let tls = dir.join("tls");
+        std::fs::create_dir_all(&tls).expect("tls");
+        let names = ["ca.pem", "server.pem", "server.key", "client.pem"];
+        for name in names {
+            std::fs::write(tls.join(name), name.as_bytes()).expect("pem");
+        }
+        let before: Vec<_> = names
+            .iter()
+            .map(|n| std::fs::read(tls.join(n)).expect("read"))
+            .collect();
+        let exec = TranscriptExec::new();
+        let err = bootstrap(args(&dir, true, true, ProviderKind::AlreadyThere), &exec)
+            .await
+            .expect_err("partial");
+        assert_eq!(err.exit_code(), ExitCode::PolicyRefusal);
+        assert!(err.to_string().contains("partial"), "{err}");
+        for (name, bytes) in names.iter().zip(before.iter()) {
+            assert_eq!(
+                &std::fs::read(tls.join(name)).expect("still"),
+                bytes,
+                "{name} must be unchanged"
+            );
+        }
+        assert!(!tls.join("client.key").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_persists_edge_fingerprint_when_control_is_up() {
+        let _g = crate::test_support::serial_net();
+        let dir = crate::test_support::scratch("boot-edge-up");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let lb = crate::test_support::start_pair(None, b"").await;
+        let tls = dir.join("tls");
+        std::fs::create_dir_all(&tls).expect("tls");
+        for name in TLS_BUNDLE_NAMES {
+            std::fs::copy(lb.tls_dir.join(name), tls.join(name)).expect("copy pem");
+        }
+        seed_probe(&dir.join("state.db"), 4).await;
+        let mut boot = args(&dir, true, true, ProviderKind::AlreadyThere);
+        boot.desired_state = ds;
+        boot.socket = lb.sock.clone();
+        boot.skip_edge = false;
+        let exec = TranscriptExec::new();
+        let report = bootstrap(boot, &exec).await.expect("apply");
+        assert!(report.applied);
+        let store = crate::test_support::open_store(&dir).await;
+        let pin = store
+            .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+            .await
+            .expect("pin")
+            .expect("persisted");
+        assert!(!pin.is_empty(), "edge fingerprint must be persisted");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_edge_check_falls_back_to_seedbox_tcp_without_home_uds() {
+        let _g = crate::test_support::serial_net();
+        let dir = crate::test_support::scratch("boot-edge-tcp");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let lb = crate::test_support::start_pair(None, b"").await;
+        let tls = dir.join("tls");
+        std::fs::create_dir_all(&tls).expect("tls");
+        for name in TLS_BUNDLE_NAMES {
+            std::fs::copy(lb.tls_dir.join(name), tls.join(name)).expect("copy pem");
+        }
+        let store = crate::test_support::open_store(&dir).await;
+        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
+        let mut boot = args(&dir, true, true, ProviderKind::AlreadyThere);
+        boot.desired_state = ds;
+        boot.socket = dir.join("no-home.sock");
+        boot.skip_edge = false;
+        boot.address = Some(lb.tcp_addr.to_string());
+        let exec = TranscriptExec::new();
+        let report = bootstrap(boot, &exec).await.expect("tcp fallback");
+        assert!(report.applied);
+        let pin = store
+            .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+            .await
+            .expect("pin")
+            .expect("persisted");
+        assert!(!pin.is_empty(), "edge fingerprint must be persisted");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tls_dir_unlistable_is_io_not_remint() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("tls-unlistable");
+        seed_probe(&dir.join("state.db"), 8).await;
+        let tls = dir.join("tls");
+        std::fs::create_dir_all(&tls).expect("tls");
+        let restore = || {
+            let _ = std::fs::set_permissions(&tls, std::fs::Permissions::from_mode(0o700));
+        };
+        std::fs::set_permissions(&tls, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read_dir(&tls).is_ok() {
+            restore();
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+        let exec = TranscriptExec::new();
+        let err = bootstrap(args(&dir, true, true, ProviderKind::AlreadyThere), &exec)
+            .await
+            .expect_err("unlistable");
+        restore();
+        assert!(
+            matches!(err, BootstrapError::Io(_)),
+            "unlistable tls/ must be Io, not remint: {err}"
+        );
+        assert!(
+            !tls.join("ca.pem").exists(),
+            "must not remint into unlistable tls/"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_control_does_not_report_applied() {
+        let dir = scratch("boot-edge-down");
+        seed_probe(&dir.join("state.db"), 4).await;
+        let mut boot = args(&dir, true, true, ProviderKind::AlreadyThere);
+        boot.skip_edge = false;
+        boot.socket = dir.join("no-such.sock");
+        boot.address = Some("127.0.0.1:1".into());
+        let exec = TranscriptExec::new();
+        let err = bootstrap(boot, &exec)
+            .await
+            .expect_err("control down must not apply");
+        assert!(
+            !matches!(err, BootstrapError::NeedsConfirm(_)),
+            "must not be a confirm skip: {err}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

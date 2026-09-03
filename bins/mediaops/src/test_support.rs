@@ -1,6 +1,7 @@
 //! In-process seedbox + home gateway for CLI unit tests. Loopback only.
 
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -48,6 +49,7 @@ pub struct Loopback {
     pub tls_dir: PathBuf,
     pub remote_root: PathBuf,
     pub fingerprint: String,
+    pub tcp_addr: SocketAddr,
     seed_task: tokio::task::JoinHandle<()>,
     uds_task: tokio::task::JoinHandle<()>,
 }
@@ -141,6 +143,7 @@ async fn start_pair_with(
         tls_dir,
         remote_root,
         fingerprint,
+        tcp_addr: addr,
         seed_task,
         uds_task,
     };

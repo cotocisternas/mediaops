@@ -35,9 +35,9 @@ Import-blocked is a product feature, not a junk drawer. This epic makes blocked 
 
 **Lock classes.** `hold list`, `hold approve`, and `hold reject` are lock-free: they may only perform single-transaction row writes through `store`. Exclusive flock stays on plan/apply/run, install, encode, reclaim apply, repair, bootstrap. The flock-holding CLI is the only executor of install/encode; home mediaopsd never writes staging or library paths. Approve records a decision; promotion through `install` happens on the exclusive apply path. `Review` already exists on the Plan `Action` enum; this epic is the inbox that feeds it, not a second action type.
 
-**Install gate.** Library paths have exactly two writers: `install` and `replace`. Staging is `_incoming/<TitleId>/…` from `core::pathschema::staging_path` — that tree is pull staging (sacred `*.partial*`), not the hold inbox.
+**Install gate.** Library paths have exactly two writers: `install` and `replace`. Staging is `_incoming/<TitleId::staging_token()>/…` (hyphen form, e.g. `movie-tmdb-603`) from `core::pathschema::staging_path` — that tree is pull staging (sacred `*.partial*`), not the hold inbox.
 
-**Grabber port.** All *arr / SAB / qBit HTTP goes through `HttpTransport`; the reqwest impl is daemon-only; tests replay cassettes. ffprobe (inbox context) goes through the shared exec port, not a lib binding.
+**Grabber port.** All *arr / SAB / qBit HTTP goes through `HttpTransport`; reqwest is a direct dependency of `mediaops-arr`; only mediaopsd constructs `ReqwestTransport`. Tests replay cassettes. ffprobe (inbox context) goes through the shared exec port, not a lib binding.
 
 **Exits.** `core` owns ExitCode: 0 ok, 1 runtime, 2 usage, 3 lock conflict, 4 drift/verify, 5 policy refusal. Libraries never `exit`.
 

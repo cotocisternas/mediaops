@@ -590,6 +590,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 address,
                 skip_probe,
                 roots,
+                socket: bootstrap::default_socket(),
+                skip_edge: false,
             };
             match bootstrap::bootstrap(args, &SystemExec).await {
                 Ok(report) => {
@@ -715,6 +717,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             plans_dir,
         }) => {
             let line = run::cmd_run(
+                &SystemExec,
                 cli.json,
                 state_db,
                 desired_state,

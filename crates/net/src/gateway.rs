@@ -281,13 +281,10 @@ mod tests {
     use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
     use std::io::Write;
     use std::path::Path;
-    use std::sync::Mutex;
     use tokio::net::{TcpListener, UnixListener};
 
-    static NET_TEST: Mutex<()> = Mutex::new(());
-
     fn serial_net() -> std::sync::MutexGuard<'static, ()> {
-        NET_TEST.lock().unwrap_or_else(|e| e.into_inner())
+        crate::serial_net()
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -517,6 +514,107 @@ mod tests {
             .await;
         let err = fourth.expect_err("n+1 must be refused");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        drop(held);
+
+        seed_task.abort();
+        uds_task.abort();
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Collapsing all Range RPCs onto one TCP (failure-history-tests.md).
+    /// N concurrent UDS GetRange streams hold N WAN slots; N+1 is ResourceExhausted
+    /// and GetRange must not open extra WAN TCP.
+    #[tokio::test]
+    async fn n_concurrent_uds_get_range_streams_exhaust_n_plus_one() {
+        let _serial = serial_net();
+        let root = scratch("uds-n-range");
+        // Sparse file large enough that unread UDS GetRange hits HTTP/2 window
+        // backpressure and keeps GuardedRange (the WAN slot) alive.
+        let hold_len = 32 * 1024 * 1024u64;
+        {
+            let path = root.join("a.bin");
+            let f = std::fs::File::create(&path).expect("create");
+            f.set_len(hold_len).expect("sparse");
+        }
+        let id = mint().expect("mint");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+        let addr = tcp.local_addr().expect("addr");
+        let seed = seedbox_for(root.clone());
+        let server = id.server_config().expect("server");
+        let seed_task = tokio::spawn(async move {
+            let _ = serve_tcp(tcp, server, seed).await;
+        });
+        let client = id.client_config().expect("client");
+        let _ = wait_tcp(addr, client.clone()).await;
+        let fingerprint = endpoint_fingerprint(&addr.to_string(), UnderlayMode::Direct);
+        let gateway = HomeGateway::connect(addr, client.clone(), fingerprint, 1)
+            .await
+            .expect("gw");
+        let sock = scratch("uds-n-range-sock").join("mediaops.sock");
+        let unix = UnixListener::bind(&sock).expect("bind uds");
+        let uds_server = id.server_config().expect("server");
+        let uds_task = tokio::spawn(async move {
+            let _ = serve_home_unix(unix, uds_server, gateway).await;
+        });
+        let ch = wait_unix(&sock, client).await;
+        let mut gateway = GatewayClient::new(ch.clone());
+        let configured = gateway
+            .configure_pool(ConfigurePoolRequest { n: 3 })
+            .await
+            .expect("configure")
+            .into_inner();
+        assert_eq!(configured.n, 3);
+
+        let mut transfer = TransferClient::new(ch.clone());
+        let list = transfer
+            .list(ListRequest {})
+            .await
+            .expect("list")
+            .into_inner();
+        let r#ref = list.entries[0].r#ref.clone();
+
+        let before_range = tcp_connect_count();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let stream = TransferClient::new(ch.clone())
+                .get_range(GetRangeRequest {
+                    r#ref: r#ref.clone(),
+                    offset: 0,
+                    len: hold_len,
+                })
+                .await
+                .expect("held uds GetRange");
+            held.push(stream);
+        }
+        assert_eq!(
+            tcp_connect_count() - before_range,
+            0,
+            "GetRange must not open extra WAN TCP (collapsing Range onto one TCP)"
+        );
+        let status = gateway
+            .pool_status(PoolStatusRequest {})
+            .await
+            .expect("status")
+            .into_inner();
+        assert_eq!(
+            status.n, 3,
+            "GetRange must not grow the WAN pool (collapsing Range onto one TCP)"
+        );
+        let fourth = TransferClient::new(ch.clone())
+            .get_range(GetRangeRequest {
+                r#ref: r#ref.clone(),
+                offset: 0,
+                len: hold_len,
+            })
+            .await;
+        let err = fourth.expect_err("n+1 must be refused");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            tcp_connect_count() - before_range,
+            0,
+            "N+1 GetRange must not open extra WAN TCP (collapsing Range onto one TCP)"
+        );
         drop(held);
 
         seed_task.abort();
