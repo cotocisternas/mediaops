@@ -226,6 +226,32 @@ enum HoldCommand {
         #[arg(long)]
         state_db: Option<PathBuf>,
     },
+    /// Persist Approved. Does not install; exclusive `run` copies later. Lock-free.
+    Approve {
+        title_id: String,
+        release_id: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
+    /// Persist Rejected and tell *arr never-this-release. Lock-free.
+    Reject {
+        title_id: String,
+        release_id: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -789,6 +815,54 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 },
         })) => {
             let line = hold::list(cli.json, socket, tls_dir, config_dir, state_db).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Hold(HoldArgs {
+            command:
+                HoldCommand::Approve {
+                    title_id,
+                    release_id,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                    state_db,
+                },
+        })) => {
+            let line = hold::decide(
+                cli.json,
+                mediaops_core::HoldDecision::Approved,
+                title_id,
+                release_id,
+                socket,
+                tls_dir,
+                config_dir,
+                state_db,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Hold(HoldArgs {
+            command:
+                HoldCommand::Reject {
+                    title_id,
+                    release_id,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                    state_db,
+                },
+        })) => {
+            let line = hold::decide(
+                cli.json,
+                mediaops_core::HoldDecision::Rejected,
+                title_id,
+                release_id,
+                socket,
+                tls_dir,
+                config_dir,
+                state_db,
+            )
+            .await?;
             write_stdout(&line)
         }
         Some(Command::Doctor {

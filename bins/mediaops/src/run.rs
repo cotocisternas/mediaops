@@ -3,8 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    Action, ControlPort, DesiredState, Envelope, JobState, Plan, Probe, TitleId, WantState,
-    free_bytes,
+    Action, ControlPort, DesiredState, Envelope, HoldDecision, JobState, Plan, Probe, TitleId,
+    WantState, free_bytes,
 };
 use mediaops_ssh::SystemExec;
 use mediaops_store::Store;
@@ -276,6 +276,14 @@ async fn prepare(
         .await
         .map_err(runtime_display)?;
     let edge_frozen = crate::doctor::is_frozen(&edge, last.as_deref());
+    let live = control.hold_list().await.map_err(runtime_display)?;
+    let mut approved = Vec::new();
+    for item in live {
+        if store.get_hold(&item.key).await.map_err(runtime_display)? == Some(HoldDecision::Approved)
+        {
+            approved.push(item);
+        }
+    }
     let planned = plan_actions(PlanRequest {
         listings: &listings,
         title_index: &title_index,
@@ -284,6 +292,7 @@ async fn prepare(
         desired: &ds,
         free_bytes: free,
         edge_frozen,
+        approved: &approved,
     });
     let plan = Plan::from_toml_bytes(toml_bytes)
         .map_err(runtime_display)?
@@ -522,5 +531,150 @@ mod tests {
             .expect("indexed");
         assert!(!title.path_missing());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cmd_plan_approved_hold_copies_schema_path_not_scene_name() {
+        let _serial = crate::test_support::serial_net();
+        let scene = "The.Matrix.1999.REPACK.mkv";
+        let mut item = mediaops_core::HoldLiveItem::new(
+            mediaops_core::HoldKey::new(
+                TitleId::movie("603").expect("id"),
+                mediaops_core::ReleaseId::parse("deadbeef").expect("id"),
+            ),
+            1,
+            10,
+            "blocked",
+        );
+        item.remote = Some(
+            mediaops_core::RemoteRef::from_wire_parts(
+                "seedbox".into(),
+                std::path::PathBuf::from(scene),
+            )
+            .expect("ref"),
+        );
+        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
+        let lb = crate::test_support::start_pair_with_grab_ops(
+            mediaops_core::Grabber::Servarr,
+            Some(std::sync::Arc::new(HoldGrabOps {
+                items: vec![item.clone()],
+            })),
+        )
+        .await;
+        std::fs::write(lb.remote_root.join(scene), b"abcdefghij").expect("scene file");
+        let dir = crate::test_support::scratch("plan-hold");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        store
+            .put_hold(&item.key, HoldDecision::Approved)
+            .await
+            .expect("put");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = cmd_plan(
+            true,
+            Some(dir.join("state.db")),
+            Some(ds),
+            Some(library),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect("plan");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true, "{json}");
+        let actions = value["data"]["actions"].as_array().expect("actions");
+        let copy = actions
+            .iter()
+            .find(|a| a["type"] == "copy")
+            .expect("copy action");
+        assert_eq!(copy["placement"]["title"], "The.Matrix");
+        assert_eq!(copy["placement"]["year"], 1999);
+        assert_eq!(copy["placement"]["extension"], "mkv");
+        let dest = mediaops_core::render(
+            &TitleId::movie("603").expect("id"),
+            &mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"),
+        )
+        .expect("schema");
+        let dest = dest.to_str().expect("utf8");
+        assert!(
+            dest.contains("The.Matrix.(1999)") && !dest.contains("REPACK"),
+            "Copy must land on PathSchema, not the scene name: {dest}"
+        );
+        assert_eq!(copy["remote"]["rel_path"], scene);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    struct HoldGrabOps {
+        items: Vec<mediaops_core::HoldLiveItem>,
+    }
+
+    impl mediaops_core::GrabOps for HoldGrabOps {
+        fn grab_apply<'a>(
+            &'a self,
+            _: &'a mediaops_core::DesiredState,
+        ) -> mediaops_core::BoxFuture<
+            'a,
+            Result<mediaops_core::GrabApplyReport, mediaops_core::ControlError>,
+        > {
+            Box::pin(async {
+                Ok(mediaops_core::GrabApplyReport {
+                    noop: true,
+                    diff: String::new(),
+                })
+            })
+        }
+        fn key_discovery(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<mediaops_core::KeyPresence, mediaops_core::ControlError>,
+        > {
+            Box::pin(async { Ok(mediaops_core::KeyPresence::default()) })
+        }
+        fn edge_api_check(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<mediaops_core::EdgeApiReport, mediaops_core::ControlError>,
+        > {
+            Box::pin(async {
+                Ok(mediaops_core::EdgeApiReport {
+                    fingerprint: String::new(),
+                    invariant_ok: true,
+                    drift: String::new(),
+                })
+            })
+        }
+        fn edge_apply<'a>(
+            &'a self,
+            _: &'a mediaops_core::DesiredState,
+        ) -> mediaops_core::BoxFuture<
+            'a,
+            Result<mediaops_core::GrabApplyReport, mediaops_core::ControlError>,
+        > {
+            Box::pin(async {
+                Ok(mediaops_core::GrabApplyReport {
+                    noop: true,
+                    diff: String::new(),
+                })
+            })
+        }
+        fn hold_list(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<Vec<mediaops_core::HoldLiveItem>, mediaops_core::ControlError>,
+        > {
+            let items = self.items.clone();
+            Box::pin(async move { Ok(items) })
+        }
+        fn hold_reject<'a>(
+            &'a self,
+            _: &'a mediaops_core::HoldKey,
+        ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 }

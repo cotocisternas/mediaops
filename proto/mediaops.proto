@@ -60,6 +60,7 @@ service Control {
   rpc KeyDiscovery(KeyDiscoveryRequest) returns (KeyDiscoveryResponse);
   rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
   rpc HoldList(HoldListRequest) returns (HoldListResponse);
+  rpc HoldReject(HoldRejectRequest) returns (HoldRejectResponse);
 }
 
 // Home UDS only. Seedbox mediaopsd does not serve this.
@@ -185,10 +186,52 @@ message HoldLiveItem {
   int64 added_unix = 3;
   uint64 size = 4;
   string reason = 5;
+  RemoteRef remote = 6;
+  Placement placement = 7;
 }
 
 message HoldListResponse {
   string semver = 1;
   string proto_package = 2;
   repeated HoldLiveItem items = 3;
+}
+
+message HoldRejectRequest {
+  string title_id = 1;
+  string release_id = 2;
+}
+
+message HoldRejectResponse {
+  string semver = 1;
+  string proto_package = 2;
+}
+
+message Placement {
+  oneof kind {
+    MoviePlacement movie = 1;
+    EpisodePlacement episode = 2;
+    TrackPlacement track = 3;
+  }
+}
+
+message MoviePlacement {
+  string title = 1;
+  uint32 year = 2;
+  string extension = 3;
+}
+
+message EpisodePlacement {
+  string title = 1;
+  uint32 year = 2;
+  uint32 season = 3;
+  uint32 episode = 4;
+  string extension = 5;
+}
+
+message TrackPlacement {
+  string album = 1;
+  uint32 year = 2;
+  uint32 track = 3;
+  string title = 4;
+  string extension = 5;
 }

@@ -705,6 +705,18 @@ fn hold_help_mentions_list() {
         stdout.contains("list"),
         "hold help must mention list: {stdout}"
     );
+    assert!(
+        stdout.contains("approve"),
+        "hold help must mention approve: {stdout}"
+    );
+    assert!(
+        stdout.contains("reject"),
+        "hold help must mention reject: {stdout}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("research"),
+        "omit hold research: {stdout}"
+    );
 }
 
 #[test]
@@ -755,6 +767,61 @@ fn hold_list_lock_free_json_empty_on_loopback() {
                 .next()
                 .is_none();
             assert!(empty, "{name} must not become a hold folder");
+        }
+        drop(lb);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn hold_approve_reject_unknown_key_is_usage_lock_free() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let _g = HOLD_NET.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("hold-cli-decide");
+        let library = dir.join("library");
+        for name in ["movies", "series", "music", "_incoming"] {
+            std::fs::create_dir_all(library.join(name)).expect("layout");
+        }
+        let lb = start_hold_loopback().await;
+        let lock_path = dir.join("mediaops.lock");
+        let file = std::fs::File::create(&lock_path).expect("lock file");
+        fs4::FileExt::try_lock(&file).expect("hold lock");
+        for verb in ["approve", "reject"] {
+            let output = bin()
+                .args([
+                    "--json",
+                    "hold",
+                    verb,
+                    "movie:tmdb:603",
+                    "deadbeef",
+                    "--socket",
+                    lb.sock.to_str().unwrap(),
+                    "--tls-dir",
+                    lb.tls_dir.to_str().unwrap(),
+                    "--state-db",
+                    dir.join("state.db").to_str().unwrap(),
+                ])
+                .output()
+                .expect(verb);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{verb} unknown key / grabber=none is usage, not lock conflict: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        drop(file);
+        for name in ["movies", "series", "music", "_incoming"] {
+            let empty = std::fs::read_dir(library.join(name))
+                .expect("read")
+                .next()
+                .is_none();
+            assert!(empty, "{name} must not be written by hold approve/reject");
         }
         drop(lb);
         let _ = std::fs::remove_dir_all(&dir);

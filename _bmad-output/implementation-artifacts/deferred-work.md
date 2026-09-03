@@ -66,3 +66,15 @@ Uncommitted Epic 3 working tree (home gateway, pull/resume, library bootstrap).
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-1-hold-store-and-inbox-join.md`
   summary: One unparsable title_id/release_id in holds_decisions fails the entire hold list.
   evidence: list_decided maps every row through TitleId::parse / ReleaseId::parse and returns StoreError on the first bad row.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-2-approve-and-reject.md`
+  summary: If HoldReject RPC fails after put(Rejected), the key has already left the inbox and cannot be retried.
+  evidence: Frozen spec order is put then Control hold_reject; no rollback.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-2-approve-and-reject.md`
+  summary: Approved holds without a live RemoteRef/placement are silently omitted from the plan (no Copy and no Skip).
+  evidence: plan_actions continues when remote or placement is missing; run only intersects current live holds.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-2-approve-and-reject.md`
+  summary: Concurrent lock-free approve/reject on the same HoldKey last-write-wins via ON CONFLICT upsert.
+  evidence: holds_decisions upserts decision; no insert-if-absent.

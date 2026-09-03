@@ -24,15 +24,15 @@ mod tests {
     use std::sync::Mutex;
 
     fn item(title: &str, release: &str) -> HoldLiveItem {
-        HoldLiveItem {
-            key: HoldKey::new(
+        HoldLiveItem::new(
+            HoldKey::new(
                 TitleId::parse(title).expect("title"),
                 ReleaseId::parse(release).expect("release"),
             ),
-            added_unix: 1_577_836_800,
-            size: 100,
-            reason: "No files found are eligible for import".into(),
-        }
+            1_577_836_800,
+            100,
+            "No files found are eligible for import",
+        )
     }
 
     #[test]
@@ -134,6 +134,9 @@ mod tests {
                 *self.calls.lock().expect("lock") += 1;
                 Ok(self.live.clone())
             })
+        }
+        fn hold_reject<'a>(&'a self, _: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 

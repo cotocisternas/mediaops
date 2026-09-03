@@ -12,6 +12,7 @@
       "totalRecords": 1,
       "records": [
         {
+          "id": 21,
           "title": "Inception.2010.nzb",
           "size": 4444,
           "protocol": "usenet",
@@ -20,7 +21,12 @@
           "statusMessages": [
             {"messages": ["Movie file is a sample"]}
           ],
-          "movie": {"tmdbId": 27205}
+          "movie": {
+            "tmdbId": 27205,
+            "title": "Inception",
+            "year": 2010,
+            "movieFile": {"relativePath": "Inception.2010.mkv"}
+          }
         }
       ]
     }

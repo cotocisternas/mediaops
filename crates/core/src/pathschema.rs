@@ -171,6 +171,37 @@ pub fn strip_scene_tags(name: &str) -> String {
     out
 }
 
+/// Strip scene tags from placement display tokens. Year / S/E / track stay put.
+pub fn strip_placement(placement: &Placement) -> Placement {
+    match placement {
+        Placement::Movie {
+            title,
+            year,
+            extension,
+        } => Placement::movie(strip_scene_tags(title), *year, extension),
+        Placement::Episode {
+            title,
+            year,
+            season,
+            episode,
+            extension,
+        } => Placement::episode(strip_scene_tags(title), *year, *season, *episode, extension),
+        Placement::Track {
+            album,
+            year,
+            track,
+            title,
+            extension,
+        } => Placement::track(
+            strip_scene_tags(album),
+            *year,
+            *track,
+            strip_scene_tags(title),
+            extension,
+        ),
+    }
+}
+
 /// Render a library-relative path from TitleId plus placement.
 pub fn render(title_id: &TitleId, placement: &Placement) -> Result<PathBuf, PathSchemaError> {
     match (title_id.kind(), placement) {

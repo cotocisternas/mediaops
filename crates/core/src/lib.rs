@@ -39,7 +39,10 @@ pub use desired_state::{
 pub use diff::{nginx_host_ok, panel_fingerprint, unified_diff};
 pub use digest::{Blake3Hex, DigestError};
 pub use exec::{ExecCommand, ExecError, ExecOutput, ExecPort, reject_bulk_copy};
-pub use hold::{HoldDecision, HoldError, HoldKey, HoldLiveItem, HoldsRepo, ReleaseId};
+pub use hold::{
+    HoldDecision, HoldError, HoldKey, HoldLiveItem, HoldsRepo, ReleaseId,
+    preflight_approve_placement,
+};
 pub use install::{
     InstallError, InstallOutcome, VerifiedConvertingHandle, VerifiedStagingHandle, free_bytes,
     install, replace,
@@ -50,7 +53,7 @@ pub use jobs::{
 };
 pub use pathschema::{
     GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, parse, parse_placement, render,
-    staging_path, strip_scene_tags,
+    staging_path, strip_placement, strip_scene_tags,
 };
 pub use plan::{
     Action, Plan, PlanError, SKIP_DUPLICATE_TITLE, SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER,
