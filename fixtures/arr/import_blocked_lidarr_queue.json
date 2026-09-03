@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/lidarr/api/v1/queue?includeArtist=true&includeAlbum=true&page=1&pageSize=200"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "page": 1,
+      "pageSize": 200,
+      "totalRecords": 1,
+      "records": [
+        {
+          "title": "Close.To.The.Edge.nzb",
+          "size": 3333,
+          "protocol": "usenet",
+          "trackedDownloadState": "importBlocked",
+          "added": "2020-01-05T00:00:00Z",
+          "statusMessages": [
+            {"messages": ["Not a valid audio file"]}
+          ],
+          "album": {"foreignAlbumId": "12345678-1234-1234-1234-123456789012"}
+        }
+      ]
+    }
+  }
+}

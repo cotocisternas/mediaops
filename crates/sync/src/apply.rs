@@ -936,6 +936,12 @@ mod tests {
         fn guard_preview(&self) -> mediaops_core::BoxFuture<'_, Result<(), ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn hold_list(
+            &self,
+        ) -> mediaops_core::BoxFuture<'_, Result<Vec<mediaops_core::HoldLiveItem>, ControlError>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[tokio::test]

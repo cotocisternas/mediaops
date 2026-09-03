@@ -59,6 +59,7 @@ service Control {
   rpc EdgeApply(EdgeApplyRequest) returns (EdgeApplyResponse);
   rpc KeyDiscovery(KeyDiscoveryRequest) returns (KeyDiscoveryResponse);
   rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
+  rpc HoldList(HoldListRequest) returns (HoldListResponse);
 }
 
 // Home UDS only. Seedbox mediaopsd does not serve this.
@@ -174,4 +175,20 @@ message GuardPreviewRequest {}
 message GuardPreviewResponse {
   string semver = 1;
   string proto_package = 2;
+}
+
+message HoldListRequest {}
+
+message HoldLiveItem {
+  string title_id = 1;
+  string release_id = 2;
+  int64 added_unix = 3;
+  uint64 size = 4;
+  string reason = 5;
+}
+
+message HoldListResponse {
+  string semver = 1;
+  string proto_package = 2;
+  repeated HoldLiveItem items = 3;
 }

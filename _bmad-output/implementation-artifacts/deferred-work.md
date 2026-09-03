@@ -48,3 +48,21 @@ Uncommitted Epic 3 working tree (home gateway, pull/resume, library bootstrap).
 - **`prune_dir` recursion is unbounded** (`crates/transfer/src/prune.rs:33`) — same class as the deferred walker depth issue. `_incoming` is operator-local and currently one title-id level deep.
 - **No systemd-user unit for `mediaopsd --role home`** — Story 3.3 only writes `mediaops-run.{service,timer}`. Overlay `list`/`pull` still assume the operator started the gateway by hand.
 - **NVENC stored cap is encoder presence (0/1), not a live session cap** (`crates/encode/src/lib.rs`) — keep 0/1 from `ffmpeg -encoders`; real GPU concurrency probe waits for Epic 4 encode.
+
+## Deferred from: spec split of epic 6 (2026-09-02)
+
+- source_spec: none
+  summary: Story 6.2 Approve and Reject — `hold approve` promotes through the install/schema gate; `hold reject` is never-this-release so *arr may try another.
+  evidence: Split from "all stories of epic 6" so 6.1 (hold store and inbox join) can ship first; 6.2 depends on HoldKey, holds_decisions, and the live ⊖ decided join.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-1-hold-store-and-inbox-join.md`
+  summary: One *arr queue HTTP error fails the whole HoldList instead of returning the other apps' import-blocked rows.
+  evidence: LocalhostGrabOps::hold_list returns on the first sonarr/radarr/lidarr queue error; fail-closed vs skip-that-app is unspecified.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-1-hold-store-and-inbox-join.md`
+  summary: Lock-free `hold list` can still hit sqlite busy_timeout because store has no WAL.
+  evidence: list_decisions shares state.db with exclusive apply; 5s busy_timeout; watch/status already read sqlite without flock.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-6-1-hold-store-and-inbox-join.md`
+  summary: One unparsable title_id/release_id in holds_decisions fails the entire hold list.
+  evidence: list_decided maps every row through TitleId::parse / ReleaseId::parse and returns StoreError on the first bad row.

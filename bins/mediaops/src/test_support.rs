@@ -2,9 +2,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use mediaops_core::{Allowlist, Grabber, Probe, UnderlayMode, endpoint_fingerprint};
+use mediaops_core::{Allowlist, GrabOps, Grabber, Probe, UnderlayMode, endpoint_fingerprint};
 use mediaops_store::Store;
 use mediaops_sync::ensure_layout;
 use mediaops_transfer::{
@@ -71,6 +71,22 @@ fn write_file(path: &Path, bytes: &[u8]) {
 }
 
 pub async fn start_pair(rel: Option<&str>, body: &[u8]) -> Loopback {
+    start_pair_with(rel, body, Grabber::None, None).await
+}
+
+pub async fn start_pair_with_grab_ops(
+    grabber: Grabber,
+    grab_ops: Option<Arc<dyn GrabOps>>,
+) -> Loopback {
+    start_pair_with(None, b"", grabber, grab_ops).await
+}
+
+async fn start_pair_with(
+    rel: Option<&str>,
+    body: &[u8],
+    grabber: Grabber,
+    grab_ops: Option<Arc<dyn GrabOps>>,
+) -> Loopback {
     let remote_root = scratch("remote");
     if let Some(rel) = rel {
         write_file(&remote_root.join(rel), body);
@@ -90,7 +106,9 @@ pub async fn start_pair(rel: Option<&str>, body: &[u8]) -> Loopback {
         "location /sonarr {\n    proxy_pass http://127.0.0.1:8989/sonarr;\n    proxy_set_header Host $host;\n}\n",
     )
     .expect("nginx");
-    let seed = Seedbox::new(allowlist, "0.1.0", Grabber::None).with_nginx_dir(nginx);
+    let seed = Seedbox::new(allowlist, "0.1.0", grabber)
+        .with_nginx_dir(nginx)
+        .with_grab_ops(grab_ops);
     let server = id.server_config().expect("server");
     let seed_task = tokio::spawn(async move {
         let _ = serve_tcp(tcp, server, seed).await;

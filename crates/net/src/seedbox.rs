@@ -15,9 +15,10 @@ use mediaops_proto::{
     DeleteRemoteRequest, DeleteRemoteResponse, DfRequest, DfResponse, EdgeApplyRequest,
     EdgeApplyResponse, EdgeCheckRequest, EdgeCheckResponse, ErrorDetail, GetRangeRequest,
     GetRangeResponse, GrabApplyRequest, GrabApplyResponse, GuardPreviewRequest,
-    GuardPreviewResponse, KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest, ListResponse,
-    PROTO_PACKAGE, RemoteEntry as WireEntry, StatRequest, StatResponse, UnmonitorRequest,
-    UnmonitorResponse, status_from_error_detail,
+    GuardPreviewResponse, HoldListRequest, HoldListResponse, HoldLiveItem as WireHold,
+    KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest, ListResponse, PROTO_PACKAGE,
+    RemoteEntry as WireEntry, StatRequest, StatResponse, UnmonitorRequest, UnmonitorResponse,
+    status_from_error_detail,
 };
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -276,6 +277,30 @@ impl Control for Seedbox {
     ) -> Result<Response<GuardPreviewResponse>, Status> {
         Err(unused("GuardPreview"))
     }
+
+    async fn hold_list(
+        &self,
+        _request: Request<HoldListRequest>,
+    ) -> Result<Response<HoldListResponse>, Status> {
+        let (semver, proto_package) = self.handshake();
+        let items = if self.grabber == Grabber::None {
+            Vec::new()
+        } else if let Some(ops) = &self.grab_ops {
+            ops.hold_list()
+                .await
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?
+                .iter()
+                .map(WireHold::from)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(HoldListResponse {
+            semver,
+            proto_package,
+            items,
+        }))
+    }
 }
 
 #[tonic::async_trait]
@@ -359,11 +384,14 @@ impl Transfer for Seedbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mediaops_core::{Allowlist, Grabber};
+    use mediaops_core::{
+        Allowlist, BoxFuture, ControlError, DesiredState, EdgeApiReport, GrabApplyReport, GrabOps,
+        Grabber, HoldKey, HoldLiveItem, KeyPresence, ReleaseId, TitleId,
+    };
     use mediaops_proto::{
         DeleteRemoteRequest, EdgeApplyRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
-        GuardPreviewRequest, KeyDiscoveryRequest, PROTO_PACKAGE, RemoteRef as WireRef, StatRequest,
-        UnmonitorRequest,
+        GuardPreviewRequest, HoldListRequest, KeyDiscoveryRequest, PROTO_PACKAGE,
+        RemoteRef as WireRef, StatRequest, UnmonitorRequest,
     };
     use std::io::Write;
     use tokio_stream::StreamExt;
@@ -450,6 +478,100 @@ mod tests {
             .expect("keys")
             .into_inner();
         assert!(!keys.sonarr_key_present);
+        let holds = seed
+            .hold_list(Request::new(HoldListRequest {}))
+            .await
+            .expect("hold list none")
+            .into_inner();
+        assert_eq!(holds.proto_package, PROTO_PACKAGE);
+        assert!(holds.items.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct FakeGrabOps {
+        items: Vec<HoldLiveItem>,
+    }
+
+    impl GrabOps for FakeGrabOps {
+        fn grab_apply<'a>(
+            &'a self,
+            _: &'a DesiredState,
+        ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>> {
+            Box::pin(async {
+                Ok(GrabApplyReport {
+                    noop: true,
+                    diff: String::new(),
+                })
+            })
+        }
+        fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>> {
+            Box::pin(async { Ok(KeyPresence::default()) })
+        }
+        fn edge_api_check(&self) -> BoxFuture<'_, Result<EdgeApiReport, ControlError>> {
+            Box::pin(async {
+                Ok(EdgeApiReport {
+                    fingerprint: String::new(),
+                    invariant_ok: true,
+                    drift: String::new(),
+                })
+            })
+        }
+        fn edge_apply<'a>(
+            &'a self,
+            _: &'a DesiredState,
+        ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>> {
+            Box::pin(async {
+                Ok(GrabApplyReport {
+                    noop: true,
+                    diff: String::new(),
+                })
+            })
+        }
+        fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>> {
+            let items = self.items.clone();
+            Box::pin(async move { Ok(items) })
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_list_uses_grab_ops_when_grabber_is_servarr() {
+        let root = scratch("hold-ops");
+        let item = HoldLiveItem {
+            key: HoldKey::new(
+                TitleId::movie("603").expect("title"),
+                ReleaseId::parse("deadbeef").expect("id"),
+            ),
+            added_unix: 1,
+            size: 2,
+            reason: "blocked".into(),
+        };
+        let seed =
+            seedbox_with(root.clone()).with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps {
+                items: vec![item.clone()],
+            })));
+        // grabber stays None in seedbox_with — None must still be empty.
+        let none = seed
+            .hold_list(Request::new(HoldListRequest {}))
+            .await
+            .expect("none")
+            .into_inner();
+        assert!(none.items.is_empty());
+
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root.clone()).expect("root");
+        let servarr = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr).with_grab_ops(Some(
+            std::sync::Arc::new(FakeGrabOps {
+                items: vec![item.clone()],
+            }),
+        ));
+        let listed = servarr
+            .hold_list(Request::new(HoldListRequest {}))
+            .await
+            .expect("servarr")
+            .into_inner();
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].title_id, "movie:tmdb:603");
+        assert_eq!(listed.items[0].release_id, "deadbeef");
         let _ = std::fs::remove_dir_all(root);
     }
 

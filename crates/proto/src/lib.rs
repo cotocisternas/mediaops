@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 use mediaops_core::{
     BoxFuture, Bytes, ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, EdgeApiReport,
-    ExitCode, GrabApplyReport, KeyPresence, RemoteEntry as CoreRemoteEntry,
-    RemoteRef as CoreRemoteRef, TitleId, WalkerError,
+    ExitCode, GrabApplyReport, HoldError, HoldKey, HoldLiveItem as CoreHoldLiveItem, KeyPresence,
+    ReleaseId, RemoteEntry as CoreRemoteEntry, RemoteRef as CoreRemoteRef, TitleId, TitleIdError,
+    WalkerError,
 };
 use prost::Message;
 
@@ -68,6 +69,10 @@ pub enum ConvertError {
     InvalidErrorDetail,
     #[error("unknown exit_code `{0}`")]
     UnknownExitCode(i32),
+    #[error(transparent)]
+    TitleId(#[from] TitleIdError),
+    #[error(transparent)]
+    Hold(#[from] HoldError),
 }
 
 fn require_nested<T>(value: Option<T>, field: &'static str) -> Result<T, ConvertError> {
@@ -232,6 +237,48 @@ impl From<&TitleId> for UnmonitorRequest {
         Self {
             title_id: title_id.render(),
         }
+    }
+}
+
+impl From<&CoreHoldLiveItem> for HoldLiveItem {
+    fn from(item: &CoreHoldLiveItem) -> Self {
+        Self {
+            title_id: item.key.title_id.render(),
+            release_id: item.key.release_id.as_str().to_string(),
+            added_unix: item.added_unix,
+            size: item.size,
+            reason: item.reason.clone(),
+        }
+    }
+}
+
+impl From<CoreHoldLiveItem> for HoldLiveItem {
+    fn from(item: CoreHoldLiveItem) -> Self {
+        Self::from(&item)
+    }
+}
+
+impl TryFrom<HoldLiveItem> for CoreHoldLiveItem {
+    type Error = ConvertError;
+
+    fn try_from(value: HoldLiveItem) -> Result<Self, Self::Error> {
+        Ok(Self {
+            key: HoldKey::new(
+                TitleId::parse(&value.title_id)?,
+                ReleaseId::parse(&value.release_id)?,
+            ),
+            added_unix: value.added_unix,
+            size: value.size,
+            reason: value.reason,
+        })
+    }
+}
+
+impl TryFrom<HoldListResponse> for Vec<CoreHoldLiveItem> {
+    type Error = ConvertError;
+
+    fn try_from(value: HoldListResponse) -> Result<Self, Self::Error> {
+        value.items.into_iter().map(TryFrom::try_from).collect()
     }
 }
 
@@ -500,6 +547,19 @@ where
             let inner = response.into_inner();
             accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(())
+        })
+    }
+
+    fn hold_list(&self) -> BoxFuture<'_, Result<Vec<CoreHoldLiveItem>, ControlError>> {
+        let mut client = self.inner.clone();
+        Box::pin(async move {
+            let response = client
+                .hold_list(HoldListRequest {})
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            accept_handshake(&inner.proto_package, &inner.semver)?;
+            Vec::<CoreHoldLiveItem>::try_from(inner).map_err(convert_to_control)
         })
     }
 }
@@ -819,5 +879,49 @@ mod tests {
         let request = UnmonitorRequest::from(&title);
         assert_eq!(request.title_id, "movie:tmdb:603");
         assert_eq!(request.title_id, title.render());
+    }
+
+    #[test]
+    fn hold_live_item_carries_release_id_verbatim() {
+        let domain = CoreHoldLiveItem {
+            key: HoldKey::new(
+                TitleId::movie("603").expect("title"),
+                ReleaseId::usenet("The.Matrix.1999.nzb").expect("release"),
+            ),
+            added_unix: 1_577_836_800,
+            size: 1234,
+            reason: "No files found are eligible for import".into(),
+        };
+        let wire = HoldLiveItem::from(&domain);
+        assert_eq!(wire.title_id, "movie:tmdb:603");
+        assert_eq!(wire.release_id, domain.key.release_id.as_str());
+        assert_eq!(wire.added_unix, 1_577_836_800);
+        assert_eq!(wire.size, 1234);
+        let back = CoreHoldLiveItem::try_from(wire).expect("from wire");
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn bad_wire_title_id_is_convert_error() {
+        let err = CoreHoldLiveItem::try_from(HoldLiveItem {
+            title_id: "not-a-title".into(),
+            release_id: "abc".into(),
+            added_unix: 0,
+            size: 0,
+            reason: String::new(),
+        })
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::TitleId(_)), "{err}");
+        let err = CoreHoldLiveItem::try_from(HoldLiveItem {
+            title_id: "movie:tmdb:603".into(),
+            release_id: String::new(),
+            added_unix: 0,
+            size: 0,
+            reason: String::new(),
+        })
+        .unwrap_err();
+        assert!(matches!(err, ConvertError::Hold(_)), "{err}");
+        let runtime = convert_to_control(err);
+        assert_eq!(runtime.exit_code, ExitCode::Runtime);
     }
 }

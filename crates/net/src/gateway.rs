@@ -15,10 +15,11 @@ use mediaops_proto::{
     ConfigurePoolRequest, ConfigurePoolResponse, DeleteRemoteRequest, DeleteRemoteResponse,
     DfRequest, DfResponse, EdgeApplyRequest, EdgeApplyResponse, EdgeCheckRequest,
     EdgeCheckResponse, ErrorDetail, GetRangeRequest, GetRangeResponse, GrabApplyRequest,
-    GrabApplyResponse, GuardPreviewRequest, GuardPreviewResponse, KeyDiscoveryRequest,
-    KeyDiscoveryResponse, ListRequest, ListResponse, PoolStatusRequest, PoolStatusResponse,
-    ProbeRangeRequest, ProbeRangeResponse, StatRequest, StatResponse, UnmonitorRequest,
-    UnmonitorResponse, resource_exhausted_detail, status_from_error_detail,
+    GrabApplyResponse, GuardPreviewRequest, GuardPreviewResponse, HoldListRequest,
+    HoldListResponse, KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest, ListResponse,
+    PoolStatusRequest, PoolStatusResponse, ProbeRangeRequest, ProbeRangeResponse, StatRequest,
+    StatResponse, UnmonitorRequest, UnmonitorResponse, resource_exhausted_detail,
+    status_from_error_detail,
 };
 use rustls::ClientConfig;
 use tokio::sync::Mutex;
@@ -177,6 +178,15 @@ impl Control for HomeGateway {
     ) -> Result<Response<GuardPreviewResponse>, Status> {
         ControlClient::new(self.control.clone())
             .guard_preview(request)
+            .await
+    }
+
+    async fn hold_list(
+        &self,
+        request: Request<HoldListRequest>,
+    ) -> Result<Response<HoldListResponse>, Status> {
+        ControlClient::new(self.control.clone())
+            .hold_list(request)
             .await
     }
 }
@@ -377,6 +387,12 @@ mod tests {
         let mut control = ControlClient::new(ch.clone());
         let df = control.df(DfRequest {}).await.expect("df").into_inner();
         assert!(df.free_bytes > 0);
+        let holds = control
+            .hold_list(mediaops_proto::HoldListRequest {})
+            .await
+            .expect("hold list")
+            .into_inner();
+        assert!(holds.items.is_empty());
 
         let mut transfer = TransferClient::new(ch.clone());
         let list = transfer
