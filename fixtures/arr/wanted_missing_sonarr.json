@@ -1,0 +1,28 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/sonarr/api/v3/wanted/missing?includeSeries=true&page=1&pageSize=200"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "page": 1,
+      "pageSize": 200,
+      "totalRecords": 1,
+      "records": [
+        {
+          "id": 101,
+          "seriesId": 5,
+          "title": "The Wire",
+          "series": {
+            "id": 5,
+            "tvdbId": 79126,
+            "title": "The Wire",
+            "monitored": true
+          }
+        }
+      ]
+    }
+  }
+}

@@ -3,8 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    Action, ControlPort, DesiredState, Envelope, ExecPort, HoldDecision, JobState, Plan, Probe,
-    TitleId, WantState, free_bytes,
+    Action, ControlPort, DesiredState, Envelope, ExecPort, ExitCode, HoldDecision, JobState, Plan,
+    Probe, TitleId, WantState, free_bytes,
 };
 use mediaops_store::Store;
 use mediaops_sync::{ApplyCtx, ApplyError, PlanRequest, apply, plan_actions, scan_schema_files};
@@ -310,6 +310,7 @@ async fn prepare(
             approved.push(item);
         }
     }
+    let wanted_missing = control.wanted_missing().await.map_err(runtime_display)?;
     let planned = plan_actions(PlanRequest {
         listings: &listings,
         title_index: &title_index,
@@ -319,6 +320,7 @@ async fn prepare(
         free_bytes: free,
         edge_frozen,
         approved: &approved,
+        wanted_missing: &wanted_missing,
     });
     let plan = Plan::from_toml_bytes(toml_bytes)
         .map_err(runtime_display)?
@@ -367,9 +369,17 @@ async fn configure_from_probes(store: &Store, channel: HomeChannel) -> Result<u3
 
 fn map_apply(err: ApplyError) -> AppError {
     if err.is_snapshot_mismatch() {
-        AppError::DriftVerify(err.to_string())
-    } else {
-        AppError::Runtime(anyhow::anyhow!("{err}"))
+        return AppError::DriftVerify(err.to_string());
+    }
+    match err {
+        ApplyError::Control(ctrl) => match ctrl.exit_code {
+            ExitCode::PolicyRefusal => AppError::Policy(ctrl.message),
+            ExitCode::DriftVerify => AppError::DriftVerify(ctrl.message),
+            ExitCode::LockConflict => AppError::LockConflict(ctrl.message),
+            ExitCode::Usage => AppError::Usage(ctrl.message),
+            _ => AppError::Runtime(anyhow::anyhow!("{}", ctrl.message)),
+        },
+        other => AppError::Runtime(anyhow::anyhow!("{other}")),
     }
 }
 
@@ -426,6 +436,14 @@ fn unique_plan_path(plans_dir: &Path, plan: &Plan) -> Result<PathBuf, AppError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_apply_preserves_control_usage() {
+        let err = map_apply(ApplyError::Control(mediaops_core::ControlError::usage(
+            "grabber is none; unmonitor requires a grabber",
+        )));
+        assert!(matches!(err, AppError::Usage(_)), "{err}");
+    }
 
     #[test]
     fn empty_apply_with_first_candidate_breach_is_policy_refusal() {
@@ -516,6 +534,57 @@ mod tests {
                 .iter()
                 .any(|a| a["type"] == "skip" && a["reason"] == "lock"),
             "{actions:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cmd_plan_emits_unmonitor_for_install_b3_and_wanted_missing() {
+        let _serial = crate::test_support::serial_net();
+        let title = TitleId::movie("603").expect("id");
+        let lb = crate::test_support::start_pair_with_grab_ops(
+            mediaops_core::Grabber::Servarr,
+            Some(std::sync::Arc::new(HoldGrabOps {
+                items: Vec::new(),
+                wanted: vec![title.clone()],
+            })),
+        )
+        .await;
+        let dir = crate::test_support::scratch("plan-unmonitor");
+        let library = crate::test_support::library_root(&dir);
+        let store = crate::test_support::open_store(&dir).await;
+        store
+            .record_install(
+                &title,
+                &mediaops_core::Blake3Hex::of_bytes(b"orig"),
+                crate::test_support::MOVIE_REL,
+            )
+            .await
+            .expect("index");
+        let ds = crate::test_support::write_ds(
+            &dir,
+            "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\ngrabber = \"servarr\"\n",
+        );
+        let json = cmd_plan(
+            true,
+            Some(dir.join("state.db")),
+            Some(ds),
+            Some(library),
+            Some(lb.sock.clone()),
+            Some(lb.tls_dir.clone()),
+            None,
+            Some(dir.join("plans")),
+        )
+        .await
+        .expect("plan");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true, "{json}");
+        let actions = value["data"]["actions"].as_array().expect("actions");
+        assert!(
+            actions
+                .iter()
+                .any(|a| { a["type"] == "unmonitor" && a["title_id"] == "movie:tmdb:603" }),
+            "plan JSON must contain unmonitor for the installed title: {actions:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -721,6 +790,7 @@ mod tests {
             mediaops_core::Grabber::Servarr,
             Some(std::sync::Arc::new(HoldGrabOps {
                 items: vec![item.clone()],
+                wanted: Vec::new(),
             })),
         )
         .await;
@@ -802,6 +872,7 @@ mod tests {
             mediaops_core::Grabber::Servarr,
             Some(std::sync::Arc::new(HoldGrabOps {
                 items: vec![item.clone()],
+                wanted: Vec::new(),
             })),
         )
         .await;
@@ -847,6 +918,7 @@ mod tests {
 
     struct HoldGrabOps {
         items: Vec<mediaops_core::HoldLiveItem>,
+        wanted: Vec<mediaops_core::TitleId>,
     }
 
     impl mediaops_core::GrabOps for HoldGrabOps {
@@ -912,6 +984,21 @@ mod tests {
         fn hold_reject<'a>(
             &'a self,
             _: &'a mediaops_core::HoldKey,
+        ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn wanted_missing(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<Vec<mediaops_core::TitleId>, mediaops_core::ControlError>,
+        > {
+            let wanted = self.wanted.clone();
+            Box::pin(async move { Ok(wanted) })
+        }
+        fn unmonitor<'a>(
+            &'a self,
+            _: &'a mediaops_core::TitleId,
         ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
             Box::pin(async { Ok(()) })
         }

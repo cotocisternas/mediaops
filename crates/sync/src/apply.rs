@@ -125,11 +125,12 @@ where
                     let _report = control.edge_apply(plan.desired_state_toml()).await?;
                 }
             }
-            Action::Encode { .. }
-            | Action::Review
-            | Action::Unmonitor
-            | Action::DeleteRemote
-            | Action::Reclaim => {}
+            Action::Unmonitor { title_id } => {
+                if let Some(control) = ctx.control {
+                    control.unmonitor(title_id).await?;
+                }
+            }
+            Action::Encode { .. } | Action::Review | Action::DeleteRemote | Action::Reclaim => {}
         }
     }
     Ok(report)
@@ -910,6 +911,7 @@ mod tests {
 
     struct FakeControl {
         calls: Mutex<usize>,
+        unmonitors: Mutex<Vec<TitleId>>,
     }
 
     impl ControlPort for FakeControl {
@@ -926,8 +928,9 @@ mod tests {
         }
         fn unmonitor<'a>(
             &'a self,
-            _: &'a TitleId,
+            title_id: &'a TitleId,
         ) -> mediaops_core::BoxFuture<'a, Result<(), ControlError>> {
+            self.unmonitors.lock().expect("lock").push(title_id.clone());
             Box::pin(async { Ok(()) })
         }
         fn delete_remote<'a>(
@@ -995,6 +998,11 @@ mod tests {
         ) -> mediaops_core::BoxFuture<'a, Result<(), ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn wanted_missing(
+            &self,
+        ) -> mediaops_core::BoxFuture<'_, Result<Vec<TitleId>, ControlError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[tokio::test]
@@ -1012,6 +1020,7 @@ mod tests {
         let root = scratch("grab-apply");
         let control = FakeControl {
             calls: Mutex::new(0),
+            unmonitors: Mutex::new(Vec::new()),
         };
         apply(
             &plan,
@@ -1028,6 +1037,44 @@ mod tests {
         .await
         .expect("apply");
         assert_eq!(*control.calls.lock().expect("lock"), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unmonitor_dispatches_through_control_port() {
+        let title = TitleId::movie("603").expect("id");
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![Action::Unmonitor {
+                title_id: title.clone(),
+            }]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("unmonitor-apply");
+        let control = FakeControl {
+            calls: Mutex::new(0),
+            unmonitors: Mutex::new(Vec::new()),
+        };
+        apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+                control: Some(&control),
+            },
+        )
+        .await
+        .expect("apply");
+        assert_eq!(*control.unmonitors.lock().expect("lock"), vec![title]);
         let _ = fs::remove_dir_all(root);
     }
 }

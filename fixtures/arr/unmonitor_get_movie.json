@@ -1,0 +1,19 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/radarr/api/v3/movie/10"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "id": 10,
+      "tmdbId": 603,
+      "title": "The Matrix",
+      "year": 1999,
+      "monitored": true,
+      "path": "/movies/The.Matrix",
+      "qualityProfileId": 1
+    }
+  }
+}

@@ -107,6 +107,17 @@ impl CassetteTransport {
         Ok(())
     }
 
+    /// How many times `method`+`path` was looked up (shared across clones).
+    pub fn hits(&self, method: &str, path: &str) -> usize {
+        let key = format!("{} {}", method.to_ascii_uppercase(), cassette_path(path));
+        self.used
+            .lock()
+            .expect("cassette cursor")
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn push(&mut self, method: &str, path: &str, body: Option<&[u8]>, response: HttpResponse) {
         self.entries.push(Entry {
             method: method.to_ascii_uppercase(),

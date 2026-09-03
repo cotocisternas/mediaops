@@ -170,6 +170,20 @@ mod tests {
         ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn wanted_missing(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<Vec<mediaops_core::TitleId>, mediaops_core::ControlError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn unmonitor<'a>(
+            &'a self,
+            _: &'a mediaops_core::TitleId,
+        ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[tokio::test]

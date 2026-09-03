@@ -534,6 +534,10 @@ fn why_and_status_json_envelopes() {
     assert_eq!(why_v["data"]["title_id"], "movie:tmdb:603");
     assert_eq!(why_v["data"]["want"]["state"], "open");
     assert_eq!(why_v["data"]["want"]["title_id"], "movie:tmdb:603");
+    assert_eq!(why_v["data"]["grab"], Value::Null);
+    assert_eq!(why_v["data"]["import"], Value::Null);
+    assert_eq!(why_v["data"]["hold"], Value::Null);
+    assert_eq!(why_v["data"]["df"], Value::Null);
     let status = bin()
         .args([
             "--json",
@@ -554,6 +558,7 @@ fn why_and_status_json_envelopes() {
         "movie:tmdb:603"
     );
     assert!(status_v["data"]["watermark"].is_object());
+    assert_eq!(status_v["data"]["df"], Value::Null);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -615,8 +620,80 @@ fn status_and_why_report_lock_holder_when_flock_is_held() {
     );
     let why_v = stdout_json(&why);
     assert_eq!(why_v["data"]["lock"]["pid"], 4242);
+    assert_eq!(why_v["data"]["df"], Value::Null);
     drop(file);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn why_and_status_df_from_seedbox_on_loopback_lock_free() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let _g = HOLD_NET.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("why-df");
+        let lb = start_hold_loopback().await;
+        let lock_path = dir.join("mediaops.lock");
+        let file = std::fs::File::create(&lock_path).expect("lock file");
+        fs4::FileExt::try_lock(&file).expect("hold lock");
+        let why = bin()
+            .args([
+                "--json",
+                "why",
+                "movie:tmdb:603",
+                "--state-db",
+                dir.join("state.db").to_str().unwrap(),
+                "--config-dir",
+                dir.to_str().unwrap(),
+                "--socket",
+                lb.sock.to_str().unwrap(),
+                "--tls-dir",
+                lb.tls_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("why");
+        assert_eq!(
+            why.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&why.stderr)
+        );
+        let why_v = stdout_json(&why);
+        assert_eq!(why_v["ok"], true);
+        assert!(why_v["data"]["df"]["free"].as_u64().is_some(), "{why_v}");
+        assert_eq!(why_v["data"]["grab"], Value::Null);
+        let status = bin()
+            .args([
+                "--json",
+                "status",
+                "--state-db",
+                dir.join("state.db").to_str().unwrap(),
+                "--plans-dir",
+                dir.join("plans").to_str().unwrap(),
+                "--socket",
+                lb.sock.to_str().unwrap(),
+                "--tls-dir",
+                lb.tls_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("status");
+        assert_eq!(
+            status.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let status_v = stdout_json(&status);
+        assert!(
+            status_v["data"]["df"]["free"].as_u64().is_some(),
+            "{status_v}"
+        );
+        drop(file);
+        drop(lb);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[test]

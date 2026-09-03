@@ -1,0 +1,26 @@
+{
+  "request": {
+    "method": "PUT",
+    "path": "/lidarr/api/v1/album/20",
+    "body_json": {
+      "id": 20,
+      "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63",
+      "title": "Relayer",
+      "monitored": false,
+      "path": "/music/Relayer",
+      "qualityProfileId": 1
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "id": 20,
+      "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63",
+      "title": "Relayer",
+      "monitored": false,
+      "path": "/music/Relayer",
+      "qualityProfileId": 1
+    }
+  }
+}

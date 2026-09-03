@@ -61,6 +61,7 @@ service Control {
   rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
   rpc HoldList(HoldListRequest) returns (HoldListResponse);
   rpc HoldReject(HoldRejectRequest) returns (HoldRejectResponse);
+  rpc WantedMissing(WantedMissingRequest) returns (WantedMissingResponse);
 }
 
 // Home UDS only. Seedbox mediaopsd does not serve this.
@@ -204,6 +205,14 @@ message HoldRejectRequest {
 message HoldRejectResponse {
   string semver = 1;
   string proto_package = 2;
+}
+
+message WantedMissingRequest {}
+
+message WantedMissingResponse {
+  string semver = 1;
+  string proto_package = 2;
+  repeated string title_id = 3;
 }
 
 message Placement {

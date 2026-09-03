@@ -19,7 +19,8 @@ use mediaops_proto::{
     HoldListResponse, HoldRejectRequest, HoldRejectResponse, KeyDiscoveryRequest,
     KeyDiscoveryResponse, ListRequest, ListResponse, PoolStatusRequest, PoolStatusResponse,
     ProbeRangeRequest, ProbeRangeResponse, StatRequest, StatResponse, UnmonitorRequest,
-    UnmonitorResponse, resource_exhausted_detail, status_from_error_detail,
+    UnmonitorResponse, WantedMissingRequest, WantedMissingResponse, resource_exhausted_detail,
+    status_from_error_detail,
 };
 use rustls::ClientConfig;
 use tokio::sync::Mutex;
@@ -196,6 +197,15 @@ impl Control for HomeGateway {
     ) -> Result<Response<HoldRejectResponse>, Status> {
         ControlClient::new(self.control.clone())
             .hold_reject(request)
+            .await
+    }
+
+    async fn wanted_missing(
+        &self,
+        request: Request<WantedMissingRequest>,
+    ) -> Result<Response<WantedMissingResponse>, Status> {
+        ControlClient::new(self.control.clone())
+            .wanted_missing(request)
             .await
     }
 }

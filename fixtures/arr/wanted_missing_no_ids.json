@@ -1,0 +1,25 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/sonarr/api/v3/wanted/missing?includeSeries=true&page=1&pageSize=200"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "page": 1,
+      "pageSize": 200,
+      "totalRecords": 2,
+      "records": [
+        {
+          "id": 99,
+          "title": "Unknown"
+        },
+        {
+          "id": 100,
+          "episodeFileId": 1
+        }
+      ]
+    }
+  }
+}

@@ -21,6 +21,8 @@ pub struct PlanRequest<'a> {
     pub edge_frozen: bool,
     /// Approved holds with a live RemoteRef+placement become Copy (not Review).
     pub approved: &'a [HoldLiveItem],
+    /// *arr wanted/missing TitleIds. Unmonitor is `title_index` ∩ this set, not `on_disk`.
+    pub wanted_missing: &'a [TitleId],
 }
 
 pub struct Planned {
@@ -181,6 +183,11 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         }
         actions.extend(upgrade_never);
         actions.extend(duplicates);
+        actions.extend(unmonitor_actions(
+            req.desired.grabber(),
+            req.title_index,
+            req.wanted_missing,
+        ));
         if req.desired.grabber() == Grabber::Servarr {
             actions.insert(0, Action::GrabApply);
         }
@@ -237,6 +244,11 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
 
     actions.extend(upgrade_never);
     actions.extend(duplicates);
+    actions.extend(unmonitor_actions(
+        req.desired.grabber(),
+        req.title_index,
+        req.wanted_missing,
+    ));
     if req.desired.grabber() == Grabber::Servarr {
         actions.insert(0, Action::GrabApply);
     }
@@ -247,6 +259,27 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         actions,
         first_candidate_breaches,
     }
+}
+
+fn unmonitor_actions(
+    grabber: Grabber,
+    title_index: &[TitleIndexEntry],
+    wanted_missing: &[TitleId],
+) -> Vec<Action> {
+    if grabber != Grabber::Servarr {
+        return Vec::new();
+    }
+    let missing: HashSet<&TitleId> = wanted_missing.iter().collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for entry in title_index {
+        if missing.contains(entry.title_id()) && seen.insert(entry.title_id()) {
+            out.push(Action::Unmonitor {
+                title_id: entry.title_id().clone(),
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -268,6 +301,25 @@ lock = false
 
     fn ds() -> DesiredState {
         DesiredState::from_toml(DS).expect("ds")
+    }
+
+    fn ds_servarr() -> DesiredState {
+        DesiredState::from_toml(&format!("{DS}\ngrabber = \"servarr\"\n")).expect("ds")
+    }
+
+    fn ds_servarr_locked() -> DesiredState {
+        DesiredState::from_toml(
+            r#"
+schema_version = 1
+max_copy_gib = 1
+min_free_gib = 1
+range_len_mib = 8
+max_nvenc = 1
+lock = true
+grabber = "servarr"
+"#,
+        )
+        .expect("ds")
     }
 
     fn digest(fill: char) -> mediaops_core::Blake3Hex {
@@ -331,6 +383,7 @@ lock = false
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -369,6 +422,7 @@ lock = false
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -400,6 +454,7 @@ lock = false
             free_bytes: Bytes::GIB + 100,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(
             planned.actions.iter().all(|a| matches!(
@@ -428,6 +483,7 @@ lock = false
             free_bytes: 4 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -459,6 +515,7 @@ lock = false
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert_eq!(planned.actions.len(), 1);
         assert!(matches!(planned.actions[0], Action::Copy { .. }));
@@ -481,6 +538,7 @@ lock = false
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -508,6 +566,7 @@ lock = false
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert_eq!(copies(&planned.actions).len(), 1);
         assert!(
@@ -518,6 +577,154 @@ lock = false
                     ..
                 } if reason == SKIP_DUPLICATE_TITLE
             )),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn install_b3_and_wanted_missing_emits_unmonitor() {
+        let title = TitleId::movie("603").expect("id");
+        let index = [TitleIndexEntry::new(
+            title.clone(),
+            movie_rel("603", 1999),
+            digest('a'),
+            digest('a'),
+        )];
+        let missing = [title.clone()];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds_servarr(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &missing,
+        });
+        assert!(
+            planned.actions.iter().any(|a| matches!(
+                a,
+                Action::Unmonitor { title_id } if *title_id == title
+            )),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn grabber_none_does_not_unmonitor_even_when_missing() {
+        let title = TitleId::movie("603").expect("id");
+        let index = [TitleIndexEntry::new(
+            title.clone(),
+            movie_rel("603", 1999),
+            digest('a'),
+            digest('a'),
+        )];
+        let missing = [title];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &missing,
+        });
+        assert!(
+            planned
+                .actions
+                .iter()
+                .all(|a| !matches!(a, Action::Unmonitor { .. })),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn lock_true_still_unmonitors_install_b3_intersect_missing() {
+        let title = TitleId::movie("603").expect("id");
+        let index = [TitleIndexEntry::new(
+            title.clone(),
+            movie_rel("603", 1999),
+            digest('a'),
+            digest('a'),
+        )];
+        let missing = [title.clone()];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds_servarr_locked(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &missing,
+        });
+        assert!(
+            planned.actions.iter().any(|a| matches!(
+                a,
+                Action::Unmonitor { title_id } if *title_id == title
+            )),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn on_disk_without_title_index_row_does_not_unmonitor() {
+        let title = TitleId::movie("603").expect("id");
+        let missing = [title.clone()];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &[],
+            on_disk: std::slice::from_ref(&title),
+            open_wants: &[],
+            desired: &ds(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &missing,
+        });
+        assert!(
+            planned
+                .actions
+                .iter()
+                .all(|a| !matches!(a, Action::Unmonitor { .. })),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn title_index_without_wanted_missing_does_not_unmonitor() {
+        let title = TitleId::movie("603").expect("id");
+        let index = [TitleIndexEntry::new(
+            title,
+            movie_rel("603", 1999),
+            digest('a'),
+            digest('a'),
+        )];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &[],
+        });
+        assert!(
+            planned
+                .actions
+                .iter()
+                .all(|a| !matches!(a, Action::Unmonitor { .. })),
             "{:?}",
             planned.actions
         );
@@ -536,6 +743,7 @@ lock = false
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -572,6 +780,7 @@ lock = true
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -609,6 +818,7 @@ lock = false
             free_bytes: 10,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -647,6 +857,7 @@ grabber = "servarr"
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(
             matches!(planned.actions.first(), Some(Action::GrabApply)),
@@ -677,6 +888,7 @@ grabber = "servarr"
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(
             matches!(planned.actions.first(), Some(Action::GrabApply)),
@@ -698,6 +910,7 @@ grabber = "servarr"
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: true,
             approved: &[],
+            wanted_missing: &[],
         });
         assert!(
             matches!(planned.actions.first(), Some(Action::EdgeApply)),
@@ -732,6 +945,7 @@ grabber = "servarr"
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: std::slice::from_ref(&item),
+            wanted_missing: &[],
         });
         assert!(
             planned.actions.iter().all(|a| !matches!(a, Action::Review)),
@@ -797,6 +1011,7 @@ grabber = "servarr"
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: std::slice::from_ref(&item),
+            wanted_missing: &[],
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -839,6 +1054,7 @@ grabber = "servarr"
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: std::slice::from_ref(&item),
+            wanted_missing: &[],
         });
         match &planned.actions[..] {
             [Action::Copy { file_len, .. }] => assert_eq!(*file_len, 99),
@@ -854,6 +1070,7 @@ grabber = "servarr"
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: std::slice::from_ref(&item),
+            wanted_missing: &[],
         });
         assert!(
             copies(&planned.actions).is_empty(),

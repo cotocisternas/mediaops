@@ -409,6 +409,26 @@ impl TryFrom<HoldListResponse> for Vec<CoreHoldLiveItem> {
     }
 }
 
+impl TryFrom<WantedMissingResponse> for Vec<TitleId> {
+    type Error = ConvertError;
+
+    fn try_from(value: WantedMissingResponse) -> Result<Self, Self::Error> {
+        Ok(value
+            .title_id
+            .into_iter()
+            .filter_map(|raw| TitleId::parse(&raw).ok())
+            .collect())
+    }
+}
+
+impl TryFrom<UnmonitorRequest> for TitleId {
+    type Error = ConvertError;
+
+    fn try_from(value: UnmonitorRequest) -> Result<Self, Self::Error> {
+        Ok(TitleId::parse(&value.title_id)?)
+    }
+}
+
 impl From<DfResponse> for Bytes {
     fn from(response: DfResponse) -> Self {
         Self::new(response.free_bytes)
@@ -701,6 +721,19 @@ where
             let inner = response.into_inner();
             accept_handshake(&inner.proto_package, &inner.semver)?;
             Ok(())
+        })
+    }
+
+    fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>> {
+        let mut client = self.inner.clone();
+        Box::pin(async move {
+            let response = client
+                .wanted_missing(WantedMissingRequest {})
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            accept_handshake(&inner.proto_package, &inner.semver)?;
+            Vec::<TitleId>::try_from(inner).map_err(convert_to_control)
         })
     }
 }
@@ -1020,6 +1053,27 @@ mod tests {
         let request = UnmonitorRequest::from(&title);
         assert_eq!(request.title_id, "movie:tmdb:603");
         assert_eq!(request.title_id, title.render());
+        assert_eq!(TitleId::try_from(request).expect("parse"), title);
+    }
+
+    #[test]
+    fn wanted_missing_response_parses_title_ids() {
+        let response = WantedMissingResponse {
+            semver: "0.1.0".into(),
+            proto_package: PROTO_PACKAGE.into(),
+            title_id: vec!["movie:tmdb:603".into(), "series:tvdb:79126".into()],
+        };
+        let ids = Vec::<TitleId>::try_from(response).expect("ids");
+        assert_eq!(ids[0].render(), "movie:tmdb:603");
+        assert_eq!(ids[1].render(), "series:tvdb:79126");
+        let mixed = WantedMissingResponse {
+            semver: "0.1.0".into(),
+            proto_package: PROTO_PACKAGE.into(),
+            title_id: vec!["not-a-title".into(), "movie:tmdb:603".into()],
+        };
+        let ids = Vec::<TitleId>::try_from(mixed).expect("skip bad");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].render(), "movie:tmdb:603");
     }
 
     #[test]

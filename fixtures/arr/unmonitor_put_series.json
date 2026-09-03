@@ -1,0 +1,26 @@
+{
+  "request": {
+    "method": "PUT",
+    "path": "/sonarr/api/v3/series/5",
+    "body_json": {
+      "id": 5,
+      "tvdbId": 79126,
+      "title": "The Wire",
+      "monitored": false,
+      "path": "/tv/The.Wire",
+      "qualityProfileId": 1
+    }
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "id": 5,
+      "tvdbId": 79126,
+      "title": "The Wire",
+      "monitored": false,
+      "path": "/tv/The.Wire",
+      "qualityProfileId": 1
+    }
+  }
+}

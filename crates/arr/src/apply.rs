@@ -1,5 +1,7 @@
 //! Grabber set-diff apply and runtime key discovery (GrabOps).
 
+use std::collections::HashSet;
+
 use mediaops_core::{
     BoxFuture, ControlError, DesiredState, EdgeApiReport, GrabApplyReport, GrabDownloadClient,
     GrabIndexer, GrabOps, Grabber, HoldKey, HoldLiveItem, KeyPresence, Placement, ReleaseId,
@@ -8,8 +10,11 @@ use mediaops_core::{
 use serde_json::{Value, json};
 
 use crate::keys::{DiscoveredKeys, KeyPaths, discover_keys};
+use crate::lidarr::Lidarr;
 use crate::prowlarr::Prowlarr;
+use crate::radarr::Radarr;
 use crate::servarr::{ArrClient, ArrError, HostConfig};
+use crate::sonarr::Sonarr;
 use crate::transport::HttpTransport;
 
 /// Localhost *arr clients built from discovered keys + url_base.
@@ -245,6 +250,137 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
                 }
             }
             Err(ControlError::runtime("hold not in grabber queue"))
+        })
+    }
+
+    fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>> {
+        Box::pin(async move {
+            let keys = discover_keys(&self.key_paths).map_err(key_to_control)?;
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            let mut apps = 0usize;
+            let mut docs_ok = 0usize;
+            let mut last_err = None;
+            if let Some(key) = keys.sonarr() {
+                apps += 1;
+                match ArrClient::new(self.transport.clone(), &self.sonarr_base, "/api/v3", key) {
+                    Ok(client) => match fetch_wanted_missing(&client, "includeSeries=true").await {
+                        Ok(doc) => {
+                            docs_ok += 1;
+                            extend_title_ids(&doc, &mut out, &mut seen);
+                        }
+                        Err(err) => last_err = Some(arr_to_control(err)),
+                    },
+                    Err(err) => last_err = Some(arr_to_control(err)),
+                }
+            }
+            if let Some(key) = keys.radarr() {
+                apps += 1;
+                match ArrClient::new(self.transport.clone(), &self.radarr_base, "/api/v3", key) {
+                    Ok(client) => match fetch_wanted_missing(&client, "includeMovie=true").await {
+                        Ok(doc) => {
+                            docs_ok += 1;
+                            extend_title_ids(&doc, &mut out, &mut seen);
+                        }
+                        Err(err) => last_err = Some(arr_to_control(err)),
+                    },
+                    Err(err) => last_err = Some(arr_to_control(err)),
+                }
+            }
+            if let Some(key) = keys.lidarr() {
+                apps += 1;
+                match ArrClient::new(self.transport.clone(), &self.lidarr_base, "/api/v1", key) {
+                    Ok(client) => match fetch_wanted_missing(&client, "includeAlbum=true").await {
+                        Ok(doc) => {
+                            docs_ok += 1;
+                            extend_title_ids(&doc, &mut out, &mut seen);
+                        }
+                        Err(err) => last_err = Some(arr_to_control(err)),
+                    },
+                    Err(err) => last_err = Some(arr_to_control(err)),
+                }
+            }
+            if apps > 0 && docs_ok == 0 {
+                return Err(
+                    last_err.unwrap_or_else(|| ControlError::runtime("wanted/missing failed"))
+                );
+            }
+            Ok(out)
+        })
+    }
+
+    fn unmonitor<'a>(&'a self, title_id: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>> {
+        Box::pin(async move {
+            let keys = discover_keys(&self.key_paths).map_err(key_to_control)?;
+            let mut apps = 0usize;
+            let mut docs_ok = 0usize;
+            let mut last_err = None;
+            if let Some(api_key) = keys.sonarr() {
+                apps += 1;
+                match ArrClient::new(
+                    self.transport.clone(),
+                    &self.sonarr_base,
+                    "/api/v3",
+                    api_key,
+                ) {
+                    Ok(client) => match fetch_wanted_missing(&client, "includeSeries=true").await {
+                        Ok(doc) => {
+                            docs_ok += 1;
+                            if unmonitor_doc(&client, &doc, title_id).await? {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => last_err = Some(arr_to_control(err)),
+                    },
+                    Err(err) => last_err = Some(arr_to_control(err)),
+                }
+            }
+            if let Some(api_key) = keys.radarr() {
+                apps += 1;
+                match ArrClient::new(
+                    self.transport.clone(),
+                    &self.radarr_base,
+                    "/api/v3",
+                    api_key,
+                ) {
+                    Ok(client) => match fetch_wanted_missing(&client, "includeMovie=true").await {
+                        Ok(doc) => {
+                            docs_ok += 1;
+                            if unmonitor_doc(&client, &doc, title_id).await? {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => last_err = Some(arr_to_control(err)),
+                    },
+                    Err(err) => last_err = Some(arr_to_control(err)),
+                }
+            }
+            if let Some(api_key) = keys.lidarr() {
+                apps += 1;
+                match ArrClient::new(
+                    self.transport.clone(),
+                    &self.lidarr_base,
+                    "/api/v1",
+                    api_key,
+                ) {
+                    Ok(client) => match fetch_wanted_missing(&client, "includeAlbum=true").await {
+                        Ok(doc) => {
+                            docs_ok += 1;
+                            if unmonitor_doc(&client, &doc, title_id).await? {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => last_err = Some(arr_to_control(err)),
+                    },
+                    Err(err) => last_err = Some(arr_to_control(err)),
+                }
+            }
+            if apps > 0 && docs_ok == 0 {
+                return Err(
+                    last_err.unwrap_or_else(|| ControlError::runtime("wanted/missing failed"))
+                );
+            }
+            Ok(())
         })
     }
 }
@@ -1113,28 +1249,132 @@ fn json_u8(value: &Value) -> Option<u8> {
 }
 
 fn title_id_from_queue_item(item: &Value) -> Option<TitleId> {
-    if let Some(id) = item
-        .get("movie")
-        .and_then(|m| m.get("tmdbId"))
-        .and_then(json_id)
-    {
+    title_id_from_arr_item(item)
+}
+
+fn title_id_from_arr_item(item: &Value) -> Option<TitleId> {
+    if let Some(id) = nested_or_top(item, "movie", "tmdbId").and_then(json_id) {
         return TitleId::movie(id).ok();
     }
-    if let Some(id) = item
-        .get("series")
-        .and_then(|s| s.get("tvdbId"))
-        .and_then(json_id)
-    {
+    if let Some(id) = nested_or_top(item, "series", "tvdbId").and_then(json_id) {
         return TitleId::series(id).ok();
     }
-    if let Some(id) = item
-        .get("album")
-        .and_then(|a| a.get("foreignAlbumId"))
-        .and_then(Value::as_str)
-    {
+    if let Some(id) = nested_or_top(item, "album", "foreignAlbumId").and_then(Value::as_str) {
         return TitleId::album(id).ok();
     }
     None
+}
+
+fn nested_or_top<'a>(item: &'a Value, nested: &str, field: &str) -> Option<&'a Value> {
+    item.get(nested)
+        .and_then(|n| n.get(field))
+        .or_else(|| item.get(field))
+}
+
+fn paged_records(doc: &Value) -> &[Value] {
+    doc.get("records")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .or_else(|| doc.as_array().map(Vec::as_slice))
+        .unwrap_or(&[])
+}
+
+fn extend_title_ids(doc: &Value, out: &mut Vec<TitleId>, seen: &mut HashSet<TitleId>) {
+    for item in paged_records(doc) {
+        let Some(id) = title_id_from_arr_item(item) else {
+            continue;
+        };
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+}
+
+fn json_arr_id(value: Option<&Value>) -> Option<i64> {
+    json_id(value?)?.parse().ok().filter(|&n| n >= 0)
+}
+
+/// Parent series/movie/album id for Unmonitor. Never the episode/track row id.
+fn unmonitor_parent(item: &Value) -> Option<(TitleId, &'static str, i64)> {
+    let title_id = title_id_from_arr_item(item)?;
+    let (resource, nested, fallback) = match title_id.kind() {
+        TitleKind::Movie => ("movie", "movie", "movieId"),
+        TitleKind::Series => ("series", "series", "seriesId"),
+        TitleKind::Album => ("album", "album", "albumId"),
+    };
+    let arr_id = if item.get(nested).is_some() {
+        json_arr_id(item.get(nested).and_then(|parent| parent.get("id")))
+            .or_else(|| json_arr_id(item.get(fallback)))
+    } else {
+        json_arr_id(item.get("id")).or_else(|| json_arr_id(item.get(fallback)))
+    }?;
+    Some((title_id, resource, arr_id))
+}
+
+fn set_unmonitored(parent: &mut Value) {
+    if let Some(obj) = parent.as_object_mut() {
+        obj.insert("monitored".into(), json!(false));
+    }
+}
+
+async fn fetch_wanted_missing<T: HttpTransport>(
+    client: &ArrClient<T>,
+    extra: &str,
+) -> Result<Value, ArrError> {
+    client.get_paged_with("wanted/missing", extra).await
+}
+
+async fn unmonitor_doc<T: HttpTransport + Clone>(
+    client: &ArrClient<T>,
+    doc: &Value,
+    title_id: &TitleId,
+) -> Result<bool, ControlError> {
+    for item in paged_records(doc) {
+        let Some((found, resource, arr_id)) = unmonitor_parent(item) else {
+            continue;
+        };
+        if found != *title_id {
+            continue;
+        }
+        let mut parent = client
+            .get_json(&format!("{resource}/{arr_id}"))
+            .await
+            .map_err(arr_to_control)?;
+        set_unmonitored(&mut parent);
+        match resource {
+            "series" => {
+                Sonarr {
+                    client: client.clone(),
+                }
+                .put_series(arr_id, &parent)
+                .await
+                .map_err(arr_to_control)?;
+            }
+            "movie" => {
+                Radarr {
+                    client: client.clone(),
+                }
+                .put_movie(arr_id, &parent)
+                .await
+                .map_err(arr_to_control)?;
+            }
+            "album" => {
+                Lidarr {
+                    client: client.clone(),
+                }
+                .put_album(arr_id, &parent)
+                .await
+                .map_err(arr_to_control)?;
+            }
+            _ => {
+                return Err(ControlError::runtime(format!(
+                    "unmonitor resource `{resource}`"
+                )));
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn release_id_from_queue_item(item: &Value) -> Option<ReleaseId> {
@@ -2154,6 +2394,311 @@ auth = "forms"
         );
         let items = ops.hold_list().await.expect("empty");
         assert!(items.is_empty());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn title_id_from_arr_item_reads_top_level_or_nested() {
+        assert_eq!(
+            title_id_from_arr_item(&json!({"tmdbId": 603}))
+                .expect("top")
+                .render(),
+            "movie:tmdb:603"
+        );
+        assert_eq!(
+            title_id_from_arr_item(&json!({"movie": {"tmdbId": 603}}))
+                .expect("nested")
+                .render(),
+            "movie:tmdb:603"
+        );
+        assert_eq!(
+            title_id_from_arr_item(&json!({"tvdbId": 79126}))
+                .expect("tvdb")
+                .render(),
+            "series:tvdb:79126"
+        );
+        assert_eq!(
+            title_id_from_arr_item(&json!({
+                "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63"
+            }))
+            .expect("album")
+            .render(),
+            "album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63"
+        );
+        assert!(
+            title_id_from_arr_item(&json!({"id": 99, "title": "Unknown"})).is_none(),
+            "numeric *arr id is never a TitleId"
+        );
+    }
+
+    #[tokio::test]
+    async fn grab_ops_wanted_missing_pages_sonarr_radarr_lidarr_cassette() {
+        let home = scratch("wanted-missing");
+        write_arr_key(&home, "Sonarr", "k");
+        write_arr_key(&home, "Radarr", "k");
+        write_arr_key(&home, "Lidarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_sonarr.json"
+        ))
+        .expect("sonarr cassette");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_radarr.json"
+        ))
+        .expect("radarr cassette");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_lidarr.json"
+        ))
+        .expect("lidarr cassette");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let ids: Vec<String> = ops
+            .wanted_missing()
+            .await
+            .expect("wanted")
+            .into_iter()
+            .map(|id| id.render())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "series:tvdb:79126".to_string(),
+                "movie:tmdb:603".to_string(),
+                "album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_wanted_missing_skips_records_without_identity_fields() {
+        let home = scratch("wanted-no-ids");
+        write_arr_key(&home, "Sonarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_no_ids.json"
+        ))
+        .expect("cassette");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let ids = ops.wanted_missing().await.expect("wanted");
+        assert!(ids.is_empty(), "do not invent another id field: {ids:?}");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn unmonitor_parent_skips_nested_without_parent_id() {
+        assert!(
+            unmonitor_parent(&json!({
+                "id": 101,
+                "series": {"tvdbId": 79126, "title": "The Wire"}
+            }))
+            .is_none(),
+            "do not PUT series/{{episodeId}}"
+        );
+    }
+
+    #[test]
+    fn unmonitor_parent_uses_series_id_not_episode_id() {
+        let (id, resource, arr_id) = unmonitor_parent(&json!({
+            "id": 101,
+            "seriesId": 5,
+            "series": {"id": 5, "tvdbId": 79126}
+        }))
+        .expect("parent");
+        assert_eq!(resource, "series");
+        assert_eq!(arr_id, 5);
+        assert_eq!(id.render(), "series:tvdb:79126");
+    }
+
+    #[test]
+    fn unmonitor_parent_accepts_string_arr_id() {
+        let (_, resource, arr_id) = unmonitor_parent(&json!({
+            "id": "10",
+            "tmdbId": 603
+        }))
+        .expect("movie");
+        assert_eq!(resource, "movie");
+        assert_eq!(arr_id, 10);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_unmonitor_puts_monitored_false_on_parent_cassette() {
+        let home = scratch("unmonitor-put");
+        write_arr_key(&home, "Sonarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_sonarr.json"
+        ))
+        .expect("missing");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_get_series.json"
+        ))
+        .expect("get parent");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_put_series.json"
+        ))
+        .expect("put");
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        ops.unmonitor(&TitleId::series("79126").expect("id"))
+            .await
+            .expect("unmonitor");
+        assert!(
+            t.hits("GET", "/sonarr/api/v3/series/5") >= 1,
+            "GET parent required"
+        );
+        assert!(
+            t.hits("PUT", "/sonarr/api/v3/series/5") >= 1,
+            "PUT monitored:false required"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_unmonitor_puts_movie_parent_cassette() {
+        let home = scratch("unmonitor-movie");
+        write_arr_key(&home, "Radarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_radarr.json"
+        ))
+        .expect("missing");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_get_movie.json"
+        ))
+        .expect("get parent");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_put_movie.json"
+        ))
+        .expect("put");
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        ops.unmonitor(&TitleId::movie("603").expect("movie"))
+            .await
+            .expect("unmonitor");
+        assert!(
+            t.hits("GET", "/radarr/api/v3/movie/10") >= 1,
+            "GET parent required"
+        );
+        assert!(
+            t.hits("PUT", "/radarr/api/v3/movie/10") >= 1,
+            "PUT monitored:false required"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_unmonitor_puts_album_parent_cassette() {
+        let home = scratch("unmonitor-album");
+        write_arr_key(&home, "Lidarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_lidarr.json"
+        ))
+        .expect("missing");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_get_album.json"
+        ))
+        .expect("get parent");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_put_album.json"
+        ))
+        .expect("put");
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        ops.unmonitor(&TitleId::album("0f82b02e-c6cd-4242-b195-93d4bf3e0d63").expect("album"))
+            .await
+            .expect("unmonitor");
+        assert!(
+            t.hits("GET", "/lidarr/api/v1/album/20") >= 1,
+            "GET parent required"
+        );
+        assert!(
+            t.hits("PUT", "/lidarr/api/v1/album/20") >= 1,
+            "PUT monitored:false required"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_unmonitor_not_in_missing_is_success_without_put() {
+        let home = scratch("unmonitor-noop");
+        write_arr_key(&home, "Sonarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_sonarr.json"
+        ))
+        .expect("get");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_get_series.json"
+        ))
+        .expect("unused get parent");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_put_series.json"
+        ))
+        .expect("unused put");
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        ops.unmonitor(&TitleId::movie("603").expect("other"))
+            .await
+            .expect("no-op");
+        assert_eq!(
+            t.hits("GET", "/sonarr/api/v3/series/5"),
+            0,
+            "no parent GET when not missing"
+        );
+        assert_eq!(
+            t.hits("PUT", "/sonarr/api/v3/series/5"),
+            0,
+            "no PUT when not missing"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_wanted_missing_skips_failed_app_and_continues() {
+        let home = scratch("wanted-skip-app");
+        write_arr_key(&home, "Sonarr", "k");
+        write_arr_key(&home, "Radarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/wanted/missing?includeSeries=true&page=1&pageSize=200",
+            None,
+            HttpResponse {
+                status: 500,
+                headers: Vec::new(),
+                body: b"err".to_vec(),
+            },
+        );
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_radarr.json"
+        ))
+        .expect("radarr");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let ids: Vec<String> = ops
+            .wanted_missing()
+            .await
+            .expect("radarr survived")
+            .into_iter()
+            .map(|id| id.render())
+            .collect();
+        assert_eq!(ids, vec!["movie:tmdb:603".to_string()]);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_wanted_missing_errors_when_every_app_fails() {
+        let home = scratch("wanted-all-fail");
+        write_arr_key(&home, "Sonarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/wanted/missing?includeSeries=true&page=1&pageSize=200",
+            None,
+            HttpResponse {
+                status: 500,
+                headers: Vec::new(),
+                body: b"err".to_vec(),
+            },
+        );
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        ops.wanted_missing().await.expect_err("every app failed");
         let _ = fs::remove_dir_all(home);
     }
 }

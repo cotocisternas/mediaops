@@ -67,6 +67,7 @@ pub struct HostConfig {
     pub authentication_method: String,
 }
 
+#[derive(Clone)]
 pub struct ArrClient<T> {
     transport: T,
     base_url: String,
