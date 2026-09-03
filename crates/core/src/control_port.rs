@@ -6,7 +6,7 @@ use std::pin::Pin;
 use crate::ExitCode;
 use crate::bytes::Bytes;
 use crate::desired_state::DesiredState;
-use crate::hold::HoldLiveItem;
+use crate::hold::{HoldKey, HoldLiveItem};
 use crate::title_id::TitleId;
 use crate::walker::RemoteRef;
 
@@ -33,6 +33,7 @@ pub trait ControlPort: Send + Sync {
     fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>>;
     fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>>;
     fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>>;
+    fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>>;
 }
 
 /// Seedbox-local grabber HTTP. Injected into `net::Seedbox`; `net` does not name HTTP.
@@ -48,6 +49,7 @@ pub trait GrabOps: Send + Sync {
         desired: &'a DesiredState,
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
     fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>>;
+    fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>>;
 }
 
 /// `df` payload for handshake + free space. Wire still splits the fields.
@@ -113,6 +115,13 @@ impl ControlError {
             message: message.into(),
         }
     }
+
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: ExitCode::Usage,
+            message: message.into(),
+        }
+    }
 }
 
 /// Outcome of `DeleteRemote`. `SkippedSeeding` is data, not an error.
@@ -147,6 +156,7 @@ mod tests {
         assert_eq!(ControlError::runtime("x").exit_code, ExitCode::Runtime);
         assert_eq!(ControlError::policy("x").exit_code, ExitCode::PolicyRefusal);
         assert_eq!(ControlError::drift("x").exit_code, ExitCode::DriftVerify);
+        assert_eq!(ControlError::usage("x").exit_code, ExitCode::Usage);
     }
 
     #[test]

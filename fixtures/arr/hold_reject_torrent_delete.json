@@ -1,0 +1,11 @@
+{
+  "request": {
+    "method": "DELETE",
+    "path": "/sonarr/api/v3/queue/12?removeFromClient=true&blocklist=true"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body": ""
+  }
+}

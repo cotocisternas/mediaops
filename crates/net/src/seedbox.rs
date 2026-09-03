@@ -6,8 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use mediaops_core::{
-    Allowlist, ControlError, DesiredState, ExitCode, GrabOps, Grabber, RemoteRef, WalkerError,
-    nginx_host_ok, panel_fingerprint,
+    Allowlist, ControlError, DesiredState, ExitCode, GrabOps, Grabber, HoldKey, HoldLiveItem,
+    RemoteRef, WalkerError, nginx_host_ok, panel_fingerprint,
 };
 use mediaops_proto::control_server::Control;
 use mediaops_proto::transfer_server::Transfer;
@@ -16,9 +16,9 @@ use mediaops_proto::{
     EdgeApplyResponse, EdgeCheckRequest, EdgeCheckResponse, ErrorDetail, GetRangeRequest,
     GetRangeResponse, GrabApplyRequest, GrabApplyResponse, GuardPreviewRequest,
     GuardPreviewResponse, HoldListRequest, HoldListResponse, HoldLiveItem as WireHold,
-    KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest, ListResponse, PROTO_PACKAGE,
-    RemoteEntry as WireEntry, StatRequest, StatResponse, UnmonitorRequest, UnmonitorResponse,
-    status_from_error_detail,
+    HoldRejectRequest, HoldRejectResponse, KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest,
+    ListResponse, PROTO_PACKAGE, RemoteEntry as WireEntry, StatRequest, StatResponse,
+    UnmonitorRequest, UnmonitorResponse, status_from_error_detail,
 };
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -286,12 +286,20 @@ impl Control for Seedbox {
         let items = if self.grabber == Grabber::None {
             Vec::new()
         } else if let Some(ops) = &self.grab_ops {
-            ops.hold_list()
+            let mut items = ops
+                .hold_list()
                 .await
-                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?
-                .iter()
-                .map(WireHold::from)
-                .collect()
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
+            let allowlist = self.allowlist.clone();
+            items = tokio::task::spawn_blocking(move || {
+                for item in &mut items {
+                    attach_remote_from_output_path(&allowlist, item);
+                }
+                items
+            })
+            .await
+            .map_err(status_from_join)?;
+            items.iter().map(WireHold::from).collect()
         } else {
             Vec::new()
         };
@@ -301,6 +309,81 @@ impl Control for Seedbox {
             items,
         }))
     }
+
+    async fn hold_reject(
+        &self,
+        request: Request<HoldRejectRequest>,
+    ) -> Result<Response<HoldRejectResponse>, Status> {
+        if self.grabber == Grabber::None {
+            return Err(status_from_error_detail(&ErrorDetail::from(
+                ControlError::usage("grabber is none; hold reject requires a grabber"),
+            )));
+        }
+        let key = HoldKey::try_from(request.into_inner()).map_err(status_from_convert)?;
+        if let Some(ops) = &self.grab_ops {
+            ops.hold_reject(&key)
+                .await
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
+        } else {
+            return Err(status_from_error_detail(&ErrorDetail::from(
+                ControlError::usage("grabber is none; hold reject requires a grabber"),
+            )));
+        }
+        let (semver, proto_package) = self.handshake();
+        Ok(Response::new(HoldRejectResponse {
+            semver,
+            proto_package,
+        }))
+    }
+}
+
+fn attach_remote_from_output_path(allowlist: &Allowlist, item: &mut HoldLiveItem) {
+    if item.remote.is_some() {
+        return;
+    }
+    let Some(raw) = item.output_path.as_deref() else {
+        return;
+    };
+    let path = std::path::Path::new(raw);
+    if let Ok(remote) = allowlist.resolve(path)
+        && allowlist.entry(&remote).is_ok()
+    {
+        item.remote = Some(remote);
+        return;
+    }
+    let Ok(entries) = allowlist.list() else {
+        return;
+    };
+    let mut media = Vec::new();
+    for entry in entries {
+        let Ok(abs) = allowlist.absolute(entry.r#ref()) else {
+            continue;
+        };
+        if !(abs == path || abs.starts_with(path)) {
+            continue;
+        }
+        let Some(name) = abs.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if is_hold_media_name(name) {
+            media.push(entry.r#ref().clone());
+        }
+    }
+    if media.len() == 1 {
+        item.remote = Some(media.remove(0));
+    }
+}
+
+fn is_hold_media_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("sample") {
+        return false;
+    }
+    let ext = lower.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    matches!(
+        ext,
+        "mkv" | "mp4" | "m4v" | "avi" | "ts" | "flac" | "mp3" | "m4a"
+    )
 }
 
 #[tonic::async_trait]
@@ -390,8 +473,8 @@ mod tests {
     };
     use mediaops_proto::{
         DeleteRemoteRequest, EdgeApplyRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
-        GuardPreviewRequest, HoldListRequest, KeyDiscoveryRequest, PROTO_PACKAGE,
-        RemoteRef as WireRef, StatRequest, UnmonitorRequest,
+        GuardPreviewRequest, HoldListRequest, HoldRejectRequest, KeyDiscoveryRequest,
+        PROTO_PACKAGE, RemoteRef as WireRef, StatRequest, UnmonitorRequest,
     };
     use std::io::Write;
     use tokio_stream::StreamExt;
@@ -531,20 +614,23 @@ mod tests {
             let items = self.items.clone();
             Box::pin(async move { Ok(items) })
         }
+        fn hold_reject<'a>(&'a self, _: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[tokio::test]
     async fn hold_list_uses_grab_ops_when_grabber_is_servarr() {
         let root = scratch("hold-ops");
-        let item = HoldLiveItem {
-            key: HoldKey::new(
+        let item = HoldLiveItem::new(
+            HoldKey::new(
                 TitleId::movie("603").expect("title"),
                 ReleaseId::parse("deadbeef").expect("id"),
             ),
-            added_unix: 1,
-            size: 2,
-            reason: "blocked".into(),
-        };
+            1,
+            2,
+            "blocked",
+        );
         let seed =
             seedbox_with(root.clone()).with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps {
                 items: vec![item.clone()],
@@ -572,6 +658,88 @@ mod tests {
         assert_eq!(listed.items.len(), 1);
         assert_eq!(listed.items[0].title_id, "movie:tmdb:603");
         assert_eq!(listed.items[0].release_id, "deadbeef");
+
+        let rejected = servarr
+            .hold_reject(Request::new(HoldRejectRequest {
+                title_id: "movie:tmdb:603".into(),
+                release_id: "deadbeef".into(),
+            }))
+            .await
+            .expect("reject servarr")
+            .into_inner();
+        assert_eq!(rejected.proto_package, PROTO_PACKAGE);
+        let none_err = seed
+            .hold_reject(Request::new(HoldRejectRequest {
+                title_id: "movie:tmdb:603".into(),
+                release_id: "deadbeef".into(),
+            }))
+            .await
+            .expect_err("grabber=None reject is usage");
+        let detail = mediaops_proto::error_detail_from_status(&none_err).expect("detail");
+        assert_eq!(detail.exit_code, i32::from(mediaops_core::ExitCode::Usage));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hold_list_maps_output_path_through_allowlist_to_remote_ref() {
+        let root = scratch("hold-remote");
+        write_file(&root.join("The.Matrix.1999.mkv"), b"abcd");
+        let mut item = HoldLiveItem::new(
+            HoldKey::new(
+                TitleId::movie("603").expect("title"),
+                ReleaseId::parse("deadbeef").expect("id"),
+            ),
+            1,
+            4,
+            "blocked",
+        );
+        item.output_path = Some(root.join("The.Matrix.1999.mkv").display().to_string());
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root.clone()).expect("root");
+        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr)
+            .with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps { items: vec![item] })));
+        let listed = seed
+            .hold_list(Request::new(HoldListRequest {}))
+            .await
+            .expect("list")
+            .into_inner();
+        assert_eq!(listed.items.len(), 1);
+        let remote = listed.items[0].remote.as_ref().expect("remote");
+        assert_eq!(remote.root_id, "seedbox");
+        assert_eq!(remote.rel_path, "The.Matrix.1999.mkv");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hold_list_maps_directory_output_path_to_the_one_media_file() {
+        let root = scratch("hold-dir");
+        let dir = root.join("The.Matrix.1999");
+        write_file(&dir.join("movie.nfo"), b"nfo");
+        write_file(&dir.join("poster.jpg"), b"jpg");
+        write_file(&dir.join("sample.mkv"), b"sample");
+        write_file(&dir.join("The.Matrix.1999.mkv"), b"abcd");
+        let mut item = HoldLiveItem::new(
+            HoldKey::new(
+                TitleId::movie("603").expect("title"),
+                ReleaseId::parse("deadbeef").expect("id"),
+            ),
+            1,
+            4,
+            "blocked",
+        );
+        item.output_path = Some(dir.display().to_string());
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root.clone()).expect("root");
+        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr)
+            .with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps { items: vec![item] })));
+        let listed = seed
+            .hold_list(Request::new(HoldListRequest {}))
+            .await
+            .expect("list")
+            .into_inner();
+        let remote = listed.items[0].remote.as_ref().expect("remote");
+        assert_eq!(remote.root_id, "seedbox");
+        assert_eq!(remote.rel_path, "The.Matrix.1999/The.Matrix.1999.mkv");
         let _ = std::fs::remove_dir_all(root);
     }
 

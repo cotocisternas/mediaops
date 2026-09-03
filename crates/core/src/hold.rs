@@ -5,7 +5,9 @@
 //! is computed in `sync`. Mapping from Servarr JSON lives only in `arr`.
 
 use crate::digest::Blake3Hex;
+use crate::pathschema::{PathSchemaError, Placement, render, strip_placement, strip_scene_tags};
 use crate::title_id::TitleId;
+use crate::walker::RemoteRef;
 
 /// Durable release identifier. Carried verbatim on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -79,18 +81,84 @@ impl HoldKey {
 }
 
 /// Live import-blocked queue item. Age is `max(0, now - added_unix)`.
+///
+/// `remote` / `placement` are additive planning fields (list JSON stays age/size/reason).
+/// `output_path` is the *arr `outputPath` string; seedbox maps it through the allowlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoldLiveItem {
     pub key: HoldKey,
     pub added_unix: i64,
     pub size: u64,
     pub reason: String,
+    pub remote: Option<RemoteRef>,
+    pub placement: Option<Placement>,
+    pub output_path: Option<String>,
 }
 
 impl HoldLiveItem {
+    pub fn new(key: HoldKey, added_unix: i64, size: u64, reason: impl Into<String>) -> Self {
+        Self {
+            key,
+            added_unix,
+            size,
+            reason: reason.into(),
+            remote: None,
+            placement: None,
+            output_path: None,
+        }
+    }
+
     pub fn age_secs(&self, now_unix: i64) -> u64 {
         u64::try_from(now_unix.saturating_sub(self.added_unix)).unwrap_or(0)
     }
+}
+
+/// PathSchema-preflight for `hold approve`: leftover scene tags and spaces refuse.
+///
+/// Strip scene tags, then `render`. Spaces or leftover REPACJ/REPACK/PROPER are
+/// policy (no decision row).
+pub fn preflight_approve_placement(
+    title_id: &TitleId,
+    placement: &Placement,
+) -> Result<Placement, PathSchemaError> {
+    if let Some(token) = placement_space_token(placement) {
+        return Err(PathSchemaError::SpaceRefused(token.to_string()));
+    }
+    if let Some(token) = placement_leftover_token(placement) {
+        return Err(PathSchemaError::LeftoverSceneTag(token.to_string()));
+    }
+    let stripped = strip_placement(placement);
+    render(title_id, &stripped)?;
+    Ok(stripped)
+}
+
+fn placement_tokens(placement: &Placement) -> Vec<&str> {
+    match placement {
+        Placement::Movie {
+            title, extension, ..
+        } => vec![title, extension],
+        Placement::Episode {
+            title, extension, ..
+        } => vec![title, extension],
+        Placement::Track {
+            album,
+            title,
+            extension,
+            ..
+        } => vec![album, title, extension],
+    }
+}
+
+fn placement_space_token(placement: &Placement) -> Option<&str> {
+    placement_tokens(placement)
+        .into_iter()
+        .find(|token| token.chars().any(char::is_whitespace))
+}
+
+fn placement_leftover_token(placement: &Placement) -> Option<&str> {
+    placement_tokens(placement)
+        .into_iter()
+        .find(|token| strip_scene_tags(token) != **token)
 }
 
 /// Persistable operator decision. `approved`/`rejected` so 6.2 needs no extra migration.
@@ -202,20 +270,49 @@ mod tests {
 
     #[test]
     fn age_secs_is_max_zero_now_minus_added() {
-        let item = HoldLiveItem {
-            key: HoldKey::new(
+        let item = HoldLiveItem::new(
+            HoldKey::new(
                 TitleId::movie("603").expect("title"),
                 ReleaseId::parse("abc").expect("id"),
             ),
-            added_unix: 100,
-            size: 42,
-            reason: "blocked".into(),
-        };
+            100,
+            42,
+            "blocked",
+        );
         assert_eq!(item.age_secs(150), 50);
         assert_eq!(item.age_secs(100), 0);
         assert_eq!(item.age_secs(50), 0);
         assert_eq!(item.size, 42);
         assert_eq!(item.reason, "blocked");
+        assert!(item.remote.is_none());
+        assert!(item.placement.is_none());
+    }
+
+    #[test]
+    fn approve_preflight_refuses_spaces_and_leftover_scene_tags() {
+        let title = TitleId::movie("603").expect("title");
+        let spaces = Placement::movie("The Matrix", 1999, "mkv");
+        assert!(matches!(
+            preflight_approve_placement(&title, &spaces),
+            Err(PathSchemaError::SpaceRefused(_))
+        ));
+        let leftover = Placement::movie("The.Matrix.REPACK", 1999, "mkv");
+        assert!(matches!(
+            preflight_approve_placement(&title, &leftover),
+            Err(PathSchemaError::LeftoverSceneTag(_))
+        ));
+        let repacj = Placement::movie("The.Matrix.REPACJ", 1999, "mkv");
+        assert!(matches!(
+            preflight_approve_placement(&title, &repacj),
+            Err(PathSchemaError::LeftoverSceneTag(_))
+        ));
+        let proper = Placement::movie("The.Matrix.PROPER", 1999, "mkv");
+        assert!(matches!(
+            preflight_approve_placement(&title, &proper),
+            Err(PathSchemaError::LeftoverSceneTag(_))
+        ));
+        let ok = Placement::movie("The.Matrix", 1999, "mkv");
+        assert_eq!(preflight_approve_placement(&title, &ok).expect("ok"), ok);
     }
 
     #[test]

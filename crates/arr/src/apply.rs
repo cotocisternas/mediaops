@@ -2,8 +2,8 @@
 
 use mediaops_core::{
     BoxFuture, ControlError, DesiredState, EdgeApiReport, GrabApplyReport, GrabDownloadClient,
-    GrabIndexer, GrabOps, Grabber, HoldKey, HoldLiveItem, KeyPresence, ReleaseId, TitleId,
-    unified_diff,
+    GrabIndexer, GrabOps, Grabber, HoldKey, HoldLiveItem, KeyPresence, Placement, ReleaseId,
+    TitleId, TitleKind, unified_diff,
 };
 use serde_json::{Value, json};
 
@@ -190,6 +190,61 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
                 out.extend(hold_items_from_queue(&queue));
             }
             Ok(out)
+        })
+    }
+
+    fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>> {
+        Box::pin(async move {
+            let keys = discover_keys(&self.key_paths).map_err(key_to_control)?;
+            if let Some(api_key) = keys.sonarr() {
+                let client = ArrClient::new(
+                    self.transport.clone(),
+                    &self.sonarr_base,
+                    "/api/v3",
+                    api_key,
+                )
+                .map_err(arr_to_control)?;
+                let queue = client
+                    .get_paged_with("queue", "includeSeries=true&includeEpisode=true")
+                    .await
+                    .map_err(arr_to_control)?;
+                if hold_reject_queue(&client, &queue, key).await? {
+                    return Ok(());
+                }
+            }
+            if let Some(api_key) = keys.radarr() {
+                let client = ArrClient::new(
+                    self.transport.clone(),
+                    &self.radarr_base,
+                    "/api/v3",
+                    api_key,
+                )
+                .map_err(arr_to_control)?;
+                let queue = client
+                    .get_paged_with("queue", "includeMovie=true")
+                    .await
+                    .map_err(arr_to_control)?;
+                if hold_reject_queue(&client, &queue, key).await? {
+                    return Ok(());
+                }
+            }
+            if let Some(api_key) = keys.lidarr() {
+                let client = ArrClient::new(
+                    self.transport.clone(),
+                    &self.lidarr_base,
+                    "/api/v1",
+                    api_key,
+                )
+                .map_err(arr_to_control)?;
+                let queue = client
+                    .get_paged_with("queue", "includeArtist=true&includeAlbum=true")
+                    .await
+                    .map_err(arr_to_control)?;
+                if hold_reject_queue(&client, &queue, key).await? {
+                    return Ok(());
+                }
+            }
+            Err(ControlError::runtime("hold not in grabber queue"))
         })
     }
 }
@@ -854,8 +909,9 @@ fn key_to_control(err: crate::keys::KeyError) -> ControlError {
 /// Map a Servarr queue JSON document to live hold items. Only `arr` parses queue JSON.
 ///
 /// Include when `trackedDownloadState` is `importBlocked` (ci). Skip missing TitleId
-/// or `release_id` without error. Path fields are ignored so blocked NZBs never look
-/// like library.
+/// or `release_id` without error. Placement (title/year/ext/S/E) comes from nested
+/// *arr objects. `outputPath` is carried for seedbox allowlist → RemoteRef; it is
+/// not a library path.
 pub fn hold_items_from_queue(queue: &Value) -> Vec<HoldLiveItem> {
     let records = queue
         .get("records")
@@ -875,14 +931,185 @@ fn hold_item_from_record(item: &Value) -> Option<HoldLiveItem> {
     let title_id = title_id_from_queue_item(item)?;
     let release_id = release_id_from_queue_item(item)?;
     Some(HoldLiveItem {
-        key: HoldKey::new(title_id, release_id),
+        key: HoldKey::new(title_id.clone(), release_id),
         added_unix: item
             .get("added")
             .and_then(parse_added)
             .unwrap_or_else(current_unix),
         size: item.get("size").and_then(json_u64).unwrap_or(0),
         reason: reason_from_queue_item(item),
+        remote: None,
+        placement: placement_from_queue_item(item, &title_id),
+        output_path: item
+            .get("outputPath")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     })
+}
+
+async fn hold_reject_queue<T: HttpTransport>(
+    client: &ArrClient<T>,
+    queue: &Value,
+    key: &HoldKey,
+) -> Result<bool, ControlError> {
+    let records = queue
+        .get("records")
+        .and_then(Value::as_array)
+        .or_else(|| queue.as_array());
+    let Some(records) = records else {
+        return Ok(false);
+    };
+    let mut deleted = false;
+    for record in records {
+        let Some(item) = hold_item_from_record(record) else {
+            continue;
+        };
+        if item.key != *key {
+            continue;
+        }
+        let Some(id) = queue_record_id(record) else {
+            return Err(ControlError::runtime(
+                "queue record has no numeric id; will not use downloadId as path id",
+            ));
+        };
+        client
+            .delete(&format!("queue/{id}?removeFromClient=true&blocklist=true"))
+            .await
+            .map_err(arr_to_control)?;
+        deleted = true;
+    }
+    Ok(deleted)
+}
+
+fn queue_record_id(item: &Value) -> Option<i64> {
+    let value = item.get("id")?;
+    if let Some(n) = value.as_i64() {
+        return (n > 0).then_some(n);
+    }
+    if let Some(n) = value.as_u64() {
+        return i64::try_from(n).ok().filter(|n| *n > 0);
+    }
+    value
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+}
+
+fn placement_from_queue_item(item: &Value, title_id: &TitleId) -> Option<Placement> {
+    match title_id.kind() {
+        TitleKind::Movie => {
+            let movie = item.get("movie")?;
+            let title = schema_token(movie.get("title").and_then(Value::as_str)?)?;
+            let year = movie.get("year").and_then(json_u16)?;
+            let extension = extension_from_file_obj(movie.get("movieFile"))
+                .or_else(|| extension_from_output_path(item))
+                .unwrap_or_else(|| default_extension(TitleKind::Movie).to_string());
+            Some(Placement::movie(title, year, extension))
+        }
+        TitleKind::Series => {
+            let series = item.get("series")?;
+            let title = schema_token(series.get("title").and_then(Value::as_str)?)?;
+            let year = series.get("year").and_then(json_u16)?;
+            let episode = item.get("episode")?;
+            let season = episode.get("seasonNumber").and_then(json_u8)?;
+            let ep = episode.get("episodeNumber").and_then(json_u8)?;
+            let extension = extension_from_file_obj(episode.get("episodeFile"))
+                .or_else(|| extension_from_file_obj(item.get("episodeFile")))
+                .or_else(|| extension_from_output_path(item))
+                .unwrap_or_else(|| default_extension(TitleKind::Series).to_string());
+            Some(Placement::episode(title, year, season, ep, extension))
+        }
+        TitleKind::Album => {
+            let album = item.get("album")?;
+            let album_title = schema_token(album.get("title").and_then(Value::as_str)?)?;
+            let year = album
+                .get("year")
+                .and_then(json_u16)
+                .or_else(|| year_from_release_date(album.get("releaseDate")))?;
+            let track = item.get("track")?;
+            let track_no = track.get("trackNumber").and_then(json_u8)?;
+            let track_title = schema_token(track.get("title").and_then(Value::as_str)?)?;
+            let extension = extension_from_file_obj(item.get("trackFile"))
+                .or_else(|| extension_from_file_obj(track.get("trackFile")))
+                .or_else(|| extension_from_output_path(item))
+                .unwrap_or_else(|| default_extension(TitleKind::Album).to_string());
+            Some(Placement::track(
+                album_title,
+                year,
+                track_no,
+                track_title,
+                extension,
+            ))
+        }
+    }
+}
+
+/// Display names → PathSchema tokens: spaces become `.`, repeated separators collapse.
+fn schema_token(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut pending_sep = false;
+    for c in raw.chars() {
+        if c.is_whitespace() || c == '.' {
+            pending_sep = !out.is_empty();
+            continue;
+        }
+        if pending_sep {
+            out.push('.');
+            pending_sep = false;
+        }
+        out.push(c);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn default_extension(kind: TitleKind) -> &'static str {
+    match kind {
+        TitleKind::Movie | TitleKind::Series => "mkv",
+        TitleKind::Album => "flac",
+    }
+}
+
+fn is_media_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "mkv" | "mp4" | "m4v" | "avi" | "ts" | "flac" | "mp3" | "m4a"
+    )
+}
+
+fn extension_from_basename(path: &str) -> Option<String> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let ext = name.rsplit_once('.')?.1;
+    is_media_extension(ext).then(|| ext.to_ascii_lowercase())
+}
+
+fn extension_from_file_obj(obj: Option<&Value>) -> Option<String> {
+    let obj = obj?;
+    let path = obj
+        .get("relativePath")
+        .or_else(|| obj.get("path"))
+        .and_then(Value::as_str)?;
+    extension_from_basename(path)
+}
+
+fn extension_from_output_path(item: &Value) -> Option<String> {
+    item.get("outputPath")
+        .and_then(Value::as_str)
+        .and_then(extension_from_basename)
+}
+
+fn year_from_release_date(value: Option<&Value>) -> Option<u16> {
+    let raw = value.and_then(Value::as_str)?;
+    let year: u16 = raw.get(0..4)?.parse().ok()?;
+    (1000..=9999).contains(&year).then_some(year)
+}
+
+fn json_u16(value: &Value) -> Option<u16> {
+    json_u64(value).and_then(|n| u16::try_from(n).ok())
+}
+
+fn json_u8(value: &Value) -> Option<u8> {
+    json_u64(value).and_then(|n| u8::try_from(n).ok())
 }
 
 fn title_id_from_queue_item(item: &Value) -> Option<TitleId> {
@@ -975,6 +1202,7 @@ fn json_u64(value: &Value) -> Option<u64> {
                 }
             })
         })
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
 fn current_unix() -> i64 {
@@ -1565,6 +1793,7 @@ auth = "forms"
         json!({
             "records": [
                 {
+                    "id": 11,
                     "title": "The.Matrix.1999.nzb",
                     "size": 12345,
                     "protocol": "usenet",
@@ -1575,9 +1804,15 @@ auth = "forms"
                         "title": "The Matrix",
                         "messages": ["No files found are eligible for import"]
                     }],
-                    "movie": {"tmdbId": 603}
+                    "movie": {
+                        "tmdbId": 603,
+                        "title": "The.Matrix",
+                        "year": 1999,
+                        "movieFile": {"relativePath": "The.Matrix.1999.mkv"}
+                    }
                 },
                 {
+                    "id": 12,
                     "title": "The.Wire.S01E01",
                     "size": 999,
                     "protocol": "torrent",
@@ -1587,15 +1822,27 @@ auth = "forms"
                     "statusMessages": [{
                         "messages": ["Sample file only"]
                     }],
-                    "series": {"tvdbId": 79126}
+                    "series": {"tvdbId": 79126, "title": "The.Wire", "year": 2002},
+                    "episode": {
+                        "seasonNumber": 1,
+                        "episodeNumber": 1,
+                        "episodeFile": {"relativePath": "The.Wire.S01E01.mkv"}
+                    }
                 },
                 {
+                    "id": 13,
                     "title": "Relayer",
                     "size": 50,
                     "protocol": "usenet",
                     "trackedDownloadState": "importBlocked",
                     "added": "2020-01-03T00:00:00Z",
-                    "album": {"foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63"}
+                    "album": {
+                        "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63",
+                        "title": "Relayer",
+                        "releaseDate": "2013-01-01T00:00:00Z"
+                    },
+                    "track": {"trackNumber": 1, "title": "The.Gates.Of.Delirium"},
+                    "trackFile": {"path": "01.The.Gates.Of.Delirium.flac"}
                 },
                 {
                     "title": "Downloading",
@@ -1648,13 +1895,96 @@ auth = "forms"
             items[2].key.title_id.render(),
             "album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63"
         );
+        assert_eq!(
+            items[0].placement,
+            Some(Placement::movie("The.Matrix", 1999, "mkv"))
+        );
+        assert_eq!(
+            items[1].placement,
+            Some(Placement::episode("The.Wire", 2002, 1, 1, "mkv"))
+        );
+        assert_eq!(
+            items[2].placement,
+            Some(Placement::track(
+                "Relayer",
+                2013,
+                1,
+                "The.Gates.Of.Delirium",
+                "flac"
+            ))
+        );
+        assert_eq!(
+            items[0].output_path.as_deref(),
+            Some("/data/_incoming/The.Matrix.1999")
+        );
         for item in &items {
-            let debug = format!("{item:?}");
             assert!(
-                !debug.contains("_incoming") && !debug.contains("outputPath"),
-                "blocked NZBs must not rot as a junk drawer of library paths: {debug}"
+                item.remote.is_none(),
+                "outputPath is not a library RemoteRef in arr: {item:?}"
             );
         }
+    }
+
+    #[test]
+    fn placement_from_import_blocked_without_file_maps_spaces_and_output_path() {
+        let file_path = hold_items_from_queue(&json!({
+            "records": [{
+                "title": "The.Matrix.1999.nzb",
+                "protocol": "usenet",
+                "trackedDownloadState": "importBlocked",
+                "outputPath": "/data/_incoming/The.Matrix.1999/The.Matrix.1999.mkv",
+                "movie": {"tmdbId": 603, "title": "The Matrix", "year": 1999}
+            }]
+        }));
+        assert_eq!(
+            file_path[0].placement,
+            Some(Placement::movie("The.Matrix", 1999, "mkv"))
+        );
+        let dir_path = hold_items_from_queue(&json!({
+            "records": [{
+                "title": "The.Matrix.1999.nzb",
+                "protocol": "usenet",
+                "trackedDownloadState": "importBlocked",
+                "outputPath": "/data/_incoming/The.Matrix.1999",
+                "movie": {"tmdbId": 603, "title": "The  Matrix", "year": 1999}
+            }]
+        }));
+        assert_eq!(
+            dir_path[0].placement,
+            Some(Placement::movie("The.Matrix", 1999, "mkv")),
+            "dir basename is not an extension; default mkv; spaces collapse to dots"
+        );
+        let album = hold_items_from_queue(&json!({
+            "records": [{
+                "title": "Relayer.nzb",
+                "protocol": "usenet",
+                "trackedDownloadState": "importBlocked",
+                "album": {
+                    "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63",
+                    "title": "Relayer",
+                    "year": 2013
+                },
+                "track": {"trackNumber": "1", "title": "The Gates Of Delirium"}
+            }]
+        }));
+        assert_eq!(
+            album[0].placement,
+            Some(Placement::track(
+                "Relayer",
+                2013,
+                1,
+                "The.Gates.Of.Delirium",
+                "flac"
+            ))
+        );
+    }
+
+    #[test]
+    fn queue_record_id_accepts_json_string() {
+        assert_eq!(queue_record_id(&json!({"id": 11})), Some(11));
+        assert_eq!(queue_record_id(&json!({"id": "11"})), Some(11));
+        assert_eq!(queue_record_id(&json!({"id": "DEADBEEF"})), None);
+        assert_eq!(queue_record_id(&json!({"downloadId": "11"})), None);
     }
 
     #[test]
@@ -1767,6 +2097,50 @@ auth = "forms"
             "lidarr album missing: {ids:?}"
         );
         assert_eq!(items.len(), 4);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_hold_reject_deletes_queue_id_with_blocklist_cassette() {
+        let home = scratch("hold-reject");
+        write_arr_key(&home, "Sonarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/import_blocked_queue.json"
+        ))
+        .expect("queue cassette");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/hold_reject_delete.json"
+        ))
+        .expect("delete cassette");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let key = HoldKey::new(
+            TitleId::movie("603").expect("title"),
+            ReleaseId::usenet("The.Matrix.1999.nzb").expect("usenet"),
+        );
+        ops.hold_reject(&key).await.expect("reject");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_hold_reject_does_not_use_download_id_as_path_id() {
+        let home = scratch("hold-reject-id");
+        write_arr_key(&home, "Sonarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/import_blocked_queue.json"
+        ))
+        .expect("queue cassette");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/hold_reject_torrent_delete.json"
+        ))
+        .expect("delete cassette");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        let key = HoldKey::new(
+            TitleId::series("79126").expect("title"),
+            ReleaseId::torrent("DEADBEEF").expect("torrent"),
+        );
+        ops.hold_reject(&key).await.expect("reject torrent");
         let _ = fs::remove_dir_all(home);
     }
 

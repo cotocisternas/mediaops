@@ -16,10 +16,10 @@ use mediaops_proto::{
     DfRequest, DfResponse, EdgeApplyRequest, EdgeApplyResponse, EdgeCheckRequest,
     EdgeCheckResponse, ErrorDetail, GetRangeRequest, GetRangeResponse, GrabApplyRequest,
     GrabApplyResponse, GuardPreviewRequest, GuardPreviewResponse, HoldListRequest,
-    HoldListResponse, KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest, ListResponse,
-    PoolStatusRequest, PoolStatusResponse, ProbeRangeRequest, ProbeRangeResponse, StatRequest,
-    StatResponse, UnmonitorRequest, UnmonitorResponse, resource_exhausted_detail,
-    status_from_error_detail,
+    HoldListResponse, HoldRejectRequest, HoldRejectResponse, KeyDiscoveryRequest,
+    KeyDiscoveryResponse, ListRequest, ListResponse, PoolStatusRequest, PoolStatusResponse,
+    ProbeRangeRequest, ProbeRangeResponse, StatRequest, StatResponse, UnmonitorRequest,
+    UnmonitorResponse, resource_exhausted_detail, status_from_error_detail,
 };
 use rustls::ClientConfig;
 use tokio::sync::Mutex;
@@ -187,6 +187,15 @@ impl Control for HomeGateway {
     ) -> Result<Response<HoldListResponse>, Status> {
         ControlClient::new(self.control.clone())
             .hold_list(request)
+            .await
+    }
+
+    async fn hold_reject(
+        &self,
+        request: Request<HoldRejectRequest>,
+    ) -> Result<Response<HoldRejectResponse>, Status> {
+        ControlClient::new(self.control.clone())
+            .hold_reject(request)
             .await
     }
 }

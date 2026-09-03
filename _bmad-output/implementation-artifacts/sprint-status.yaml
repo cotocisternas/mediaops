@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 08-29-2026 01:26
-last_updated: 09-02-2026 20:25
+last_updated: 09-02-2026 22:16
 project: mediaops
 project_key: NOKEY
 tracking_system: file-system
@@ -70,7 +70,7 @@ development_status:
 
   epic-6: in-progress
   6-1-hold-store-and-inbox-join: review
-  6-2-approve-and-reject: backlog
+  6-2-approve-and-reject: review
   epic-6-retrospective: optional
 
   epic-7: backlog

@@ -12,6 +12,7 @@
       "totalRecords": 2,
       "records": [
         {
+          "id": 11,
           "title": "The.Matrix.1999.nzb",
           "size": 12345,
           "protocol": "usenet",
@@ -24,9 +25,15 @@
               "messages": ["No files found are eligible for import"]
             }
           ],
-          "movie": {"tmdbId": 603}
+          "movie": {
+            "tmdbId": 603,
+            "title": "The.Matrix",
+            "year": 1999,
+            "movieFile": {"relativePath": "The.Matrix.1999.mkv"}
+          }
         },
         {
+          "id": 12,
           "title": "The.Wire.S01E01",
           "size": 999,
           "protocol": "torrent",
@@ -36,7 +43,12 @@
           "statusMessages": [
             {"messages": ["Sample file only"]}
           ],
-          "series": {"tvdbId": 79126}
+          "series": {"tvdbId": 79126, "title": "The.Wire", "year": 2002},
+          "episode": {
+            "seasonNumber": 1,
+            "episodeNumber": 1,
+            "episodeFile": {"relativePath": "The.Wire.S01E01.mkv"}
+          }
         }
       ]
     }

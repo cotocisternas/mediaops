@@ -3,9 +3,9 @@
 use std::collections::HashSet;
 
 use mediaops_core::{
-    Action, DesiredState, Grabber, Job, JobState, RemoteEntry, SKIP_DUPLICATE_TITLE, SKIP_LOCK,
-    SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK, TitleId, TitleIndexEntry, TitleKind,
-    WantState, parse_placement,
+    Action, DesiredState, Grabber, HoldLiveItem, Job, JobState, RemoteEntry, SKIP_DUPLICATE_TITLE,
+    SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK, TitleId, TitleIndexEntry,
+    TitleKind, WantState, parse_placement, render, strip_placement,
 };
 
 pub struct PlanRequest<'a> {
@@ -19,6 +19,8 @@ pub struct PlanRequest<'a> {
     pub free_bytes: u64,
     /// When doctor would freeze/drift, emit EdgeApply.
     pub edge_frozen: bool,
+    /// Approved holds with a live RemoteRef+placement become Copy (not Review).
+    pub approved: &'a [HoldLiveItem],
 }
 
 pub struct Planned {
@@ -92,6 +94,58 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
             title_id,
             remote: entry.r#ref().clone(),
             file_len: entry.len(),
+            placement,
+            listing_index,
+            kind,
+        });
+    }
+
+    for (offset, item) in req.approved.iter().enumerate() {
+        let (Some(remote), Some(placement)) = (&item.remote, &item.placement) else {
+            continue;
+        };
+        let placement = strip_placement(placement);
+        if render(&item.key.title_id, &placement).is_err() {
+            continue;
+        }
+        let title_id = item.key.title_id.clone();
+        let listing_index = req.listings.len() + offset;
+        if installed.contains(&title_id) {
+            if planned_titles.insert(title_id.clone()) {
+                upgrade_never.push(Action::Skip {
+                    title_id: Some(title_id),
+                    reason: SKIP_UPGRADE_NEVER.to_string(),
+                });
+            } else {
+                duplicates.push(Action::Skip {
+                    title_id: Some(title_id),
+                    reason: SKIP_DUPLICATE_TITLE.to_string(),
+                });
+            }
+            continue;
+        }
+        if !planned_titles.insert(title_id.clone()) {
+            duplicates.push(Action::Skip {
+                title_id: Some(title_id),
+                reason: SKIP_DUPLICATE_TITLE.to_string(),
+            });
+            continue;
+        }
+        let file_len = req
+            .listings
+            .iter()
+            .find(|entry| entry.r#ref() == remote)
+            .map(mediaops_core::RemoteEntry::len)
+            .unwrap_or(item.size);
+        if file_len == 0 {
+            continue;
+        }
+        let kind = title_id.kind();
+        candidates.push(Candidate {
+            wanted: wants.contains(&title_id),
+            title_id,
+            remote: remote.clone(),
+            file_len,
             placement,
             listing_index,
             kind,
@@ -276,6 +330,7 @@ lock = false
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -313,6 +368,7 @@ lock = false
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -343,6 +399,7 @@ lock = false
             desired: &ds(),
             free_bytes: Bytes::GIB + 100,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(
             planned.actions.iter().all(|a| matches!(
@@ -370,6 +427,7 @@ lock = false
             desired: &ds(),
             free_bytes: 4 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(
             planned.actions.iter().any(|a| matches!(
@@ -400,6 +458,7 @@ lock = false
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert_eq!(planned.actions.len(), 1);
         assert!(matches!(planned.actions[0], Action::Copy { .. }));
@@ -421,6 +480,7 @@ lock = false
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         let ids: Vec<String> = copies(&planned.actions)
             .into_iter()
@@ -447,6 +507,7 @@ lock = false
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert_eq!(copies(&planned.actions).len(), 1);
         assert!(
@@ -474,6 +535,7 @@ lock = false
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -509,6 +571,7 @@ lock = true
             desired: &desired,
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -545,6 +608,7 @@ lock = false
             desired: &desired,
             free_bytes: 10,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(copies(&planned.actions).is_empty());
         assert!(
@@ -582,6 +646,7 @@ grabber = "servarr"
             desired: &desired,
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(
             matches!(planned.actions.first(), Some(Action::GrabApply)),
@@ -611,6 +676,7 @@ grabber = "servarr"
             desired: &desired,
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
+            approved: &[],
         });
         assert!(
             matches!(planned.actions.first(), Some(Action::GrabApply)),
@@ -631,10 +697,167 @@ grabber = "servarr"
             desired: &desired,
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: true,
+            approved: &[],
         });
         assert!(
             matches!(planned.actions.first(), Some(Action::EdgeApply)),
             "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn approved_hold_with_live_remote_is_copy_not_review_or_scene_name() {
+        let title = TitleId::movie("603").expect("id");
+        let remote =
+            RemoteRef::from_wire_parts("seed".into(), PathBuf::from("The.Matrix.1999.REPACK.mkv"))
+                .expect("ref");
+        let mut item = HoldLiveItem::new(
+            mediaops_core::HoldKey::new(
+                title.clone(),
+                mediaops_core::ReleaseId::parse("abc").expect("id"),
+            ),
+            1,
+            10,
+            "blocked",
+        );
+        item.remote = Some(remote.clone());
+        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: std::slice::from_ref(&item),
+        });
+        assert!(
+            planned.actions.iter().all(|a| !matches!(a, Action::Review)),
+            "do not use Action::Review: {:?}",
+            planned.actions
+        );
+        match &planned.actions[..] {
+            [
+                Action::Copy {
+                    title_id,
+                    remote: copy_remote,
+                    placement,
+                    ..
+                },
+            ] => {
+                assert_eq!(title_id, &title);
+                assert_eq!(copy_remote, &remote);
+                assert_eq!(
+                    *placement,
+                    mediaops_core::Placement::movie("The.Matrix", 1999, "mkv")
+                );
+                let dest = render(title_id, placement).expect("schema");
+                assert!(
+                    dest.to_str().expect("utf8").contains("The.Matrix.(1999)"),
+                    "Copy must land on PathSchema, not the scene name: {}",
+                    dest.display()
+                );
+                assert!(!dest.to_str().expect("utf8").contains("REPACK"));
+            }
+            other => panic!("expected one Copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approved_hold_already_in_title_index_is_upgrade_never() {
+        let title = TitleId::movie("603").expect("id");
+        let mut item = HoldLiveItem::new(
+            mediaops_core::HoldKey::new(
+                title.clone(),
+                mediaops_core::ReleaseId::parse("abc").expect("id"),
+            ),
+            1,
+            10,
+            "blocked",
+        );
+        item.remote = Some(
+            RemoteRef::from_wire_parts("seed".into(), PathBuf::from("The.Matrix.1999.mkv"))
+                .expect("ref"),
+        );
+        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
+        let index = [TitleIndexEntry::new(
+            title.clone(),
+            movie_rel("603", 1999),
+            digest('a'),
+            digest('a'),
+        )];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: std::slice::from_ref(&item),
+        });
+        assert!(copies(&planned.actions).is_empty());
+        assert!(
+            planned.actions.iter().any(|a| matches!(
+                a,
+                Action::Skip {
+                    title_id: Some(id),
+                    reason
+                } if *id == title && reason == SKIP_UPGRADE_NEVER
+            )),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn approved_hold_file_len_prefers_listing_and_skips_zero() {
+        let title = TitleId::movie("603").expect("id");
+        let remote =
+            RemoteRef::from_wire_parts("seed".into(), PathBuf::from("The.Matrix.1999.mkv"))
+                .expect("ref");
+        let mut item = HoldLiveItem::new(
+            mediaops_core::HoldKey::new(
+                title.clone(),
+                mediaops_core::ReleaseId::parse("abc").expect("id"),
+            ),
+            1,
+            10,
+            "blocked",
+        );
+        item.remote = Some(remote.clone());
+        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
+        let listings = [entry("The.Matrix.1999.mkv", 99)];
+        let planned = plan_actions(PlanRequest {
+            listings: &listings,
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: std::slice::from_ref(&item),
+        });
+        match &planned.actions[..] {
+            [Action::Copy { file_len, .. }] => assert_eq!(*file_len, 99),
+            other => panic!("expected Copy with listing len, got {other:?}"),
+        }
+        item.size = 0;
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &[],
+            on_disk: &[],
+            open_wants: &[],
+            desired: &ds(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: std::slice::from_ref(&item),
+        });
+        assert!(
+            copies(&planned.actions).is_empty(),
+            "zero-byte hold must not Copy: {:?}",
             planned.actions
         );
     }

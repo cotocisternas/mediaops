@@ -631,6 +631,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_from_scene_named_remote_installs_on_pathschema_not_scene_name() {
+        let action = Action::Copy {
+            title_id: TitleId::movie("603").expect("id"),
+            remote: RemoteRef::from_wire_parts(
+                "seed".into(),
+                PathBuf::from("The.Matrix.1999.REPACK.mkv"),
+            )
+            .expect("ref"),
+            file_len: 4,
+            placement: Placement::movie("The.Matrix", 1999, "mkv"),
+        };
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![action]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("hold-copy-schema");
+        let report = apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+                control: None,
+            },
+        )
+        .await
+        .expect("copy");
+        assert_eq!(report.copies, 1);
+        let installed = report.installed[0].path.to_str().expect("utf8");
+        assert!(
+            installed.contains("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+            "install must use PathSchema, not the scene name: {installed}"
+        );
+        assert!(!installed.contains("REPACK"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn partial_resume_still_works_when_apply_is_killed_mid_file() {
         const MIB: usize = 1 << 20;
         let ds = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\n";
@@ -941,6 +988,12 @@ mod tests {
         ) -> mediaops_core::BoxFuture<'_, Result<Vec<mediaops_core::HoldLiveItem>, ControlError>>
         {
             Box::pin(async { Ok(Vec::new()) })
+        }
+        fn hold_reject<'a>(
+            &'a self,
+            _: &'a mediaops_core::HoldKey,
+        ) -> mediaops_core::BoxFuture<'a, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 

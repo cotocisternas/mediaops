@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use mediaops_core::{
     BoxFuture, Bytes, ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, EdgeApiReport,
     ExitCode, GrabApplyReport, HoldError, HoldKey, HoldLiveItem as CoreHoldLiveItem, KeyPresence,
-    ReleaseId, RemoteEntry as CoreRemoteEntry, RemoteRef as CoreRemoteRef, TitleId, TitleIdError,
-    WalkerError,
+    Placement as CorePlacement, ReleaseId, RemoteEntry as CoreRemoteEntry,
+    RemoteRef as CoreRemoteRef, TitleId, TitleIdError, WalkerError,
 };
 use prost::Message;
 
@@ -73,6 +73,8 @@ pub enum ConvertError {
     TitleId(#[from] TitleIdError),
     #[error(transparent)]
     Hold(#[from] HoldError),
+    #[error("invalid placement field `{0}`")]
+    InvalidPlacement(&'static str),
 }
 
 fn require_nested<T>(value: Option<T>, field: &'static str) -> Result<T, ConvertError> {
@@ -113,15 +115,30 @@ impl TryFrom<&CoreRemoteRef> for RemoteRef {
     type Error = ConvertError;
 
     fn try_from(value: &CoreRemoteRef) -> Result<Self, Self::Error> {
-        let rel_path = value
-            .rel_path()
-            .to_str()
-            .ok_or(ConvertError::NonUtf8Path)?
-            .to_owned();
-        Ok(Self {
+        remote_ref_to_wire_utf8(value)
+    }
+}
+
+fn remote_ref_to_wire_utf8(value: &CoreRemoteRef) -> Result<RemoteRef, ConvertError> {
+    let rel_path = value
+        .rel_path()
+        .to_str()
+        .ok_or(ConvertError::NonUtf8Path)?
+        .to_owned();
+    Ok(RemoteRef {
+        root_id: value.root_id().to_owned(),
+        rel_path,
+    })
+}
+
+/// Hold live remotes must not be dropped: UTF-8 paths stay exact, else lossy.
+fn remote_ref_to_wire(value: &CoreRemoteRef) -> RemoteRef {
+    match remote_ref_to_wire_utf8(value) {
+        Ok(wire) => wire,
+        Err(_) => RemoteRef {
             root_id: value.root_id().to_owned(),
-            rel_path,
-        })
+            rel_path: value.rel_path().to_string_lossy().into_owned(),
+        },
     }
 }
 
@@ -248,6 +265,8 @@ impl From<&CoreHoldLiveItem> for HoldLiveItem {
             added_unix: item.added_unix,
             size: item.size,
             reason: item.reason.clone(),
+            remote: item.remote.as_ref().map(remote_ref_to_wire),
+            placement: item.placement.as_ref().map(Placement::from),
         }
     }
 }
@@ -270,8 +289,116 @@ impl TryFrom<HoldLiveItem> for CoreHoldLiveItem {
             added_unix: value.added_unix,
             size: value.size,
             reason: value.reason,
+            remote: value.remote.map(CoreRemoteRef::try_from).transpose()?,
+            placement: value.placement.map(CorePlacement::try_from).transpose()?,
+            output_path: None,
         })
     }
+}
+
+impl From<&HoldKey> for HoldRejectRequest {
+    fn from(key: &HoldKey) -> Self {
+        Self {
+            title_id: key.title_id.render(),
+            release_id: key.release_id.as_str().to_string(),
+        }
+    }
+}
+
+impl TryFrom<HoldRejectRequest> for HoldKey {
+    type Error = ConvertError;
+
+    fn try_from(value: HoldRejectRequest) -> Result<Self, Self::Error> {
+        Ok(Self::new(
+            TitleId::parse(&value.title_id)?,
+            ReleaseId::parse(&value.release_id)?,
+        ))
+    }
+}
+
+impl From<&CorePlacement> for Placement {
+    fn from(placement: &CorePlacement) -> Self {
+        match placement {
+            CorePlacement::Movie {
+                title,
+                year,
+                extension,
+            } => Self {
+                kind: Some(placement::Kind::Movie(MoviePlacement {
+                    title: title.clone(),
+                    year: u32::from(*year),
+                    extension: extension.clone(),
+                })),
+            },
+            CorePlacement::Episode {
+                title,
+                year,
+                season,
+                episode,
+                extension,
+            } => Self {
+                kind: Some(placement::Kind::Episode(EpisodePlacement {
+                    title: title.clone(),
+                    year: u32::from(*year),
+                    season: u32::from(*season),
+                    episode: u32::from(*episode),
+                    extension: extension.clone(),
+                })),
+            },
+            CorePlacement::Track {
+                album,
+                year,
+                track,
+                title,
+                extension,
+            } => Self {
+                kind: Some(placement::Kind::Track(TrackPlacement {
+                    album: album.clone(),
+                    year: u32::from(*year),
+                    track: u32::from(*track),
+                    title: title.clone(),
+                    extension: extension.clone(),
+                })),
+            },
+        }
+    }
+}
+
+impl TryFrom<Placement> for CorePlacement {
+    type Error = ConvertError;
+
+    fn try_from(value: Placement) -> Result<Self, Self::Error> {
+        match value.kind {
+            Some(placement::Kind::Movie(movie)) => Ok(Self::movie(
+                movie.title,
+                fit_u16(movie.year, "year")?,
+                movie.extension,
+            )),
+            Some(placement::Kind::Episode(ep)) => Ok(Self::episode(
+                ep.title,
+                fit_u16(ep.year, "year")?,
+                fit_u8(ep.season, "season")?,
+                fit_u8(ep.episode, "episode")?,
+                ep.extension,
+            )),
+            Some(placement::Kind::Track(track)) => Ok(Self::track(
+                track.album,
+                fit_u16(track.year, "year")?,
+                fit_u8(track.track, "track")?,
+                track.title,
+                track.extension,
+            )),
+            None => Err(ConvertError::MissingField("placement.kind")),
+        }
+    }
+}
+
+fn fit_u16(n: u32, field: &'static str) -> Result<u16, ConvertError> {
+    u16::try_from(n).map_err(|_| ConvertError::InvalidPlacement(field))
+}
+
+fn fit_u8(n: u32, field: &'static str) -> Result<u8, ConvertError> {
+    u8::try_from(n).map_err(|_| ConvertError::InvalidPlacement(field))
 }
 
 impl TryFrom<HoldListResponse> for Vec<CoreHoldLiveItem> {
@@ -560,6 +687,20 @@ where
             let inner = response.into_inner();
             accept_handshake(&inner.proto_package, &inner.semver)?;
             Vec::<CoreHoldLiveItem>::try_from(inner).map_err(convert_to_control)
+        })
+    }
+
+    fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>> {
+        let mut client = self.inner.clone();
+        let request = HoldRejectRequest::from(key);
+        Box::pin(async move {
+            let response = client
+                .hold_reject(request)
+                .await
+                .map_err(control_error_from_status)?;
+            let inner = response.into_inner();
+            accept_handshake(&inner.proto_package, &inner.semver)?;
+            Ok(())
         })
     }
 }
@@ -891,14 +1032,88 @@ mod tests {
             added_unix: 1_577_836_800,
             size: 1234,
             reason: "No files found are eligible for import".into(),
+            remote: Some(domain_ref("seedbox", "The.Matrix.1999.mkv")),
+            placement: Some(CorePlacement::movie("The.Matrix", 1999, "mkv")),
+            output_path: Some("/data/_incoming/The.Matrix.1999".into()),
         };
         let wire = HoldLiveItem::from(&domain);
         assert_eq!(wire.title_id, "movie:tmdb:603");
         assert_eq!(wire.release_id, domain.key.release_id.as_str());
         assert_eq!(wire.added_unix, 1_577_836_800);
         assert_eq!(wire.size, 1234);
+        assert_eq!(
+            wire.remote.as_ref().expect("remote").rel_path,
+            "The.Matrix.1999.mkv"
+        );
         let back = CoreHoldLiveItem::try_from(wire).expect("from wire");
-        assert_eq!(back, domain);
+        assert_eq!(back.key, domain.key);
+        assert_eq!(back.remote, domain.remote);
+        assert_eq!(back.placement, domain.placement);
+        assert!(
+            back.output_path.is_none(),
+            "outputPath stays off the wire; seedbox maps it to RemoteRef"
+        );
+        let key = HoldKey::new(
+            TitleId::movie("603").expect("title"),
+            ReleaseId::parse("deadbeef").expect("id"),
+        );
+        let reject = HoldRejectRequest::from(&key);
+        assert_eq!(reject.title_id, "movie:tmdb:603");
+        assert_eq!(reject.release_id, "deadbeef");
+        assert_eq!(HoldKey::try_from(reject).expect("key"), key);
+    }
+
+    #[test]
+    fn hold_live_item_remote_ref_round_trips() {
+        let remote = domain_ref("seedbox", "downloads/The.Matrix.1999.mkv");
+        let domain = CoreHoldLiveItem {
+            key: HoldKey::new(
+                TitleId::movie("603").expect("title"),
+                ReleaseId::parse("deadbeef").expect("id"),
+            ),
+            added_unix: 0,
+            size: 1,
+            reason: "blocked".into(),
+            remote: Some(remote.clone()),
+            placement: Some(CorePlacement::movie("The.Matrix", 1999, "mkv")),
+            output_path: None,
+        };
+        let wire = HoldLiveItem::from(&domain);
+        assert!(
+            wire.remote.is_some(),
+            "mapped RemoteRef must not be dropped on the wire"
+        );
+        let back = CoreHoldLiveItem::try_from(wire).expect("from wire");
+        assert_eq!(back.remote.as_ref().expect("remote"), &remote);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hold_live_item_non_utf8_remote_is_not_dropped() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let rel = PathBuf::from(OsString::from_vec(vec![0xff, b'a']));
+        let domain_remote = CoreRemoteRef::from_wire_parts("seedbox".into(), rel).expect("shape");
+        let domain = CoreHoldLiveItem {
+            key: HoldKey::new(
+                TitleId::movie("603").expect("title"),
+                ReleaseId::parse("deadbeef").expect("id"),
+            ),
+            added_unix: 0,
+            size: 1,
+            reason: "blocked".into(),
+            remote: Some(domain_remote),
+            placement: None,
+            output_path: None,
+        };
+        let wire = HoldLiveItem::from(&domain);
+        assert!(
+            wire.remote.is_some(),
+            "lossy RemoteRef must still be emitted"
+        );
+        assert_eq!(wire.remote.as_ref().expect("remote").root_id, "seedbox");
+        assert!(!wire.remote.as_ref().expect("remote").rel_path.is_empty());
     }
 
     #[test]
@@ -909,6 +1124,8 @@ mod tests {
             added_unix: 0,
             size: 0,
             reason: String::new(),
+            remote: None,
+            placement: None,
         })
         .unwrap_err();
         assert!(matches!(err, ConvertError::TitleId(_)), "{err}");
@@ -918,6 +1135,8 @@ mod tests {
             added_unix: 0,
             size: 0,
             reason: String::new(),
+            remote: None,
+            placement: None,
         })
         .unwrap_err();
         assert!(matches!(err, ConvertError::Hold(_)), "{err}");
