@@ -53,7 +53,7 @@ Uncommitted Epic 3 working tree (home gateway, pull/resume, library bootstrap).
 
 - source_spec: none
   summary: Story 6.2 Approve and Reject — `hold approve` promotes through the install/schema gate; `hold reject` is never-this-release so *arr may try another.
-  evidence: Split from "all stories of epic 6" so 6.1 (hold store and inbox join) can ship first; 6.2 depends on HoldKey, holds_decisions, and the live ⊖ decided join.
+  evidence: Closed 2026-09-02. Shipped in PR #8 (`df772be`) on main. 6.1 HoldKey / `holds_decisions` / live ⊖ decided join was the prerequisite (PR #7).
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-1-hold-store-and-inbox-join.md`
   summary: One *arr queue HTTP error fails the whole HoldList instead of returning the other apps' import-blocked rows.

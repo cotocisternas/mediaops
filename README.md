@@ -43,7 +43,7 @@ Do **not** put `seedbox bootstrap --yes`, a real pull, or NVENC in a Make target
 
 | Binary     | Role |
 | ---------- | ---- |
-| `mediaops` | Home CLI. Plan/apply, watch/why/status, pull, encode, bootstrap. |
+| `mediaops` | Home CLI. Plan/apply, watch/why/status, hold inbox, pull, encode, bootstrap. |
 | `mediaopsd` | Daemon. Seedbox: gRPC + mTLS on TCP. Home: unix-socket gateway to the seedbox. |
 
 ```bash
@@ -62,8 +62,11 @@ make build
 | `library bootstrap` | Schema dirs, sqlite, lock, systemd-user units, NVENC probe. `--enable-timer` also enables the run timer and home unit. |
 | `list` / `pull` | List remotes / pull one file through the home socket. |
 | `watch TITLE` | Record a want (`kind:source:id`). Exits 0; does not wait for playable. |
-| `plan` / `run` | Exclusive lock. `run` is plan + apply in this process. Lock conflict is exit 3, never silent 0. |
+| `plan` / `run` | Exclusive lock. `run` is plan + apply in this process. Lock conflict is exit 3, never silent 0. Approved holds become Copy on this path. |
 | `why TITLE` / `status` | Lock-free peek. Local FS is truth. |
+| `hold list\|approve\|reject` | Lock-free import-blocked inbox. Approve records a decision (does not install). Reject is never-this-release. |
+| `doctor` / `repair edge` | Read-only EdgeInvariant vs confirmed nginx + API repair. |
+| `seedbox apply\|upgrade` | Grabber set-diff apply; re-copy musl `mediaopsd` and restart. |
 | `encode scan\|run\|pause` | Home GPU only. Not linked into `mediaopsd`. |
 
 `TITLE` is `movie:tmdb:…`, `series:tvdb:…`, or `album:mbid:…`.
@@ -123,7 +126,7 @@ crates/ssh        bootstrap exec only
 crates/transfer   Range pull, .partial resume, BLAKE3
 crates/sync       grabber=None planner + apply
 crates/encode     EncodePolicy, ffprobe/ffmpeg via ExecPort
-crates/arr        grabber HTTP (daemon only; unused while grabber=None)
+crates/arr        grabber HTTP (daemon only; cassettes in fixtures/arr)
 crates/arch-tests dependency-graph law
 ```
 
@@ -132,4 +135,4 @@ crates/arch-tests dependency-graph law
 - [`_bmad-output/specs/spec-mediaops/SPEC.md`](_bmad-output/specs/spec-mediaops/SPEC.md) — capabilities and constraints
 - [`_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md`](_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md) — crate graph and ADs
 
-Not in this tree yet: *arr HTTP apply, reclaim, doctor/repair, TUI.
+Not in this tree yet: reclaim, `library relocate` / `new-machine`, `docs render`, TUI.

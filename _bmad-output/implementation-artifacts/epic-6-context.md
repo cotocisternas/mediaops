@@ -8,8 +8,8 @@ Import-blocked is a product feature, not a junk drawer. This epic makes blocked 
 
 ## Stories
 
-- Story 6.1: Hold store and inbox join
-- Story 6.2: Approve and Reject
+- Story 6.1: Hold store and inbox join — shipped PR #7
+- Story 6.2: Approve and Reject — shipped PR #8
 
 ## Requirements & Constraints
 
