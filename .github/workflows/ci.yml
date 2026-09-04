@@ -20,4 +20,9 @@ jobs:
       - name: Musl-static mediaopsd
         run: make musl OFFLINE=1
       - name: mediaopsd is statically linked
-        run: file target/x86_64-unknown-linux-musl/release/mediaopsd | grep -q 'statically linked'
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/mediaopsd
+          out=$(file "$bin")
+          echo "$out"
+          # Ubuntu's file(1) reports musl +crt-static as "static-pie linked".
+          echo "$out" | grep -Eq 'statically linked|static-pie linked'
