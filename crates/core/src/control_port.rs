@@ -34,6 +34,7 @@ pub trait ControlPort: Send + Sync {
     fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>>;
     fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>>;
     fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>>;
+    fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>>;
 }
 
 /// Seedbox-local grabber HTTP. Injected into `net::Seedbox`; `net` does not name HTTP.
@@ -50,6 +51,8 @@ pub trait GrabOps: Send + Sync {
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
     fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>>;
     fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>>;
+    fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>>;
+    fn unmonitor<'a>(&'a self, title_id: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>>;
 }
 
 /// `df` payload for handshake + free space. Wire still splits the fields.

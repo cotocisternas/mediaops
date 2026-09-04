@@ -253,6 +253,12 @@ mod tests {
             self.rejected.lock().expect("lock").push(key.clone());
             Box::pin(async { Ok(()) })
         }
+        fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn unmonitor<'a>(&'a self, _: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn live_item(

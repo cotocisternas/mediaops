@@ -17,7 +17,7 @@ pub const SKIP_DUPLICATE_TITLE: &str = "duplicate_title";
 
 /// Exhaustive plan action. Match every variant; do not add a `_` arm.
 ///
-/// Internally tagged so Copy/Skip/Encode can carry the payloads apply needs.
+/// Internally tagged so Copy/Skip/Encode/Unmonitor can carry the payloads apply needs.
 /// Review and later verbs stay unit placeholders until their epics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,7 +34,9 @@ pub enum Action {
         reason: String,
     },
     Review,
-    Unmonitor,
+    Unmonitor {
+        title_id: TitleId,
+    },
     DeleteRemote,
     Encode {
         title_id: TitleId,
@@ -198,6 +200,12 @@ mod tests {
         }
     }
 
+    fn sample_unmonitor() -> Action {
+        Action::Unmonitor {
+            title_id: sample_title(),
+        }
+    }
+
     #[test]
     fn plan_round_trip_preserves_bytes_and_digest() {
         let bytes = HAPPY_TOML.as_bytes().to_vec();
@@ -269,7 +277,7 @@ mod tests {
                 reason: SKIP_WATERMARK.into(),
             },
             Action::Review,
-            Action::Unmonitor,
+            sample_unmonitor(),
             Action::DeleteRemote,
             sample_encode(),
             Action::Reclaim,
@@ -281,7 +289,7 @@ mod tests {
                 Action::Copy { .. } => "copy",
                 Action::Skip { .. } => "skip",
                 Action::Review => "review",
-                Action::Unmonitor => "unmonitor",
+                Action::Unmonitor { .. } => "unmonitor",
                 Action::DeleteRemote => "delete_remote",
                 Action::Encode { .. } => "encode",
                 Action::Reclaim => "reclaim",
@@ -304,7 +312,7 @@ mod tests {
             (sample_copy(), "copy"),
             (skip, "skip"),
             (Action::Review, "review"),
-            (Action::Unmonitor, "unmonitor"),
+            (sample_unmonitor(), "unmonitor"),
             (Action::DeleteRemote, "delete_remote"),
             (sample_encode(), "encode"),
             (Action::Reclaim, "reclaim"),

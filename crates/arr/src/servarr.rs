@@ -67,6 +67,7 @@ pub struct HostConfig {
     pub authentication_method: String,
 }
 
+#[derive(Clone)]
 pub struct ArrClient<T> {
     transport: T,
     base_url: String,
@@ -315,7 +316,21 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     pub async fn get_paged_with(&self, resource: &str, extra: &str) -> Result<Value, ArrError> {
-        self.paged(resource, extra).await
+        self.paged_inner(resource, extra, |_| false).await
+    }
+
+    /// [`Self::get_paged_with`] that stops fetching once `found` accepts a page.
+    /// The returned doc holds every record walked so far, the matching one last.
+    pub async fn paged_until<F>(
+        &self,
+        resource: &str,
+        extra: &str,
+        found: F,
+    ) -> Result<Value, ArrError>
+    where
+        F: FnMut(&[Value]) -> bool,
+    {
+        self.paged_inner(resource, extra, found).await
     }
 
     pub async fn history(&self) -> Result<Value, ArrError> {
@@ -384,6 +399,18 @@ impl<T: HttpTransport> ArrClient<T> {
     }
 
     async fn paged(&self, resource: &str, extra: &str) -> Result<Value, ArrError> {
+        self.paged_inner(resource, extra, |_| false).await
+    }
+
+    async fn paged_inner<F>(
+        &self,
+        resource: &str,
+        extra: &str,
+        mut found: F,
+    ) -> Result<Value, ArrError>
+    where
+        F: FnMut(&[Value]) -> bool,
+    {
         const PAGE_SIZE: u32 = 200;
         let mut page: u32 = 1;
         let mut all = Vec::new();
@@ -409,8 +436,9 @@ impl<T: HttpTransport> ArrClient<T> {
                 .unwrap_or_default();
             total = value.get("totalRecords").and_then(Value::as_u64).or(total);
             let n = batch.len();
+            let stop = found(&batch);
             all.extend(batch);
-            if n == 0 {
+            if n == 0 || stop {
                 break;
             }
             if let Some(t) = total {
@@ -738,6 +766,47 @@ mod tests {
         let client = ArrClient::new(t, "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
         let queue = client.queue().await.expect("queue");
         assert_eq!(queue["records"].as_array().expect("records").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn paged_until_stops_on_the_matching_page() {
+        let mut t = CassetteTransport::new();
+        t.push(
+            "GET",
+            "/sonarr/api/v3/queue?page=1&pageSize=200",
+            None,
+            json_ok(serde_json::json!({
+                "records": [{"id": 1}],
+                "totalRecords": 2,
+                "page": 1,
+                "pageSize": 1
+            })),
+        );
+        t.push(
+            "GET",
+            "/sonarr/api/v3/queue?page=2&pageSize=200",
+            None,
+            json_ok(serde_json::json!({
+                "records": [{"id": 2}],
+                "totalRecords": 2,
+                "page": 2,
+                "pageSize": 1
+            })),
+        );
+        let client =
+            ArrClient::new(t.clone(), "http://127.0.0.1:8989/sonarr", "/api/v3", "k").expect("c");
+        let doc = client
+            .paged_until("queue", "", |batch| {
+                batch.iter().any(|item| item["id"] == 1)
+            })
+            .await
+            .expect("queue");
+        assert_eq!(doc["records"].as_array().expect("records").len(), 1);
+        assert_eq!(
+            t.hits("GET", "/sonarr/api/v3/queue?page=2&pageSize=200"),
+            0,
+            "page 2 must not be fetched once page 1 matched"
+        );
     }
 
     #[tokio::test]

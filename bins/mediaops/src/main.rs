@@ -120,7 +120,7 @@ enum Command {
         #[arg(long)]
         state_db: Option<PathBuf>,
     },
-    /// Why is this title stuck (pull / watermark / lock / encode-queue).
+    /// Why is this title stuck (grab / import / hold / pull / watermark / lock / encode-queue).
     Why {
         title: String,
         #[arg(long)]
@@ -131,8 +131,12 @@ enum Command {
         library_root: Option<PathBuf>,
         #[arg(long)]
         config_dir: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
     },
-    /// Lock holder, open wants, in-flight jobs, last plan file.
+    /// Lock holder, open wants, in-flight jobs, last plan file, seedbox df.
     Status {
         #[arg(long)]
         state_db: Option<PathBuf>,
@@ -144,6 +148,10 @@ enum Command {
         library_root: Option<PathBuf>,
         #[arg(long)]
         config_dir: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
     },
     Encode(EncodeArgs),
     /// Import-blocked inbox (lock-free).
@@ -740,6 +748,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             desired_state,
             library_root,
             config_dir,
+            socket,
+            tls_dir,
         }) => {
             let line = status::why(
                 cli.json,
@@ -748,6 +758,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 desired_state,
                 library_root,
                 config_dir,
+                socket,
+                tls_dir,
             )
             .await?;
             write_stdout(&line)
@@ -758,6 +770,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             desired_state,
             library_root,
             config_dir,
+            socket,
+            tls_dir,
         }) => {
             let line = status::status(
                 cli.json,
@@ -766,6 +780,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 desired_state,
                 library_root,
                 config_dir,
+                socket,
+                tls_dir,
             )
             .await?;
             write_stdout(&line)

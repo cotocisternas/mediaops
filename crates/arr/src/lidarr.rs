@@ -28,6 +28,10 @@ impl<T: HttpTransport> Lidarr<T> {
         self.client.get_json("album").await
     }
 
+    pub async fn put_album(&self, id: i64, body: &Value) -> Result<Value, ArrError> {
+        self.client.put_json(&format!("album/{id}"), body).await
+    }
+
     pub async fn tracks(&self, album_id: i64) -> Result<Value, ArrError> {
         self.client
             .get_json(&format!("track?albumId={album_id}"))
@@ -121,6 +125,16 @@ mod tests {
                 body: b"{}".to_vec(),
             },
         );
+        t.push(
+            "PUT",
+            "/lidarr/api/v1/album/1",
+            None,
+            HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            },
+        );
         let lidarr = Lidarr::new(t, "http://127.0.0.1:8686/lidarr", "k").expect("l");
         assert_eq!(
             lidarr.artists().await.expect("artists"),
@@ -131,5 +145,9 @@ mod tests {
         lidarr.track_file(3).await.expect("file");
         lidarr.metadata_profiles().await.expect("meta");
         lidarr.parse("x").await.expect("parse");
+        lidarr
+            .put_album(1, &serde_json::json!({"id": 1}))
+            .await
+            .expect("put");
     }
 }

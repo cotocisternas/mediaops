@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use mediaops_core::{
     Allowlist, ControlError, DesiredState, ExitCode, GrabOps, Grabber, HoldKey, HoldLiveItem,
-    RemoteRef, WalkerError, nginx_host_ok, panel_fingerprint,
+    RemoteRef, TitleId, WalkerError, nginx_host_ok, panel_fingerprint,
 };
 use mediaops_proto::control_server::Control;
 use mediaops_proto::transfer_server::Transfer;
@@ -18,7 +18,8 @@ use mediaops_proto::{
     GuardPreviewResponse, HoldListRequest, HoldListResponse, HoldLiveItem as WireHold,
     HoldRejectRequest, HoldRejectResponse, KeyDiscoveryRequest, KeyDiscoveryResponse, ListRequest,
     ListResponse, PROTO_PACKAGE, RemoteEntry as WireEntry, StatRequest, StatResponse,
-    UnmonitorRequest, UnmonitorResponse, status_from_error_detail,
+    UnmonitorRequest, UnmonitorResponse, WantedMissingRequest, WantedMissingResponse,
+    status_from_error_detail,
 };
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -134,9 +135,30 @@ impl Control for Seedbox {
 
     async fn unmonitor(
         &self,
-        _request: Request<UnmonitorRequest>,
+        request: Request<UnmonitorRequest>,
     ) -> Result<Response<UnmonitorResponse>, Status> {
-        Err(unused("Unmonitor"))
+        if self.grabber == Grabber::None {
+            return Err(status_from_error_detail(&ErrorDetail::from(
+                ControlError::usage("grabber is none; unmonitor requires a grabber"),
+            )));
+        }
+        let title_id = TitleId::try_from(request.into_inner()).map_err(status_from_convert)?;
+        if let Some(ops) = &self.grab_ops {
+            ops.unmonitor(&title_id)
+                .await
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
+        } else {
+            return Err(status_from_error_detail(&ErrorDetail::from(
+                ControlError::usage(
+                    "grabber ops were not injected; unmonitor requires grabber ops",
+                ),
+            )));
+        }
+        let (semver, proto_package) = self.handshake();
+        Ok(Response::new(UnmonitorResponse {
+            semver,
+            proto_package,
+        }))
     }
 
     async fn delete_remote(
@@ -310,6 +332,30 @@ impl Control for Seedbox {
         }))
     }
 
+    async fn wanted_missing(
+        &self,
+        _request: Request<WantedMissingRequest>,
+    ) -> Result<Response<WantedMissingResponse>, Status> {
+        let (semver, proto_package) = self.handshake();
+        let title_id = if self.grabber == Grabber::None {
+            Vec::new()
+        } else if let Some(ops) = &self.grab_ops {
+            ops.wanted_missing()
+                .await
+                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?
+                .into_iter()
+                .map(|id| id.render())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(WantedMissingResponse {
+            semver,
+            proto_package,
+            title_id,
+        }))
+    }
+
     async fn hold_reject(
         &self,
         request: Request<HoldRejectRequest>,
@@ -474,7 +520,7 @@ mod tests {
     use mediaops_proto::{
         DeleteRemoteRequest, EdgeApplyRequest, EdgeCheckRequest, GetRangeRequest, GrabApplyRequest,
         GuardPreviewRequest, HoldListRequest, HoldRejectRequest, KeyDiscoveryRequest,
-        PROTO_PACKAGE, RemoteRef as WireRef, StatRequest, UnmonitorRequest,
+        PROTO_PACKAGE, RemoteRef as WireRef, StatRequest, UnmonitorRequest, WantedMissingRequest,
     };
     use std::io::Write;
     use tokio_stream::StreamExt;
@@ -511,14 +557,6 @@ mod tests {
         let root = scratch("unused");
         let seed = seedbox_with(root.clone());
         for (name, result) in [
-            (
-                "Unmonitor",
-                seed.unmonitor(Request::new(UnmonitorRequest {
-                    title_id: "movie:tmdb:603".into(),
-                }))
-                .await
-                .err(),
-            ),
             (
                 "DeleteRemote",
                 seed.delete_remote(Request::new(DeleteRemoteRequest { r#ref: None }))
@@ -568,11 +606,61 @@ mod tests {
             .into_inner();
         assert_eq!(holds.proto_package, PROTO_PACKAGE);
         assert!(holds.items.is_empty());
+        let wanted = seed
+            .wanted_missing(Request::new(WantedMissingRequest {}))
+            .await
+            .expect("wanted none")
+            .into_inner();
+        assert_eq!(wanted.proto_package, PROTO_PACKAGE);
+        assert!(wanted.title_id.is_empty());
+        let none_err = seed
+            .unmonitor(Request::new(UnmonitorRequest {
+                title_id: "movie:tmdb:603".into(),
+            }))
+            .await
+            .expect_err("grabber=None unmonitor is usage");
+        let detail = mediaops_proto::error_detail_from_status(&none_err).expect("detail");
+        assert_eq!(detail.exit_code, i32::from(mediaops_core::ExitCode::Usage));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unmonitor_without_grab_ops_is_usage_distinct_from_grabber_none() {
+        let root = scratch("unmonitor-no-ops");
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root.clone()).expect("root");
+        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr);
+        let err = seed
+            .unmonitor(Request::new(UnmonitorRequest {
+                title_id: "movie:tmdb:603".into(),
+            }))
+            .await
+            .expect_err("ops missing");
+        let detail = mediaops_proto::error_detail_from_status(&err).expect("detail");
+        assert_eq!(detail.exit_code, i32::from(mediaops_core::ExitCode::Usage));
+        assert!(
+            !err.message().contains("grabber is none"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("not injected"), "{}", err.message());
         let _ = std::fs::remove_dir_all(root);
     }
 
     struct FakeGrabOps {
         items: Vec<HoldLiveItem>,
+        wanted: Vec<TitleId>,
+        unmonitored: std::sync::Mutex<Vec<TitleId>>,
+    }
+
+    impl Default for FakeGrabOps {
+        fn default() -> Self {
+            Self {
+                items: Vec::new(),
+                wanted: Vec::new(),
+                unmonitored: std::sync::Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl GrabOps for FakeGrabOps {
@@ -617,6 +705,20 @@ mod tests {
         fn hold_reject<'a>(&'a self, _: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>> {
+            let wanted = self.wanted.clone();
+            Box::pin(async move { Ok(wanted) })
+        }
+        fn unmonitor<'a>(
+            &'a self,
+            title_id: &'a TitleId,
+        ) -> BoxFuture<'a, Result<(), ControlError>> {
+            self.unmonitored
+                .lock()
+                .expect("lock")
+                .push(title_id.clone());
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[tokio::test]
@@ -634,6 +736,7 @@ mod tests {
         let seed =
             seedbox_with(root.clone()).with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps {
                 items: vec![item.clone()],
+                ..Default::default()
             })));
         // grabber stays None in seedbox_with — None must still be empty.
         let none = seed
@@ -648,6 +751,7 @@ mod tests {
         let servarr = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr).with_grab_ops(Some(
             std::sync::Arc::new(FakeGrabOps {
                 items: vec![item.clone()],
+                ..Default::default()
             }),
         ));
         let listed = servarr
@@ -677,6 +781,29 @@ mod tests {
             .expect_err("grabber=None reject is usage");
         let detail = mediaops_proto::error_detail_from_status(&none_err).expect("detail");
         assert_eq!(detail.exit_code, i32::from(mediaops_core::ExitCode::Usage));
+
+        let ops = FakeGrabOps {
+            wanted: vec![TitleId::movie("603").expect("title")],
+            ..Default::default()
+        };
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root.clone()).expect("root");
+        let servarr = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr)
+            .with_grab_ops(Some(std::sync::Arc::new(ops)));
+        let wanted = servarr
+            .wanted_missing(Request::new(WantedMissingRequest {}))
+            .await
+            .expect("wanted")
+            .into_inner();
+        assert_eq!(wanted.title_id, vec!["movie:tmdb:603".to_string()]);
+        let unmonitored = servarr
+            .unmonitor(Request::new(UnmonitorRequest {
+                title_id: "movie:tmdb:603".into(),
+            }))
+            .await
+            .expect("unmonitor")
+            .into_inner();
+        assert_eq!(unmonitored.proto_package, PROTO_PACKAGE);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -696,8 +823,12 @@ mod tests {
         item.output_path = Some(root.join("The.Matrix.1999.mkv").display().to_string());
         let mut allowlist = Allowlist::new();
         allowlist.add_root("seedbox", root.clone()).expect("root");
-        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr)
-            .with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps { items: vec![item] })));
+        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr).with_grab_ops(Some(
+            std::sync::Arc::new(FakeGrabOps {
+                items: vec![item],
+                ..Default::default()
+            }),
+        ));
         let listed = seed
             .hold_list(Request::new(HoldListRequest {}))
             .await
@@ -730,8 +861,12 @@ mod tests {
         item.output_path = Some(dir.display().to_string());
         let mut allowlist = Allowlist::new();
         allowlist.add_root("seedbox", root.clone()).expect("root");
-        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr)
-            .with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps { items: vec![item] })));
+        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr).with_grab_ops(Some(
+            std::sync::Arc::new(FakeGrabOps {
+                items: vec![item],
+                ..Default::default()
+            }),
+        ));
         let listed = seed
             .hold_list(Request::new(HoldListRequest {}))
             .await

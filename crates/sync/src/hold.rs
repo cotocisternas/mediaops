@@ -138,6 +138,9 @@ mod tests {
         fn hold_reject<'a>(&'a self, _: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[tokio::test]

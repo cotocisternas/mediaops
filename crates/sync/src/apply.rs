@@ -20,11 +20,19 @@ pub struct InstalledCopy {
     pub placement: Placement,
 }
 
+/// An [`Action::Unmonitor`] the grabber refused. Reported, never fatal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmonitorFailure {
+    pub title_id: TitleId,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApplyReport {
     pub copies: usize,
     pub skips: usize,
     pub installed: Vec<InstalledCopy>,
+    pub unmonitor_failed: Vec<UnmonitorFailure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -125,11 +133,23 @@ where
                     let _report = control.edge_apply(plan.desired_state_toml()).await?;
                 }
             }
-            Action::Encode { .. }
-            | Action::Review
-            | Action::Unmonitor
-            | Action::DeleteRemote
-            | Action::Reclaim => {}
+            Action::Unmonitor { title_id } => {
+                if let Some(control) = ctx.control {
+                    // Never fatal. Unmonitor is ordered after Copy, so aborting
+                    // here would strand copies that are already installed and
+                    // still owe their post-install encode -- and they would not
+                    // get a second chance, since the next plan skips them
+                    // upgrade-never. The action itself is idempotent and the
+                    // next run re-emits it, so a failure only costs a cycle.
+                    if let Err(err) = control.unmonitor(title_id).await {
+                        report.unmonitor_failed.push(UnmonitorFailure {
+                            title_id: title_id.clone(),
+                            error: err.message,
+                        });
+                    }
+                }
+            }
+            Action::Encode { .. } | Action::Review | Action::DeleteRemote | Action::Reclaim => {}
         }
     }
     Ok(report)
@@ -910,6 +930,8 @@ mod tests {
 
     struct FakeControl {
         calls: Mutex<usize>,
+        unmonitors: Mutex<Vec<TitleId>>,
+        unmonitor_err: bool,
     }
 
     impl ControlPort for FakeControl {
@@ -926,9 +948,16 @@ mod tests {
         }
         fn unmonitor<'a>(
             &'a self,
-            _: &'a TitleId,
+            title_id: &'a TitleId,
         ) -> mediaops_core::BoxFuture<'a, Result<(), ControlError>> {
-            Box::pin(async { Ok(()) })
+            self.unmonitors.lock().expect("lock").push(title_id.clone());
+            let fail = self.unmonitor_err;
+            Box::pin(async move {
+                if fail {
+                    return Err(ControlError::runtime("sonarr 500"));
+                }
+                Ok(())
+            })
         }
         fn delete_remote<'a>(
             &'a self,
@@ -995,6 +1024,11 @@ mod tests {
         ) -> mediaops_core::BoxFuture<'a, Result<(), ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn wanted_missing(
+            &self,
+        ) -> mediaops_core::BoxFuture<'_, Result<Vec<TitleId>, ControlError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[tokio::test]
@@ -1012,6 +1046,8 @@ mod tests {
         let root = scratch("grab-apply");
         let control = FakeControl {
             calls: Mutex::new(0),
+            unmonitors: Mutex::new(Vec::new()),
+            unmonitor_err: false,
         };
         apply(
             &plan,
@@ -1028,6 +1064,106 @@ mod tests {
         .await
         .expect("apply");
         assert_eq!(*control.calls.lock().expect("lock"), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failing_unmonitor_is_reported_and_does_not_abort_the_copy() {
+        let title = TitleId::movie("603").expect("id");
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![
+                Action::Copy {
+                    title_id: title.clone(),
+                    remote: RemoteRef::from_wire_parts(
+                        "seed".into(),
+                        PathBuf::from("The.Matrix.1999.mkv"),
+                    )
+                    .expect("ref"),
+                    file_len: 4,
+                    placement: Placement::movie("The.Matrix", 1999, "mkv"),
+                },
+                Action::Unmonitor {
+                    title_id: title.clone(),
+                },
+            ]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("unmonitor-fails");
+        let control = FakeControl {
+            calls: Mutex::new(0),
+            unmonitors: Mutex::new(Vec::new()),
+            unmonitor_err: true,
+        };
+        // The caller still needs `installed` back: those copies owe a
+        // post-install encode that no later run will hand them.
+        let report = apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+                control: Some(&control),
+            },
+        )
+        .await
+        .expect("grabber failure must not abort the run");
+        assert_eq!(report.copies, 1);
+        assert_eq!(report.installed.len(), 1);
+        assert_eq!(
+            report.unmonitor_failed,
+            vec![UnmonitorFailure {
+                title_id: title,
+                error: "sonarr 500".into(),
+            }]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unmonitor_dispatches_through_control_port() {
+        let title = TitleId::movie("603").expect("id");
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![Action::Unmonitor {
+                title_id: title.clone(),
+            }]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("unmonitor-apply");
+        let control = FakeControl {
+            calls: Mutex::new(0),
+            unmonitors: Mutex::new(Vec::new()),
+            unmonitor_err: false,
+        };
+        apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+                control: Some(&control),
+            },
+        )
+        .await
+        .expect("apply");
+        assert_eq!(*control.unmonitors.lock().expect("lock"), vec![title]);
         let _ = fs::remove_dir_all(root);
     }
 }

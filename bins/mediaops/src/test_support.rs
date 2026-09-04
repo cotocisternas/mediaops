@@ -83,7 +83,7 @@ pub async fn start_pair_with_grab_ops(
     start_pair_with(None, b"", grabber, grab_ops).await
 }
 
-async fn start_pair_with(
+pub async fn start_pair_with(
     rel: Option<&str>,
     body: &[u8],
     grabber: Grabber,

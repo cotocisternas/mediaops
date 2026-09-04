@@ -1,0 +1,23 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/lidarr/api/v1/wanted/missing?includeAlbum=true&page=1&pageSize=200"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": {
+      "page": 1,
+      "pageSize": 200,
+      "totalRecords": 1,
+      "records": [
+        {
+          "id": 20,
+          "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63",
+          "title": "Relayer",
+          "monitored": true
+        }
+      ]
+    }
+  }
+}
