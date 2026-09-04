@@ -64,14 +64,24 @@ pub struct GuardPreviewItem {
 
 impl GuardPreviewItem {
     pub fn matches_remote(&self, remote: &RemoteRef) -> bool {
-        if self.remote.as_ref() == Some(remote) {
-            return true;
-        }
-        torrent_covers_file(&self.content_path, &self.save_path, remote.rel_path())
+        self.guards(remote, None)
     }
 
     pub fn covers_path(&self, absolute: &Path) -> bool {
         torrent_covers_file(&self.content_path, &self.save_path, absolute)
+    }
+
+    /// Same match preview and DeleteRemote use so the guard cannot miss a cover.
+    pub fn guards(&self, remote: &RemoteRef, absolute: Option<&Path>) -> bool {
+        if self.remote.as_ref() == Some(remote) {
+            return true;
+        }
+        if let Some(path) = absolute
+            && self.covers_path(path)
+        {
+            return true;
+        }
+        torrent_covers_file(&self.content_path, &self.save_path, remote.rel_path())
     }
 
     pub fn blocks_delete(&self) -> bool {
@@ -145,17 +155,18 @@ fn is_strict_under(file: &Path, root: &Path) -> bool {
     file_comps.starts_with(&root_comps)
 }
 
-/// Proved surplus (install_b3 ∩ on-disk, nlink==1). No qBit filter.
+fn listing_is_installed_file(entry: &RemoteEntry, row: &TitleIndexEntry) -> bool {
+    row.path_missing() || Path::new(row.path()) == entry.r#ref().rel_path()
+}
+
+/// Proved surplus: this listing is the indexed schema path (not merely the TitleId)
+/// and that title is still on disk. nlink==1. No qBit filter.
 pub fn reclaim_proved(
     listings: &[RemoteEntry],
     title_index: &[TitleIndexEntry],
     on_disk: &[TitleId],
 ) -> Vec<ReclaimCandidate> {
-    let proved: HashSet<&TitleId> = title_index
-        .iter()
-        .map(TitleIndexEntry::title_id)
-        .filter(|id| on_disk.iter().any(|d| d == *id))
-        .collect();
+    let on_disk: HashSet<&TitleId> = on_disk.iter().collect();
     let mut out = Vec::new();
     for entry in listings {
         if entry.nlink() > 1 {
@@ -164,7 +175,13 @@ pub fn reclaim_proved(
         let Ok((title_id, _)) = parse_placement(entry.r#ref().rel_path()) else {
             continue;
         };
-        if !proved.contains(&title_id) {
+        if !on_disk.contains(&title_id) {
+            continue;
+        }
+        let Some(row) = title_index.iter().find(|row| row.title_id() == &title_id) else {
+            continue;
+        };
+        if !listing_is_installed_file(entry, row) {
             continue;
         }
         out.push(ReclaimCandidate {
@@ -196,9 +213,13 @@ pub fn reclaim_preview(
         if covering.iter().any(|t| t.blocks_delete()) {
             continue;
         }
-        if let Some(best) = covering.iter().min_by(|a, b| a.ratio.total_cmp(&b.ratio)) {
+        // One torrent owns both rank fields so the key is not a chimera.
+        if let Some(best) = covering.iter().max_by(|a, b| {
+            (u8::from(a.is_private), OrderedF64(a.ratio))
+                .cmp(&(u8::from(b.is_private), OrderedF64(b.ratio)))
+        }) {
             candidate.ratio = Some(best.ratio);
-            candidate.is_private = Some(covering.iter().any(|t| t.is_private));
+            candidate.is_private = Some(best.is_private);
         }
         out.push(candidate);
     }
@@ -480,5 +501,44 @@ mod tests {
         };
         let ranked = reclaim_preview(&listings, &title_index, &on_disk, &[paused, private_under]);
         assert!(ranked.is_empty(), "private-under-goal cover must omit");
+    }
+
+    #[test]
+    fn extra_remote_of_a_proved_title_is_not_a_candidate() {
+        let installed = schema("1", "The.Matrix");
+        let extra = schema("1", "The.Matrix.Sample");
+        let listings = vec![entry(&installed, 1, 1), entry(&extra, 1, 1)];
+        let title_index = vec![index_row("1", &installed)];
+        let on_disk = vec![movie("1")];
+        let ranked = reclaim_preview(&listings, &title_index, &on_disk, &[]);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].remote.rel_path().display().to_string(), installed);
+    }
+
+    #[test]
+    fn rank_fields_come_from_one_covering_torrent() {
+        let rel = schema("1", "Shared");
+        let listings = vec![entry(&rel, 1, 1)];
+        let title_index = vec![index_row("1", &rel)];
+        let on_disk = vec![movie("1")];
+        let low_public = torrent(&rel, "pausedDL", 0.1, false);
+        let high_private = GuardPreviewItem {
+            hash: "priv".into(),
+            state: "pausedDL".into(),
+            ratio: 1.5,
+            is_private: true,
+            content_path: rel,
+            save_path: String::new(),
+            remote: None,
+        };
+        let ranked = reclaim_preview(
+            &listings,
+            &title_index,
+            &on_disk,
+            &[low_public, high_private],
+        );
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].is_private, Some(true));
+        assert_eq!(ranked[0].ratio, Some(1.5));
     }
 }

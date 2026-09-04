@@ -9,6 +9,7 @@ pub struct ReclaimReport {
     pub deleted: usize,
     pub skipped_seeding: usize,
     pub failed: usize,
+    pub errors: Vec<String>,
 }
 
 pub async fn apply_reclaim(
@@ -20,7 +21,10 @@ pub async fn apply_reclaim(
         match control.delete_remote(remote).await {
             Ok(DeleteRemoteOutcome::Deleted) => report.deleted += 1,
             Ok(DeleteRemoteOutcome::SkippedSeeding) => report.skipped_seeding += 1,
-            Err(_) => report.failed += 1,
+            Err(err) => {
+                report.failed += 1;
+                report.errors.push(err.to_string());
+            }
         }
     }
     Ok(report)
@@ -170,6 +174,8 @@ mod tests {
             .expect("continue");
         assert_eq!(report.failed, 1);
         assert_eq!(report.deleted, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("qbit 500"), "{:?}", report.errors);
         assert_eq!(control.deletes.lock().expect("lock").as_slice(), &[a, b]);
     }
 

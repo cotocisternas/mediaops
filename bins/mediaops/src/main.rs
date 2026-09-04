@@ -231,8 +231,6 @@ enum ReclaimCommand {
         #[arg(long)]
         state_db: Option<PathBuf>,
         #[arg(long)]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
         library_root: Option<PathBuf>,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -246,8 +244,6 @@ enum ReclaimCommand {
         #[arg(long)]
         state_db: Option<PathBuf>,
         #[arg(long)]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
         library_root: Option<PathBuf>,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -255,6 +251,9 @@ enum ReclaimCommand {
         tls_dir: Option<PathBuf>,
         #[arg(long)]
         config_dir: Option<PathBuf>,
+        /// Delete at most N ranked candidates.
+        #[arg(long)]
+        max: Option<usize>,
     },
 }
 
@@ -871,7 +870,6 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             command:
                 ReclaimCommand::Preview {
                     state_db,
-                    desired_state,
                     library_root,
                     socket,
                     tls_dir,
@@ -881,7 +879,6 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             let line = reclaim::preview(
                 cli.json,
                 state_db,
-                desired_state,
                 library_root,
                 socket,
                 tls_dir,
@@ -894,21 +891,21 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             command:
                 ReclaimCommand::Apply {
                     state_db,
-                    desired_state,
                     library_root,
                     socket,
                     tls_dir,
                     config_dir,
+                    max,
                 },
         })) => {
             let line = reclaim::apply(
                 cli.json,
                 state_db,
-                desired_state,
                 library_root,
                 socket,
                 tls_dir,
                 config_dir,
+                max,
             )
             .await?;
             write_stdout(&line)

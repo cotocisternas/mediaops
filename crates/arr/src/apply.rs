@@ -373,10 +373,6 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
 
     fn qbit_snapshot(&self) -> BoxFuture<'_, Result<Vec<GuardPreviewItem>, ControlError>> {
         Box::pin(async move {
-            let keys = discover_keys(&self.key_paths).map_err(key_to_control)?;
-            if !keys.qbit_present() {
-                return Ok(Vec::new());
-            }
             let client = crate::QbitClient::new(self.transport.clone(), &self.qbit_base);
             client.torrents_guard().await.map_err(arr_to_control)
         })
@@ -2831,12 +2827,13 @@ auth = "forms"
     }
 
     #[tokio::test]
-    async fn grab_ops_qbit_snapshot_without_conf_is_empty() {
+    async fn grab_ops_qbit_snapshot_without_conf_is_fail_closed() {
         let home = scratch("qbit-none");
         let t = CassetteTransport::new();
         let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
-        let items = ops.qbit_snapshot().await.expect("no qbit");
-        assert!(items.is_empty());
+        ops.qbit_snapshot()
+            .await
+            .expect_err("missing conf is not an empty torrent list");
         let _ = fs::remove_dir_all(home);
     }
 

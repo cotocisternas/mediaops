@@ -519,6 +519,8 @@ fn reclaim_preview_is_lock_free_and_apply_is_exclusive() {
             "--json",
             "reclaim",
             "apply",
+            "--max",
+            "1",
             "--state-db",
             dir.join("state.db").to_str().unwrap(),
             "--config-dir",
@@ -546,6 +548,27 @@ fn reclaim_preview_is_lock_free_and_apply_is_exclusive() {
     let value = stdout_json(&apply);
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "lock_conflict");
+}
+
+#[test]
+fn reclaim_preview_rejects_max_and_desired_state() {
+    for extra in [["--max", "1"], ["--desired-state", "/tmp/x"]] {
+        let output = bin()
+            .args(["--json", "reclaim", "preview"])
+            .args(extra)
+            .output()
+            .expect("preview extra");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "preview extra {:?} stdout={} stderr={}",
+            extra,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = stdout_json(&output);
+        assert_eq!(value["error"]["code"], "usage", "{extra:?}");
+    }
 }
 
 #[test]

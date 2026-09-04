@@ -60,7 +60,6 @@ struct StatusData {
     last_plan: Option<String>,
     watermark: WatermarkView,
     df: Option<DfView>,
-    reclaim: Option<ReclaimView>,
 }
 
 /// Present when there is something to say about the grabber. `grab: null` means
@@ -158,11 +157,19 @@ pub async fn why(
     let watermark = watermark_view(library_root.as_deref(), &desired_state);
     let lock = bootstrap::lock_holder_if_contended(&bootstrap::lock_path(&state_db))
         .map_err(map_bootstrap)?;
-    let titles = store
-        .list_titles()
+    let titles = match store
+        .get_title(&title_id)
         .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let on_disk = crate::reclaim::on_disk_titles(library_root.as_deref().unwrap_or(Path::new("")))?;
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
+    {
+        Some(row) => vec![row],
+        None => Vec::new(),
+    };
+    let on_disk = if library.as_ref().is_some_and(|view| view.present) {
+        vec![title_id.clone()]
+    } else {
+        Vec::new()
+    };
     let remote = load_remote_why(&socket, &tls_dir, &title_id, &titles, &on_disk).await;
 
     let data = WhyData {
@@ -255,12 +262,7 @@ pub async fn status(
             .map(PathBuf::from),
     };
     let watermark = watermark_view(library_root.as_deref(), &desired_state);
-    let titles = store
-        .list_titles()
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let on_disk = crate::reclaim::on_disk_titles(library_root.as_deref().unwrap_or(Path::new("")))?;
-    let (df, reclaim) = load_remote_df_reclaim(&socket, &tls_dir, &titles, &on_disk).await;
+    let df = load_remote_df(&socket, &tls_dir).await;
     let data = StatusData {
         lock,
         open_wants,
@@ -268,21 +270,16 @@ pub async fn status(
         last_plan,
         watermark,
         df,
-        reclaim,
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         Ok(format!(
-            "status wants {} in_flight {} plan {:?} df {:?} reclaim {}",
+            "status wants {} in_flight {} plan {:?} df {:?}",
             data.open_wants.len(),
             data.in_flight.len(),
             data.last_plan,
             data.df.as_ref().map(|d| d.free),
-            data.reclaim
-                .as_ref()
-                .map(|r| r.candidates.len())
-                .unwrap_or(0)
         ))
     }
 }
@@ -367,28 +364,14 @@ async fn load_remote_why(
     }
 }
 
-async fn load_remote_df_reclaim(
-    socket: &Path,
-    tls_dir: &Path,
-    titles: &[TitleIndexEntry],
-    on_disk: &[TitleId],
-) -> (Option<DfView>, Option<ReclaimView>) {
+async fn load_remote_df(socket: &Path, tls_dir: &Path) -> Option<DfView> {
     let Ok(channel) = connect_home(socket, tls_dir).await else {
-        return (None, None);
+        return None;
     };
-    let control = ControlPortClient::new(ControlClient::new(channel.clone()));
-    let df = control.df().await.ok().map(|snap| DfView {
+    let control = ControlPortClient::new(ControlClient::new(channel));
+    control.df().await.ok().map(|snap| DfView {
         free: snap.free.get(),
-    });
-    let listings = list_entries(channel).await.ok();
-    let torrents = control.guard_preview().await.ok();
-    let reclaim = match (listings.as_ref(), torrents.as_ref()) {
-        (Some(entries), Some(items)) => Some(ReclaimView {
-            candidates: reclaim_preview(entries, titles, on_disk, items),
-        }),
-        _ => None,
-    };
-    (df, reclaim)
+    })
 }
 
 fn job_view(job: &mediaops_core::Job) -> JobView {
@@ -849,7 +832,11 @@ mod tests {
         let status_v: serde_json::Value = serde_json::from_str(&status_json).expect("json");
         assert!(status_v["data"]["df"]["free"].as_u64().is_some());
         assert!(status_v["data"]["watermark"]["free"].as_u64().is_some());
-        assert!(status_v["data"]["reclaim"].is_object());
+        assert_eq!(
+            status_v["data"]["reclaim"],
+            serde_json::Value::Null,
+            "status keeps df; reclaim ranking is why + reclaim preview: {status_json}"
+        );
         drop(lb);
         let _ = std::fs::remove_dir_all(dir);
     }

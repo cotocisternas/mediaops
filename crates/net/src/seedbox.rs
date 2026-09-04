@@ -304,7 +304,9 @@ impl Control for Seedbox {
         _request: Request<KeyDiscoveryRequest>,
     ) -> Result<Response<KeyDiscoveryResponse>, Status> {
         let (semver, proto_package) = self.handshake();
-        let presence = if let Some(ops) = &self.grab_ops {
+        let presence = if self.grabber == Grabber::Servarr
+            && let Some(ops) = &self.grab_ops
+        {
             ops.key_discovery()
                 .await
                 .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?
@@ -327,13 +329,9 @@ impl Control for Seedbox {
         &self,
         _request: Request<GuardPreviewRequest>,
     ) -> Result<Response<GuardPreviewResponse>, Status> {
-        let torrents = match &self.grab_ops {
-            Some(ops) => ops
-                .qbit_snapshot()
-                .await
-                .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?,
-            None => Vec::new(),
-        };
+        let torrents = qbit_or_skip(self.grab_ops.as_deref())
+            .await
+            .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
         let allowlist = self.allowlist.clone();
         let items = tokio::task::spawn_blocking(move || attach_guard_remotes(&allowlist, torrents))
             .await
@@ -439,7 +437,7 @@ async fn qbit_or_skip(
 ) -> Result<Vec<GuardPreviewItem>, ControlError> {
     match grab_ops {
         Some(ops) => ops.qbit_snapshot().await,
-        None => Ok(Vec::new()),
+        None => Err(ControlError::runtime("qbit unavailable")),
     }
 }
 
@@ -455,7 +453,7 @@ fn delete_remote_locked(
     }
     if torrents
         .iter()
-        .any(|t| t.covers_path(&path) && t.blocks_delete())
+        .any(|t| t.guards(remote, Some(&path)) && t.blocks_delete())
     {
         return Ok(DeleteRemoteOutcome::SkippedSeeding);
     }
@@ -688,7 +686,8 @@ mod tests {
     async fn delete_remote_unlinks_usenet_when_qbit_has_no_match() {
         let root = scratch("unlink-usenet");
         write_file(&root.join(movie_rel()), b"copy");
-        let seed = seedbox_with(root.clone());
+        let seed = seedbox_with(root.clone())
+            .with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps::default())));
         let remote = mediaops_core::RemoteRef::from_wire_parts(
             "seedbox".into(),
             std::path::PathBuf::from(movie_rel()),
@@ -706,6 +705,54 @@ mod tests {
             .into_inner();
         assert_eq!(resp.result, DeleteRemoteResult::Deleted as i32);
         assert!(!root.join(movie_rel()).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn key_discovery_grabber_none_ignores_ops() {
+        let root = scratch("keys-none");
+        let seed =
+            seedbox_with(root.clone()).with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps {
+                keys: KeyPresence {
+                    sonarr_key_present: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })));
+        let keys = seed
+            .key_discovery(Request::new(KeyDiscoveryRequest {}))
+            .await
+            .expect("keys")
+            .into_inner();
+        assert!(
+            !keys.sonarr_key_present,
+            "grabber=None must not run on-disk key discovery"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn delete_remote_without_grab_ops_is_skipped_seeding() {
+        let root = scratch("no-ops");
+        write_file(&root.join(movie_rel()), b"copy");
+        let seed = seedbox_with(root.clone());
+        let remote = mediaops_core::RemoteRef::from_wire_parts(
+            "seedbox".into(),
+            std::path::PathBuf::from(movie_rel()),
+        )
+        .expect("ref");
+        let resp = seed
+            .delete_remote(Request::new(DeleteRemoteRequest {
+                r#ref: Some(WireRef {
+                    root_id: remote.root_id().into(),
+                    rel_path: remote.rel_path().display().to_string(),
+                }),
+            }))
+            .await
+            .expect("skip")
+            .into_inner();
+        assert_eq!(resp.result, DeleteRemoteResult::SkippedSeeding as i32);
+        assert!(root.join(movie_rel()).is_file());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -922,6 +969,7 @@ mod tests {
         unmonitored: std::sync::Mutex<Vec<TitleId>>,
         qbit: Vec<GuardPreviewItem>,
         qbit_down: bool,
+        keys: KeyPresence,
         edge_apply_calls: std::sync::Mutex<usize>,
     }
 
@@ -933,6 +981,7 @@ mod tests {
                 unmonitored: std::sync::Mutex::new(Vec::new()),
                 qbit: Vec::new(),
                 qbit_down: false,
+                keys: KeyPresence::default(),
                 edge_apply_calls: std::sync::Mutex::new(0),
             }
         }
@@ -951,7 +1000,8 @@ mod tests {
             })
         }
         fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>> {
-            Box::pin(async { Ok(KeyPresence::default()) })
+            let keys = self.keys.clone();
+            Box::pin(async move { Ok(keys) })
         }
         fn edge_api_check(&self) -> BoxFuture<'_, Result<EdgeApiReport, ControlError>> {
             Box::pin(async {
