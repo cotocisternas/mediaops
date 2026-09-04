@@ -232,9 +232,20 @@ impl TryFrom<DeleteRemoteResult> for DeleteRemoteOutcome {
         match value {
             DeleteRemoteResult::Deleted => Ok(Self::Deleted),
             DeleteRemoteResult::SkippedSeeding => Ok(Self::SkippedSeeding),
+            DeleteRemoteResult::QbitUnavailable => Ok(Self::QbitUnavailable),
             DeleteRemoteResult::Unspecified => {
                 Err(ConvertError::UnknownDeleteRemoteResult(value as i32))
             }
+        }
+    }
+}
+
+impl From<DeleteRemoteOutcome> for DeleteRemoteResult {
+    fn from(outcome: DeleteRemoteOutcome) -> Self {
+        match outcome {
+            DeleteRemoteOutcome::Deleted => Self::Deleted,
+            DeleteRemoteOutcome::SkippedSeeding => Self::SkippedSeeding,
+            DeleteRemoteOutcome::QbitUnavailable => Self::QbitUnavailable,
         }
     }
 }
@@ -335,6 +346,8 @@ impl From<&CorePlacement> for Placement {
                 year,
                 season,
                 episode,
+                episode_end,
+                episode_title,
                 extension,
             } => Self {
                 kind: Some(placement::Kind::Episode(EpisodePlacement {
@@ -343,11 +356,15 @@ impl From<&CorePlacement> for Placement {
                     season: u32::from(*season),
                     episode: u32::from(*episode),
                     extension: extension.clone(),
+                    episode_end: episode_end.map(u32::from).unwrap_or(0),
+                    episode_title: episode_title.clone().unwrap_or_default(),
                 })),
             },
             CorePlacement::Track {
+                artist,
                 album,
                 year,
+                disc,
                 track,
                 title,
                 extension,
@@ -355,9 +372,11 @@ impl From<&CorePlacement> for Placement {
                 kind: Some(placement::Kind::Track(TrackPlacement {
                     album: album.clone(),
                     year: u32::from(*year),
-                    track: u32::from(*track),
+                    track: track.map(u32::from).unwrap_or(0),
                     title: title.clone(),
                     extension: extension.clone(),
+                    artist: artist.clone(),
+                    disc: disc.map(u32::from).unwrap_or(0),
                 })),
             },
         }
@@ -374,17 +393,27 @@ impl TryFrom<Placement> for CorePlacement {
                 fit_u16(movie.year, "year")?,
                 movie.extension,
             )),
-            Some(placement::Kind::Episode(ep)) => Ok(Self::episode(
+            Some(placement::Kind::Episode(ep)) => Ok(Self::episode_titled(
                 ep.title,
                 fit_u16(ep.year, "year")?,
                 fit_u8(ep.season, "season")?,
-                fit_u8(ep.episode, "episode")?,
+                fit_u16(ep.episode, "episode")?,
+                (ep.episode_end != 0)
+                    .then(|| fit_u16(ep.episode_end, "episode_end"))
+                    .transpose()?,
+                (!ep.episode_title.is_empty()).then_some(ep.episode_title),
                 ep.extension,
             )),
             Some(placement::Kind::Track(track)) => Ok(Self::track(
+                track.artist,
                 track.album,
                 fit_u16(track.year, "year")?,
-                fit_u8(track.track, "track")?,
+                (track.disc != 0)
+                    .then(|| fit_u8(track.disc, "disc"))
+                    .transpose()?,
+                (track.track != 0)
+                    .then(|| fit_u8(track.track, "track"))
+                    .transpose()?,
                 track.title,
                 track.extension,
             )),

@@ -1191,6 +1191,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1278,6 +1279,7 @@ dependencies = [
  "mediaops-transfer",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

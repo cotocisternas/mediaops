@@ -129,11 +129,14 @@ impl ControlError {
     }
 }
 
-/// Outcome of `DeleteRemote`. `SkippedSeeding` is data, not an error.
+/// Outcome of `DeleteRemote`. Neither skip is an error: `SkippedSeeding` means
+/// a torrent still covers the file (or it is hardlinked); `QbitUnavailable`
+/// means qBittorrent is configured but could not be asked, so nothing moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteRemoteOutcome {
     Deleted,
     SkippedSeeding,
+    QbitUnavailable,
 }
 
 #[cfg(test)]
@@ -145,15 +148,17 @@ mod tests {
         let outcomes = [
             DeleteRemoteOutcome::Deleted,
             DeleteRemoteOutcome::SkippedSeeding,
+            DeleteRemoteOutcome::QbitUnavailable,
         ];
         for outcome in outcomes {
             let n = match outcome {
                 DeleteRemoteOutcome::Deleted => 1,
                 DeleteRemoteOutcome::SkippedSeeding => 2,
+                DeleteRemoteOutcome::QbitUnavailable => 3,
             };
-            assert!(n == 1 || n == 2);
+            assert!((1..=3).contains(&n));
         }
-        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes.len(), 3);
     }
 
     #[test]

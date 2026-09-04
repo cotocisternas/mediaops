@@ -620,7 +620,7 @@ mod tests {
         }
         let store = crate::test_support::open_store(&dir).await;
         let key = HoldKey::new(
-            TitleId::movie("603").expect("title"),
+            TitleId::movie_key("The.Matrix", 1999).expect("title"),
             ReleaseId::parse("deadbeef").expect("id"),
         );
         assert!(store.get(&key).await.expect("get").is_none());

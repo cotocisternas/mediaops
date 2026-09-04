@@ -33,33 +33,37 @@ pub struct LocalhostGrabOps<T> {
 }
 
 impl<T> LocalhostGrabOps<T> {
+    /// Ports and URL bases come from each app's own config file on the box
+    /// (the same files the API keys come from); a `url_bases` entry in
+    /// desired-state overrides the base for that app.
     pub fn new(transport: T, key_paths: KeyPaths, desired: &DesiredState) -> Self {
         let bases = desired
             .edge()
             .map(|e| e.url_bases.clone())
             .unwrap_or_default();
+        let endpoints = match crate::keys::discover_endpoints(&key_paths) {
+            Ok(endpoints) => endpoints,
+            Err(err) => {
+                tracing::warn!(error = %err, "endpoint discovery failed; using stock ports");
+                crate::keys::discover_endpoints(&KeyPaths::from_home(std::path::Path::new(
+                    "/nonexistent",
+                )))
+                .unwrap_or_else(|_| unreachable!("missing files yield defaults"))
+            }
+        };
+        let base_for = |app: &str, endpoint: &crate::keys::Endpoint| -> String {
+            match bases.get(app) {
+                Some(base) => localhost(endpoint.port, base),
+                None => endpoint.base_url(),
+            }
+        };
         Self {
             transport,
             key_paths,
-            sonarr_base: localhost(
-                8989,
-                bases.get("sonarr").map(String::as_str).unwrap_or("/sonarr"),
-            ),
-            radarr_base: localhost(
-                7878,
-                bases.get("radarr").map(String::as_str).unwrap_or("/radarr"),
-            ),
-            lidarr_base: localhost(
-                8686,
-                bases.get("lidarr").map(String::as_str).unwrap_or("/lidarr"),
-            ),
-            prowlarr_base: localhost(
-                9696,
-                bases
-                    .get("prowlarr")
-                    .map(String::as_str)
-                    .unwrap_or("/prowlarr"),
-            ),
+            sonarr_base: base_for("sonarr", &endpoints.sonarr),
+            radarr_base: base_for("radarr", &endpoints.radarr),
+            lidarr_base: base_for("lidarr", &endpoints.lidarr),
+            prowlarr_base: base_for("prowlarr", &endpoints.prowlarr),
             bind: desired
                 .edge()
                 .map(|e| e.bind.clone())
@@ -68,31 +72,23 @@ impl<T> LocalhostGrabOps<T> {
                 .edge()
                 .map(|e| e.auth.clone())
                 .unwrap_or_else(|| "forms".into()),
-            qbit_base: qbit_localhost(
-                bases
-                    .get("qbittorrent")
-                    .or_else(|| bases.get("qbit"))
-                    .map(String::as_str),
-            ),
+            qbit_base: match bases.get("qbittorrent").or_else(|| bases.get("qbit")) {
+                Some(base) if !base.is_empty() && base != "/" => {
+                    localhost(endpoints.qbit.port, base)
+                }
+                _ => endpoints.qbit.base_url(),
+            },
             url_bases: bases,
         }
     }
 }
 
-fn qbit_localhost(url_base: Option<&str>) -> String {
-    match url_base {
-        Some(base) if !base.is_empty() && base != "/" => localhost(8080, base),
-        _ => "http://127.0.0.1:8080".into(),
-    }
-}
-
 fn localhost(port: u16, url_base: &str) -> String {
-    let base = if url_base.starts_with('/') {
-        url_base.to_string()
-    } else {
-        format!("/{url_base}")
-    };
-    format!("http://127.0.0.1:{port}{base}")
+    let trimmed = url_base.trim_matches('/');
+    if trimmed.is_empty() {
+        return format!("http://127.0.0.1:{port}");
+    }
+    format!("http://127.0.0.1:{port}/{trimmed}")
 }
 
 impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrabOps<T> {
@@ -361,7 +357,7 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
             let doc = client
                 .paged_until("wanted/missing", extra, |batch| {
                     batch.iter().any(|item| {
-                        unmonitor_parent(item).is_some_and(|(found, _, _)| found == *title_id)
+                        unmonitor_parent(item).is_some() && item_matches_title(item, title_id)
                     })
                 })
                 .await
@@ -825,11 +821,7 @@ async fn check_edge_apps<T: HttpTransport + Clone>(
             .map_err(arr_to_control)?;
         if let Some(arr) = apps.as_array() {
             for app in arr {
-                let url = app
-                    .get("baseUrl")
-                    .or_else(|| app.get("url"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let url = prowlarr_app_base_url(app).unwrap_or("");
                 let name = app
                     .get("name")
                     .and_then(Value::as_str)
@@ -847,6 +839,84 @@ async fn check_edge_apps<T: HttpTransport + Clone>(
         drift.push("prowlarr key missing; host unchecked".into());
     }
     Ok(drift)
+}
+
+/// The *arr URL a Prowlarr application syncs to. Prowlarr keeps it in
+/// `fields[{name:"baseUrl", value}]`; a flat `baseUrl`/`url` is accepted too.
+fn prowlarr_app_base_url(app: &Value) -> Option<&str> {
+    if let Some(url) = app
+        .get("baseUrl")
+        .or_else(|| app.get("url"))
+        .and_then(Value::as_str)
+    {
+        return Some(url);
+    }
+    app.get("fields")?
+        .as_array()?
+        .iter()
+        .find(|f| f.get("name").and_then(Value::as_str) == Some("baseUrl"))
+        .and_then(|f| f.get("value"))
+        .and_then(Value::as_str)
+}
+
+/// Write the app URL where Prowlarr reads it (the `baseUrl` field entry when
+/// the resource has `fields`, else flat).
+fn set_prowlarr_app_base_url(app: &mut Value, url: &str) {
+    if let Some(fields) = app.get_mut("fields").and_then(Value::as_array_mut) {
+        if let Some(field) = fields
+            .iter_mut()
+            .find(|f| f.get("name").and_then(Value::as_str) == Some("baseUrl"))
+        {
+            field["value"] = json!(url);
+            return;
+        }
+        fields.push(json!({"name": "baseUrl", "value": url}));
+        return;
+    }
+    app["baseUrl"] = json!(url);
+}
+
+#[cfg(test)]
+mod prowlarr_fields_tests {
+    use super::*;
+
+    #[test]
+    fn base_url_is_read_from_fields_and_flat_and_written_back_in_place() {
+        // What Prowlarr v1 actually returns.
+        let real = json!({
+            "id": 1, "name": "Sonarr", "implementation": "Sonarr",
+            "fields": [
+                {"name": "prowlarrUrl", "value": "http://127.0.0.1:9696/prowlarr"},
+                {"name": "baseUrl", "value": "http://127.0.0.1:8989/sonarr"},
+                {"name": "apiKey", "value": "********"}
+            ]
+        });
+        assert_eq!(
+            prowlarr_app_base_url(&real),
+            Some("http://127.0.0.1:8989/sonarr")
+        );
+        let flat = json!({"id": 1, "name": "Sonarr", "baseUrl": "http://127.0.0.1:8989/1/"});
+        assert_eq!(
+            prowlarr_app_base_url(&flat),
+            Some("http://127.0.0.1:8989/1/")
+        );
+        assert_eq!(prowlarr_app_base_url(&json!({"id": 2, "name": "X"})), None);
+
+        let mut body = real.clone();
+        set_prowlarr_app_base_url(&mut body, "http://127.0.0.1:8989/sonarr2");
+        assert_eq!(
+            prowlarr_app_base_url(&body),
+            Some("http://127.0.0.1:8989/sonarr2")
+        );
+        assert!(
+            body.get("baseUrl").is_none(),
+            "fields-style stays fields-style"
+        );
+        assert_eq!(body["fields"].as_array().expect("fields").len(), 3);
+        let mut flat_body = flat.clone();
+        set_prowlarr_app_base_url(&mut flat_body, "http://127.0.0.1:8989/sonarr");
+        assert_eq!(flat_body["baseUrl"], "http://127.0.0.1:8989/sonarr");
+    }
 }
 
 fn app_url_base<'a>(ops: &'a LocalhostGrabOps<impl HttpTransport>, name: &str) -> &'a str {
@@ -976,11 +1046,7 @@ async fn apply_prowlarr_app_urls<T: HttpTransport>(
     };
     let mut diffs = Vec::new();
     for app in arr {
-        let url = app
-            .get("baseUrl")
-            .or_else(|| app.get("url"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let url = prowlarr_app_base_url(app).unwrap_or("");
         let name = app
             .get("name")
             .and_then(Value::as_str)
@@ -1005,7 +1071,7 @@ async fn apply_prowlarr_app_urls<T: HttpTransport>(
             "lidarr" => 8686,
             _ => 9696,
         };
-        body["baseUrl"] = json!(format!("http://127.0.0.1:{port}{base}"));
+        set_prowlarr_app_base_url(&mut body, &format!("http://127.0.0.1:{port}{base}"));
         client
             .put_json(&format!("applications/{id}"), &body)
             .await
@@ -1143,30 +1209,54 @@ fn placement_from_queue_item(item: &Value, title_id: &TitleId) -> Option<Placeme
             let year = series.get("year").and_then(json_u16)?;
             let episode = item.get("episode")?;
             let season = episode.get("seasonNumber").and_then(json_u8)?;
-            let ep = episode.get("episodeNumber").and_then(json_u8)?;
+            let ep = episode.get("episodeNumber").and_then(json_u16)?;
+            let episode_title = episode
+                .get("title")
+                .and_then(Value::as_str)
+                .and_then(schema_token);
             let extension = extension_from_file_obj(episode.get("episodeFile"))
                 .or_else(|| extension_from_file_obj(item.get("episodeFile")))
                 .or_else(|| extension_from_output_path(item))
                 .unwrap_or_else(|| default_extension(TitleKind::Series).to_string());
-            Some(Placement::episode(title, year, season, ep, extension))
+            Some(Placement::episode_titled(
+                title,
+                year,
+                season,
+                ep,
+                None,
+                episode_title,
+                extension,
+            ))
         }
         TitleKind::Album => {
             let album = item.get("album")?;
             let album_title = schema_token(album.get("title").and_then(Value::as_str)?)?;
+            let artist = album
+                .get("artist")
+                .and_then(|a| a.get("artistName"))
+                .or_else(|| item.get("artist").and_then(|a| a.get("artistName")))
+                .and_then(Value::as_str)
+                .and_then(schema_token)?;
             let year = album
                 .get("year")
                 .and_then(json_u16)
                 .or_else(|| year_from_release_date(album.get("releaseDate")))?;
             let track = item.get("track")?;
-            let track_no = track.get("trackNumber").and_then(json_u8)?;
+            let track_no = track.get("trackNumber").and_then(json_u8);
+            let disc = track
+                .get("mediumNumber")
+                .and_then(json_u8)
+                .filter(|d| *d > 1);
             let track_title = schema_token(track.get("title").and_then(Value::as_str)?)?;
             let extension = extension_from_file_obj(item.get("trackFile"))
                 .or_else(|| extension_from_file_obj(track.get("trackFile")))
                 .or_else(|| extension_from_output_path(item))
                 .unwrap_or_else(|| default_extension(TitleKind::Album).to_string());
             Some(Placement::track(
+                artist,
                 album_title,
                 year,
+                disc,
                 track_no,
                 track_title,
                 extension,
@@ -1175,21 +1265,9 @@ fn placement_from_queue_item(item: &Value, title_id: &TitleId) -> Option<Placeme
     }
 }
 
-/// Display names → PathSchema tokens: spaces become `.`, repeated separators collapse.
+/// Display names → PathSchema tokens via the one dotting rule in `core`.
 fn schema_token(raw: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut pending_sep = false;
-    for c in raw.chars() {
-        if c.is_whitespace() || c == '.' {
-            pending_sep = !out.is_empty();
-            continue;
-        }
-        if pending_sep {
-            out.push('.');
-            pending_sep = false;
-        }
-        out.push(c);
-    }
+    let out = mediaops_core::dotted(raw);
     (!out.is_empty()).then_some(out)
 }
 
@@ -1259,6 +1337,47 @@ fn title_id_from_arr_item(item: &Value) -> Option<TitleId> {
     None
 }
 
+/// The library (`key`) identity of an *arr record, from the display title and
+/// year *arr itself names folders with. This is what the home planner compares
+/// against the disk; the tmdb/tvdb/mbid id stays alongside for the inbox.
+fn key_title_id_from_arr_item(item: &Value) -> Option<TitleId> {
+    if let Some(movie) = item
+        .get("movie")
+        .or_else(|| item.get("tmdbId").map(|_| item))
+    {
+        let title = movie.get("title").and_then(Value::as_str)?;
+        let year = movie.get("year").and_then(json_u16)?;
+        return TitleId::movie_key(title, year).ok();
+    }
+    if let Some(series) = item
+        .get("series")
+        .or_else(|| item.get("tvdbId").map(|_| item))
+    {
+        let title = series.get("title").and_then(Value::as_str)?;
+        let year = series.get("year").and_then(json_u16)?;
+        return TitleId::series_key(title, year).ok();
+    }
+    if let Some(album) = item
+        .get("album")
+        .or_else(|| item.get("foreignAlbumId").map(|_| item))
+    {
+        let title = album.get("title").and_then(Value::as_str)?;
+        let artist = album
+            .get("artist")
+            .and_then(|a| a.get("artistName"))
+            .or_else(|| item.get("artist").and_then(|a| a.get("artistName")))
+            .and_then(Value::as_str)?;
+        return TitleId::album_key(artist, title).ok();
+    }
+    None
+}
+
+/// Does this *arr record name `title_id`, by authority id or by library key?
+fn item_matches_title(item: &Value, title_id: &TitleId) -> bool {
+    title_id_from_arr_item(item).as_ref() == Some(title_id)
+        || key_title_id_from_arr_item(item).as_ref() == Some(title_id)
+}
+
 fn nested_or_top<'a>(item: &'a Value, nested: &str, field: &str) -> Option<&'a Value> {
     item.get(nested)
         .and_then(|n| n.get(field))
@@ -1273,13 +1392,20 @@ fn paged_records(doc: &Value) -> &[Value] {
         .unwrap_or(&[])
 }
 
+/// Both identities of every wanted/missing record: the library key (what the
+/// planner matches against the disk) and the *arr authority id.
 fn extend_title_ids(doc: &Value, out: &mut Vec<TitleId>, seen: &mut HashSet<TitleId>) {
     for item in paged_records(doc) {
-        let Some(id) = title_id_from_arr_item(item) else {
-            continue;
-        };
-        if seen.insert(id.clone()) {
-            out.push(id);
+        for id in [
+            key_title_id_from_arr_item(item),
+            title_id_from_arr_item(item),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if seen.insert(id.clone()) {
+                out.push(id);
+            }
         }
     }
 }
@@ -1324,10 +1450,10 @@ async fn unmonitor_doc<T: HttpTransport + Clone>(
     title_id: &TitleId,
 ) -> Result<bool, ControlError> {
     for item in paged_records(doc) {
-        let Some((found, resource, arr_id)) = unmonitor_parent(item) else {
+        let Some((_, resource, arr_id)) = unmonitor_parent(item) else {
             continue;
         };
-        if found != *title_id {
+        if !item_matches_title(item, title_id) {
             continue;
         }
         let mut parent = client
@@ -2073,7 +2199,8 @@ auth = "forms"
                     "album": {
                         "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63",
                         "title": "Relayer",
-                        "releaseDate": "2013-01-01T00:00:00Z"
+                        "releaseDate": "2013-01-01T00:00:00Z",
+                        "artist": {"artistName": "Yes"}
                     },
                     "track": {"trackNumber": 1, "title": "The.Gates.Of.Delirium"},
                     "trackFile": {"path": "01.The.Gates.Of.Delirium.flac"}
@@ -2140,9 +2267,11 @@ auth = "forms"
         assert_eq!(
             items[2].placement,
             Some(Placement::track(
+                "Yes",
                 "Relayer",
                 2013,
-                1,
+                None,
+                Some(1),
                 "The.Gates.Of.Delirium",
                 "flac"
             ))
@@ -2196,7 +2325,8 @@ auth = "forms"
                 "album": {
                     "foreignAlbumId": "0f82b02e-c6cd-4242-b195-93d4bf3e0d63",
                     "title": "Relayer",
-                    "year": 2013
+                    "year": 2013,
+                    "artist": {"artistName": "Yes"}
                 },
                 "track": {"trackNumber": "1", "title": "The Gates Of Delirium"}
             }]
@@ -2204,9 +2334,11 @@ auth = "forms"
         assert_eq!(
             album[0].placement,
             Some(Placement::track(
+                "Yes",
                 "Relayer",
                 2013,
-                1,
+                None,
+                Some(1),
                 "The.Gates.Of.Delirium",
                 "flac"
             ))
@@ -2452,10 +2584,13 @@ auth = "forms"
             .into_iter()
             .map(|id| id.render())
             .collect();
+        // Both identities: the library key the planner matches on disk, and
+        // the *arr authority id (the cassette's series/album lack title+year).
         assert_eq!(
             ids,
             vec![
                 "series:tvdb:79126".to_string(),
+                "movie:key:thematrix.1999".to_string(),
                 "movie:tmdb:603".to_string(),
                 "album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63".to_string(),
             ]
@@ -2768,7 +2903,13 @@ auth = "forms"
             .into_iter()
             .map(|id| id.render())
             .collect();
-        assert_eq!(ids, vec!["movie:tmdb:603".to_string()]);
+        assert_eq!(
+            ids,
+            vec![
+                "movie:key:thematrix.1999".to_string(),
+                "movie:tmdb:603".to_string()
+            ]
+        );
         let _ = fs::remove_dir_all(home);
     }
 

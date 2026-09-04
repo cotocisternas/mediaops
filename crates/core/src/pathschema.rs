@@ -1,22 +1,69 @@
 //! Versioned library-path grammar. The only renderer/parser of library paths.
 //!
-//! Golden paths (dots, no spaces; year copied into folder and stem):
-//! - `movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv`
-//! - `series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.mkv`
-//! - `music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.The.Gates.Of.Delirium.(2013).flac`
+//! Grammar v2 is the operator's dotted Jellyfin layout (`AGENTS.md`), which is
+//! also exactly what Radarr/Sonarr/Lidarr are configured to write on the box:
+//!
+//! - `movies/The.Matrix.(1999)/The.Matrix.(1999).mkv`
+//! - `series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E01.The.Target.mkv`
+//! - `music/Yes/Relayer.(1974)/Relayer.(1974).01.The.Gates.Of.Delirium.flac`
+//! - `music/Radiohead/OK.Computer.(1997)/Disc.01/OK.Computer.(1997).01.Airbag.flac`
+//!
+//! No identity token lives in a path. Identity recovered from a path is a
+//! [`crate::title_id::TitleSource::Key`] TitleId (normalised title + year;
+//! artist + album for music). Rendering is strict (dots, no spaces); parsing is lenient about
+//! spaces and `Title - Subtitle (Year)` so that what *arr actually writes on the
+//! seedbox still classifies.
 
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::title_id::{TitleId, TitleKind, TitleSource};
+use crate::title_id::{TitleId, TitleKind, strip_trailing_year};
 
 /// PathSchema grammar version. Bump when render/parse rules change.
-pub const GRAMMAR_VERSION: u32 = 1;
+pub const GRAMMAR_VERSION: u32 = 2;
 
 const SCENE_TAGS: &[&str] = &["REPACJ", "REPACK", "PROPER"];
 
+/// Tokens after which an episode/track title is release noise, not a title.
+/// A Sonarr `{Episode.CleanTitle}` never contains these; a scene name does.
+const STOP_TOKENS: &[&str] = &[
+    "web",
+    "internal",
+    "readnfo",
+    "hdr",
+    "hdr10",
+    "hdr10+",
+    "hdr10plus",
+    "dv",
+    "dovi",
+    "h",
+    "xvid",
+    "8bit",
+    "opus",
+    "flac",
+    "amzn",
+    "dsnp",
+    "atvp",
+    "hmax",
+    "nf",
+    "hulu",
+    "pcok",
+    "uhd",
+    "multi",
+    "hybrid",
+    "imax",
+    "repack",
+    "repack2",
+    "proper",
+    "complete",
+    "season",
+    "pack",
+];
+
 /// Display placement used only to render a path. Identity stays on [`TitleId`].
+///
+/// Added fields default so plans written by grammar v1 still load.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Placement {
@@ -29,16 +76,38 @@ pub enum Placement {
         title: String,
         year: u16,
         season: u8,
-        episode: u8,
+        episode: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        episode_end: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        episode_title: Option<String>,
         extension: String,
     },
     Track {
+        #[serde(default)]
+        artist: String,
         album: String,
         year: u16,
-        track: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disc: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track: Option<u8>,
         title: String,
         extension: String,
     },
+}
+
+/// Which file of a title this is: the dedupe / already-present unit.
+///
+/// A movie is one file. An episode is `(season, episode)` inside its show.
+/// A track is `(disc, track)` inside its album; the album year is display, so
+/// a remaster and the original share tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileKey {
+    Whole,
+    Episode { season: u8, episode: u16 },
+    Track { disc: u8, track: u8 },
 }
 
 impl Placement {
@@ -54,7 +123,7 @@ impl Placement {
         title: impl Into<String>,
         year: u16,
         season: u8,
-        episode: u8,
+        episode: u16,
         extension: impl Into<String>,
     ) -> Self {
         Self::Episode {
@@ -62,23 +131,127 @@ impl Placement {
             year,
             season,
             episode,
+            episode_end: None,
+            episode_title: None,
+            extension: extension.into(),
+        }
+    }
+
+    pub fn episode_titled(
+        title: impl Into<String>,
+        year: u16,
+        season: u8,
+        episode: u16,
+        episode_end: Option<u16>,
+        episode_title: Option<String>,
+        extension: impl Into<String>,
+    ) -> Self {
+        Self::Episode {
+            title: title.into(),
+            year,
+            season,
+            episode,
+            episode_end,
+            episode_title: episode_title.filter(|t| !t.is_empty()),
             extension: extension.into(),
         }
     }
 
     pub fn track(
+        artist: impl Into<String>,
         album: impl Into<String>,
         year: u16,
-        track: u8,
+        disc: Option<u8>,
+        track: Option<u8>,
         title: impl Into<String>,
         extension: impl Into<String>,
     ) -> Self {
         Self::Track {
+            artist: artist.into(),
             album: album.into(),
             year,
+            disc,
             track,
             title: title.into(),
             extension: extension.into(),
+        }
+    }
+
+    pub fn kind(&self) -> TitleKind {
+        match self {
+            Self::Movie { .. } => TitleKind::Movie,
+            Self::Episode { .. } => TitleKind::Series,
+            Self::Track { .. } => TitleKind::Album,
+        }
+    }
+
+    pub fn extension(&self) -> &str {
+        match self {
+            Self::Movie { extension, .. }
+            | Self::Episode { extension, .. }
+            | Self::Track { extension, .. } => extension,
+        }
+    }
+
+    /// The per-file identity unit. Tracks without a number fall back to `Whole`
+    /// (one such file per album is all the grammar can name).
+    pub fn file_key(&self) -> FileKey {
+        match self {
+            Self::Movie { .. } => FileKey::Whole,
+            Self::Episode {
+                season, episode, ..
+            } => FileKey::Episode {
+                season: *season,
+                episode: *episode,
+            },
+            Self::Track {
+                disc,
+                track: Some(track),
+                ..
+            } => FileKey::Track {
+                disc: disc.unwrap_or(1),
+                track: *track,
+            },
+            Self::Track { track: None, .. } => FileKey::Whole,
+        }
+    }
+
+    /// The `key` TitleId this placement names: the identity the planner and the
+    /// on-disk scan compare.
+    pub fn key_title_id(&self) -> Result<TitleId, PathSchemaError> {
+        match self {
+            Self::Movie { title, year, .. } => TitleId::movie_key(title, *year),
+            Self::Episode { title, year, .. } => TitleId::series_key(title, *year),
+            Self::Track { artist, album, .. } => TitleId::album_key(artist, album),
+        }
+        .map_err(|_| PathSchemaError::Invalid(format!("{self:?}")))
+    }
+
+    /// Human label for `why`/`status`: `The.Matrix.(1999)`, `The.Wire.(2002) S01E01`.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Movie { title, year, .. } => format!("{title}.({year})"),
+            Self::Episode {
+                title,
+                year,
+                season,
+                episode,
+                episode_end,
+                ..
+            } => match episode_end {
+                Some(end) => format!("{title}.({year}) S{season:02}E{episode:02}-E{end:02}"),
+                None => format!("{title}.({year}) S{season:02}E{episode:02}"),
+            },
+            Self::Track {
+                artist,
+                album,
+                year,
+                track,
+                ..
+            } => match track {
+                Some(n) => format!("{artist}/{album}.({year}) {n:02}"),
+                None => format!("{artist}/{album}.({year})"),
+            },
         }
     }
 }
@@ -119,8 +292,8 @@ pub enum PathSchemaError {
     YearMismatch { folder: u16, file: u16 },
     #[error("year {0} is outside 1000..=9999")]
     InvalidYear(u16),
-    #[error("season {season} / episode {episode} is outside 0..=99")]
-    SeasonEpisodeOutOfRange { season: u8, episode: u8 },
+    #[error("season {season} / episode {episode} is outside range")]
+    SeasonEpisodeOutOfRange { season: u8, episode: u16 },
     #[error("track {0} is outside 1..=99")]
     TrackOutOfRange(u8),
     #[error("empty final name")]
@@ -134,6 +307,42 @@ impl PathSchemaError {
             _ => None,
         }
     }
+}
+
+/// Dotted display form: whitespace, `:`, `/`, `\`, `[]{}`, `,`, `_` and
+/// ` - ` become `.`; runs of dots collapse; leading/trailing dots go.
+/// Parentheses survive so `(1999)` stays a year. Intra-word hyphens and
+/// apostrophes survive (`Spider-Man`, `It's.Always.Sunny`).
+pub fn dotted(text: &str) -> String {
+    let mut s = text.replace('\u{a0}', " ");
+    s = s.replace(" - ", " ");
+    let mapped: String = s
+        .chars()
+        .map(|c| match c {
+            ':' | '/' | '\\' | '[' | ']' | '{' | '}' | ',' | '_' | '—' | '–' | '\u{2019}' => {
+                '.'
+            }
+            c if c.is_whitespace() => '.',
+            c => c,
+        })
+        .collect();
+    let mut out = String::with_capacity(mapped.len());
+    let mut last_dot = true;
+    for c in mapped.chars() {
+        if c == '.' {
+            if !last_dot {
+                out.push('.');
+            }
+            last_dot = true;
+        } else {
+            out.push(c);
+            last_dot = false;
+        }
+    }
+    while out.ends_with('.') {
+        out.pop();
+    }
+    out
 }
 
 /// Strip scene tags `REPACJ`, `REPACK`, and `PROPER` from a name.
@@ -163,7 +372,6 @@ pub fn strip_scene_tags(name: &str) -> String {
         if first {
             first = false;
         } else {
-            // The separator that originally preceded this token.
             out.push(seps[idx - 1]);
         }
         out.push_str(token);
@@ -184,17 +392,31 @@ pub fn strip_placement(placement: &Placement) -> Placement {
             year,
             season,
             episode,
+            episode_end,
+            episode_title,
             extension,
-        } => Placement::episode(strip_scene_tags(title), *year, *season, *episode, extension),
+        } => Placement::episode_titled(
+            strip_scene_tags(title),
+            *year,
+            *season,
+            *episode,
+            *episode_end,
+            episode_title.as_deref().map(strip_scene_tags),
+            extension,
+        ),
         Placement::Track {
+            artist,
             album,
             year,
+            disc,
             track,
             title,
             extension,
         } => Placement::track(
+            strip_scene_tags(artist),
             strip_scene_tags(album),
             *year,
+            *disc,
             *track,
             strip_scene_tags(title),
             extension,
@@ -202,115 +424,194 @@ pub fn strip_placement(placement: &Placement) -> Placement {
     }
 }
 
+/// Normalise every display token of a placement to dotted form and strip
+/// scene tags: the one door from *arr JSON (spaces, colons) to a renderable
+/// placement.
+pub fn normalize_placement(placement: &Placement) -> Placement {
+    let dotted_p = match placement {
+        Placement::Movie {
+            title,
+            year,
+            extension,
+        } => Placement::movie(dotted(title), *year, extension.trim_start_matches('.')),
+        Placement::Episode {
+            title,
+            year,
+            season,
+            episode,
+            episode_end,
+            episode_title,
+            extension,
+        } => Placement::episode_titled(
+            dotted(title),
+            *year,
+            *season,
+            *episode,
+            *episode_end,
+            episode_title.as_deref().map(dotted),
+            extension.trim_start_matches('.'),
+        ),
+        Placement::Track {
+            artist,
+            album,
+            year,
+            disc,
+            track,
+            title,
+            extension,
+        } => Placement::track(
+            dotted(artist),
+            dotted(strip_trailing_year(album)),
+            *year,
+            *disc,
+            *track,
+            dotted(title),
+            extension.trim_start_matches('.'),
+        ),
+    };
+    strip_placement(&dotted_p)
+}
+
 /// Render a library-relative path from TitleId plus placement.
+///
+/// The TitleId only has to agree on kind; the path never carries its id.
 pub fn render(title_id: &TitleId, placement: &Placement) -> Result<PathBuf, PathSchemaError> {
-    match (title_id.kind(), placement) {
-        (
-            TitleKind::Movie,
-            Placement::Movie {
-                title,
-                year,
-                extension,
-            },
-        ) => {
+    if title_id.kind() != placement.kind() {
+        return Err(PathSchemaError::KindMismatch);
+    }
+    render_placement(placement)
+}
+
+/// Render a library-relative path from a placement alone.
+pub fn render_placement(placement: &Placement) -> Result<PathBuf, PathSchemaError> {
+    match placement {
+        Placement::Movie {
+            title,
+            year,
+            extension,
+        } => {
             let title = validate_display_token(title)?;
             let year = validate_year(*year)?;
             let extension = validate_extension(extension)?;
-            let folder = title_folder(&title, year, title_id);
-            let file = format!("{title}.({year}).{extension}");
+            let folder = format!("{title}.({year})");
+            let file = format!("{folder}.{extension}");
             Ok(PathBuf::from("movies").join(folder).join(file))
         }
-        (
-            TitleKind::Series,
-            Placement::Episode {
-                title,
-                year,
-                season,
-                episode,
-                extension,
-            },
-        ) => {
+        Placement::Episode {
+            title,
+            year,
+            season,
+            episode,
+            episode_end,
+            episode_title,
+            extension,
+        } => {
             let title = validate_display_token(title)?;
             let year = validate_year(*year)?;
             let extension = validate_extension(extension)?;
-            // `is_sxxexx` accepts exactly two digits per field, so anything wider
-            // would render a path this module's own `parse` rejects.
-            if *season > 99 || *episode > 99 {
+            if *season > 99 || *episode > 999 || episode_end.is_some_and(|e| e > 999) {
                 return Err(PathSchemaError::SeasonEpisodeOutOfRange {
                     season: *season,
                     episode: *episode,
                 });
             }
-            let folder = title_folder(&title, year, title_id);
-            let file = format!("{title}.({year}).S{season:02}E{episode:02}.{extension}");
-            Ok(PathBuf::from("series").join(folder).join(file))
+            let folder = format!("{title}.({year})");
+            let mut stem = format!("{folder}.S{season:02}E{episode:02}");
+            if let Some(end) = episode_end {
+                stem.push_str(&format!("-E{end:02}"));
+            }
+            if let Some(ep_title) = episode_title.as_deref().filter(|t| !t.is_empty()) {
+                let ep_title = validate_display_token(ep_title)?;
+                stem.push('.');
+                stem.push_str(&ep_title);
+            }
+            Ok(PathBuf::from("series")
+                .join(folder)
+                .join(format!("Season.{season:02}"))
+                .join(format!("{stem}.{extension}")))
         }
-        (
-            TitleKind::Album,
-            Placement::Track {
-                album,
-                year,
-                track,
-                title,
-                extension,
-            },
-        ) => {
+        Placement::Track {
+            artist,
+            album,
+            year,
+            disc,
+            track,
+            title,
+            extension,
+        } => {
+            let artist = validate_display_token(artist)?;
             let album = validate_display_token(album)?;
             let title = validate_display_token(title)?;
             let year = validate_year(*year)?;
             let extension = validate_extension(extension)?;
-            // Track stems carry a two-digit prefix that `parse` requires back.
-            if !(1..=99).contains(track) {
-                return Err(PathSchemaError::TrackOutOfRange(*track));
+            if let Some(n) = track
+                && !(1..=99).contains(n)
+            {
+                return Err(PathSchemaError::TrackOutOfRange(*n));
             }
-            let folder = title_folder(&album, year, title_id);
-            let file = format!("{track:02}.{title}.({year}).{extension}");
-            Ok(PathBuf::from("music").join(folder).join(file))
+            if let Some(d) = disc
+                && !(1..=99).contains(d)
+            {
+                return Err(PathSchemaError::TrackOutOfRange(*d));
+            }
+            let album_folder = format!("{album}.({year})");
+            let mut dir = PathBuf::from("music").join(artist).join(&album_folder);
+            if let Some(d) = disc {
+                dir = dir.join(format!("Disc.{d:02}"));
+            }
+            let file = match track {
+                Some(n) => format!("{album_folder}.{n:02}.{title}.{extension}"),
+                None => format!("{album_folder}.{title}.{extension}"),
+            };
+            Ok(dir.join(file))
         }
-        _ => Err(PathSchemaError::KindMismatch),
     }
 }
 
-/// Parse a library-relative path to a TitleId.
-///
-/// Year in the path is display. Recovered identity is the `{tmdb|tvdb|mbid-…}`
-/// token in the title folder. Album remasters with different folder years and
-/// the same MBID yield the same TitleId.
+/// Parse a library-relative path to a `key` TitleId.
 ///
 /// Paths under `_ops/needs-split` or `_ops/needs-year` are classified as those
 /// reject bins, not a TitleId.
 pub fn parse(path: impl AsRef<Path>) -> Result<TitleId, PathSchemaError> {
-    parse_inner(path.as_ref()).map(|(title_id, _)| title_id)
+    parse_inner(path.as_ref(), None).map(|(title_id, _)| title_id)
 }
 
 /// Parse a library-relative **file** path to TitleId plus placement.
-///
-/// Folder-only paths are not Copy candidates: they have a TitleId but no file
-/// component to install.
 pub fn parse_placement(path: impl AsRef<Path>) -> Result<(TitleId, Placement), PathSchemaError> {
-    let path = path.as_ref();
-    let (title_id, placement) = parse_inner(path)?;
-    match placement {
-        Some(placement) => Ok((title_id, placement)),
-        None => Err(PathSchemaError::Invalid(path_utf8(path)?.to_string())),
+    parse_inner(path.as_ref(), None)
+}
+
+/// Parse a **root-relative** remote path (no `movies/` prefix) with the kind
+/// the allowlisted root is declared to hold. `None` infers the kind from
+/// shape: `Season.NN` or `SxxEyy` is an episode, artist/album/file is a
+/// track, folder/file is a movie.
+pub fn parse_remote(
+    kind: Option<TitleKind>,
+    rel_path: impl AsRef<Path>,
+) -> Result<(TitleId, Placement), PathSchemaError> {
+    parse_inner(rel_path.as_ref(), Some(kind))
+}
+
+/// Root-relative library path: `movies/`, `series/`, `music/` map to a kind.
+/// Seedbox roots are commonly named `tv`; accept it as `series`.
+pub fn kind_dir(name: &str) -> Option<TitleKind> {
+    match name {
+        "movies" => Some(TitleKind::Movie),
+        "series" | "tv" => Some(TitleKind::Series),
+        "music" => Some(TitleKind::Album),
+        _ => None,
     }
 }
 
-fn parse_inner(path: &Path) -> Result<(TitleId, Option<Placement>), PathSchemaError> {
+/// `hint == None`: library-relative, first component must be a kind dir.
+/// `hint == Some(kind)`: root-relative with a known or inferred kind.
+fn parse_inner(
+    path: &Path,
+    hint: Option<Option<TitleKind>>,
+) -> Result<(TitleId, Placement), PathSchemaError> {
     let raw = path_utf8(path)?;
     if let Some(bin) = classify_reject_bin(path) {
         return Err(PathSchemaError::RejectBin(bin));
-    }
-    if raw.chars().any(char::is_whitespace) {
-        return Err(PathSchemaError::SpaceRefused(raw.to_string()));
-    }
-    if path.components().any(|c| match c {
-        Component::Normal(name) => name
-            .to_str()
-            .is_some_and(|s| s.split(['.', '-', '_']).any(is_scene_tag)),
-        _ => false,
-    }) {
-        return Err(PathSchemaError::LeftoverSceneTag(raw.to_string()));
     }
     if path.is_absolute()
         || path.components().any(|c| {
@@ -322,70 +623,345 @@ fn parse_inner(path: &Path) -> Result<(TitleId, Option<Placement>), PathSchemaEr
     {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     }
-
-    let mut comps = path.components();
-    let kind_dir = component_str(comps.next(), raw)?;
-    let folder = component_str(comps.next(), raw)?;
-    let file = match comps.next() {
-        Some(Component::Normal(name)) => Some(os_str(name, raw)?),
-        Some(_) => return Err(PathSchemaError::Invalid(raw.to_string())),
-        None => None,
-    };
-    if comps.next().is_some() {
+    let mut comps: Vec<&str> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::Normal(name) => comps.push(os_str(name, raw)?),
+            Component::CurDir => {}
+            _ => return Err(PathSchemaError::Invalid(raw.to_string())),
+        }
+    }
+    if comps.first().is_some_and(|c| c.starts_with('_')) {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     }
 
-    let (display_title, folder_year, source, id) = parse_title_folder(folder, raw)?;
-    let kind = match kind_dir {
-        "movies" => TitleKind::Movie,
-        "series" => TitleKind::Series,
-        "music" => TitleKind::Album,
+    let kind = match hint {
+        None => {
+            let first = comps
+                .first()
+                .ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
+            let kind = kind_dir(first).ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
+            comps.remove(0);
+            kind
+        }
+        Some(Some(kind)) => {
+            if comps.len() > 2
+                && let Some(first_kind) = kind_dir(comps[0])
+                && first_kind == kind
+            {
+                comps.remove(0);
+            }
+            kind
+        }
+        Some(None) => {
+            // A root that is the parent of the kind dirs (one `~/media` root)
+            // yields `movies/...` paths: the dir names the kind.
+            if comps.len() > 2
+                && let Some(kind) = kind_dir(comps[0])
+            {
+                comps.remove(0);
+                kind
+            } else {
+                infer_kind(&comps).ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?
+            }
+        }
+    };
+    if comps
+        .iter()
+        .any(|c| c.split(['.', '-', '_', ' ']).any(is_scene_tag))
+    {
+        return Err(PathSchemaError::LeftoverSceneTag(raw.to_string()));
+    }
+
+    let placement = match kind {
+        TitleKind::Movie => parse_movie(&comps, raw)?,
+        TitleKind::Series => parse_episode(&comps, raw)?,
+        TitleKind::Album => parse_track(&comps, raw)?,
+    };
+    let title_id = placement.key_title_id()?;
+    Ok((title_id, placement))
+}
+
+fn infer_kind(comps: &[&str]) -> Option<TitleKind> {
+    let file = comps.last()?;
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    if episode_tag(stem).is_some() || comps.iter().any(|c| season_dir(c).is_some()) {
+        return Some(TitleKind::Series);
+    }
+    match comps.len() {
+        2 => Some(TitleKind::Movie),
+        3 | 4 => Some(TitleKind::Album),
+        _ => None,
+    }
+}
+
+fn parse_movie(comps: &[&str], raw: &str) -> Result<Placement, PathSchemaError> {
+    let [folder, file] = comps else {
+        return Err(PathSchemaError::Invalid(raw.to_string()));
+    };
+    let folder = dotted(folder);
+    let (title, year) = split_title_year(&folder, raw)?;
+    let (stem, extension) = split_stem_ext(file, raw)?;
+    let stem = dotted(stem);
+    let prefix = format!("{title}.({year})");
+    if !stem.eq_ignore_ascii_case(&prefix) && !starts_with_ci(&stem, &format!("{prefix}.")) {
+        return Err(PathSchemaError::Invalid(raw.to_string()));
+    }
+    validate_display_token(&title).map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    Ok(Placement::movie(title, year, extension))
+}
+
+fn parse_episode(comps: &[&str], raw: &str) -> Result<Placement, PathSchemaError> {
+    let (folder, file) = match comps {
+        [folder, file] => (*folder, *file),
+        [folder, season_folder, file] if season_dir(season_folder).is_some() => (*folder, *file),
         _ => return Err(PathSchemaError::Invalid(raw.to_string())),
     };
-    let title_id = TitleId::parse(&format!("{}:{}:{id}", kind.as_str(), source.as_str()))
-        .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    let folder = dotted(folder);
+    let (title, year) = split_title_year(&folder, raw)?;
+    validate_display_token(&title).map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    let (stem, extension) = split_stem_ext(file, raw)?;
+    let stem = dotted(stem);
+    let (season, episode, episode_end, after) =
+        episode_tag(&stem).ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
+    if season > 99 || episode > 999 || episode_end.is_some_and(|e| e > 999) {
+        return Err(PathSchemaError::SeasonEpisodeOutOfRange { season, episode });
+    }
+    if let [_, season_folder, _] = comps
+        && let Some(dir_season) = season_dir(season_folder)
+        && dir_season != season
+    {
+        return Err(PathSchemaError::Invalid(raw.to_string()));
+    }
+    let episode_title = cut_at_stop_token(after);
+    Ok(Placement::episode_titled(
+        title,
+        year,
+        season,
+        episode,
+        episode_end,
+        episode_title,
+        extension,
+    ))
+}
 
-    let Some(file) = file else {
-        return Ok((title_id, None));
+fn parse_track(comps: &[&str], raw: &str) -> Result<Placement, PathSchemaError> {
+    let (artist, album_folder, disc, file) = match comps {
+        [artist, album, file] => (*artist, *album, None, *file),
+        [artist, album, disc_folder, file] => {
+            let disc =
+                disc_dir(disc_folder).ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
+            (*artist, *album, Some(disc), *file)
+        }
+        _ => return Err(PathSchemaError::Invalid(raw.to_string())),
     };
-    let extension = file
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_string())
+    let artist = dotted(artist);
+    validate_display_token(&artist).map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    let album_folder = dotted(album_folder);
+    let (album, year) = split_title_year(&album_folder, raw)?;
+    validate_display_token(&album).map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    let (stem, extension) = split_stem_ext(file, raw)?;
+    let stem = dotted(stem);
+    let prefix = format!("{album}.({year}).");
+    let rest = if starts_with_ci(&stem, &prefix) {
+        &stem[prefix.len()..]
+    } else {
+        stem.as_str()
+    };
+    let (track, title) = match rest.split_once('.') {
+        Some((n, title))
+            if n.len() <= 3 && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let n: u8 = n
+                .parse()
+                .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+            (Some(n), title.to_string())
+        }
+        _ => (None, rest.to_string()),
+    };
+    let title = cut_at_stop_token(&title).unwrap_or_else(|| title.clone());
+    if title.is_empty() {
+        return Err(PathSchemaError::Invalid(raw.to_string()));
+    }
+    validate_display_token(&title).map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    if let Some(n) = track
+        && !(1..=99).contains(&n)
+    {
+        return Err(PathSchemaError::TrackOutOfRange(n));
+    }
+    Ok(Placement::track(
+        artist, album, year, disc, track, title, extension,
+    ))
+}
+
+/// `Title.(1999)` → (`Title`, 1999). Year is required.
+fn split_title_year(folder: &str, raw: &str) -> Result<(String, u16), PathSchemaError> {
+    let title = strip_trailing_year(folder);
+    if title.len() == folder.len() {
+        return Err(PathSchemaError::RejectBin(RejectBin::NeedsYear));
+    }
+    let open = folder
+        .rfind('(')
         .ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
-    let stem = file_stem(file, raw)?;
-    let placement = match kind {
-        TitleKind::Movie => {
-            let file_year = year_from_movie_stem(stem, &display_title, raw)?;
-            if file_year != folder_year {
-                return Err(PathSchemaError::YearMismatch {
-                    folder: folder_year,
-                    file: file_year,
-                });
+    let year = parse_year_4(&folder[open + 1..open + 5], raw)?;
+    if title.is_empty() {
+        return Err(PathSchemaError::Invalid(raw.to_string()));
+    }
+    Ok((title.to_string(), year))
+}
+
+/// `S01E02`, `S01E02-E03`, `S01E02E03` anywhere in a dotted stem.
+/// Returns (season, episode, episode_end, remainder-after-tag).
+fn episode_tag(stem: &str) -> Option<(u8, u16, Option<u16>, &str)> {
+    let bytes = stem.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if (bytes[i] == b'S' || bytes[i] == b's')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let mut j = i + 1;
+            let s_start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && j - s_start < 2 {
+                j += 1;
             }
-            Placement::movie(display_title, folder_year, extension)
-        }
-        TitleKind::Series => {
-            let (file_year, season, episode) = episode_from_stem(stem, &display_title, raw)?;
-            if file_year != folder_year {
-                return Err(PathSchemaError::YearMismatch {
-                    folder: folder_year,
-                    file: file_year,
-                });
+            if j > s_start && j < bytes.len() && (bytes[j] == b'E' || bytes[j] == b'e') {
+                let e_start = j + 1;
+                let mut k = e_start;
+                while k < bytes.len() && bytes[k].is_ascii_digit() && k - e_start < 3 {
+                    k += 1;
+                }
+                if k > e_start {
+                    let season: u8 = stem[s_start..j].parse().ok()?;
+                    let episode: u16 = stem[e_start..k].parse().ok()?;
+                    let mut end = None;
+                    let mut after = k;
+                    // `-E03` or `E03` immediately following.
+                    let mut m = k;
+                    if m < bytes.len() && bytes[m] == b'-' {
+                        m += 1;
+                    }
+                    if m < bytes.len() && (bytes[m] == b'E' || bytes[m] == b'e') {
+                        let e2 = m + 1;
+                        let mut n = e2;
+                        while n < bytes.len() && bytes[n].is_ascii_digit() && n - e2 < 3 {
+                            n += 1;
+                        }
+                        if n > e2 && (n == bytes.len() || !bytes[n].is_ascii_alphanumeric()) {
+                            end = stem[e2..n].parse().ok();
+                            after = n;
+                        }
+                    }
+                    if after == bytes.len() || !bytes[after].is_ascii_alphanumeric() {
+                        return Some((season, episode, end, &stem[after..]));
+                    }
+                }
             }
-            Placement::episode(display_title, folder_year, season, episode, extension)
         }
-        TitleKind::Album => {
-            let (track, title, file_year) = track_from_stem(stem, raw)?;
-            if file_year != folder_year {
-                return Err(PathSchemaError::YearMismatch {
-                    folder: folder_year,
-                    file: file_year,
-                });
-            }
-            Placement::track(display_title, folder_year, track, title, extension)
-        }
-    };
-    Ok((title_id, Some(placement)))
+        i += 1;
+    }
+    None
+}
+
+fn season_dir(name: &str) -> Option<u8> {
+    let name = dotted(name);
+    let rest = name
+        .strip_prefix("Season.")
+        .or_else(|| name.strip_prefix("season."))?;
+    (rest.len() <= 2 && rest.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| rest.parse().ok())
+        .flatten()
+}
+
+fn disc_dir(name: &str) -> Option<u8> {
+    let name = dotted(name);
+    let rest = name
+        .strip_prefix("Disc.")
+        .or_else(|| name.strip_prefix("disc."))
+        .or_else(|| name.strip_prefix("CD."))
+        .or_else(|| name.strip_prefix("CD"))?;
+    (rest.len() <= 2 && rest.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| rest.parse().ok())
+        .flatten()
+}
+
+/// Remainder after an episode tag → episode title.
+///
+/// A clean `{Episode.CleanTitle}` is kept whole. Only when the remainder
+/// carries a definitive release marker (a resolution, source, codec, or audio
+/// token) is it a scene name, and then the title is cut at the first release
+/// token so `Machines.1080p.ATVP.WEB-DL.DDP5.1.H.264-NTb` yields `Machines`.
+/// Empty → `None`.
+fn cut_at_stop_token(after: &str) -> Option<String> {
+    let trimmed = after.trim_matches(['.', '-', ' ']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = trimmed.split('.').filter(|t| !t.is_empty()).collect();
+    if !tokens.iter().any(|t| is_release_marker(t)) {
+        return Some(tokens.join("."));
+    }
+    let kept: Vec<&str> = tokens
+        .iter()
+        .copied()
+        .take_while(|t| !is_stop_token(t))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(kept.join("."))
+}
+
+/// Tokens that only a release name contains.
+fn is_release_marker(token: &str) -> bool {
+    let folded = token.to_ascii_lowercase();
+    let folded = folded.trim_matches('-');
+    if folded.len() >= 4
+        && folded.ends_with('p')
+        && folded[..folded.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
+    matches!(
+        folded,
+        "web-dl"
+            | "webdl"
+            | "webrip"
+            | "bluray"
+            | "blu-ray"
+            | "bdrip"
+            | "brrip"
+            | "dvdrip"
+            | "hdtv"
+            | "remux"
+            | "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "avc"
+            | "av1"
+            | "10bit"
+            | "eac3"
+            | "ac3"
+            | "aac"
+            | "atmos"
+            | "truehd"
+            | "dts"
+            | "dts-hd"
+    ) || folded
+        .strip_prefix("ddp")
+        .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_stop_token(token: &str) -> bool {
+    if is_release_marker(token) {
+        return true;
+    }
+    let folded = token.to_ascii_lowercase();
+    let folded = folded.trim_matches('-');
+    STOP_TOKENS.contains(&folded)
 }
 
 /// Staging layout: `_incoming/<kind-source-id>/<final_name>`.
@@ -406,14 +982,6 @@ pub fn staging_path(title_id: &TitleId, final_name: &str) -> Result<PathBuf, Pat
     Ok(PathBuf::from("_incoming")
         .join(title_id.staging_token())
         .join(final_name))
-}
-
-fn title_folder(title: &str, year: u16, title_id: &TitleId) -> String {
-    format!(
-        "{title}.({year}).{{{}-{}}}",
-        title_id.source().path_token(),
-        title_id.id()
-    )
 }
 
 fn validate_display_token(token: &str) -> Result<String, PathSchemaError> {
@@ -466,20 +1034,13 @@ fn validate_extension(extension: &str) -> Result<String, PathSchemaError> {
     {
         return Err(PathSchemaError::Invalid(extension.to_string()));
     }
-    Ok(extension.to_string())
+    Ok(extension.to_ascii_lowercase())
 }
 
-/// Split the trailing `len` bytes off `s`, refusing a cut inside a character.
-///
-/// Both callers previously guarded with a byte-length check and then sliced at a
-/// byte offset, which panics on any multi-byte name (`parse` is fed remote
-/// filenames, so that was reachable).
-fn split_tail(s: &str, len: usize) -> Option<(&str, &str)> {
-    let cut = s.len().checked_sub(len)?;
-    if !s.is_char_boundary(cut) {
-        return None;
-    }
-    Some((&s[..cut], &s[cut..]))
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len()
+        && s.is_char_boundary(prefix.len())
+        && s[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 fn is_scene_tag(part: &str) -> bool {
@@ -496,151 +1057,34 @@ fn classify_reject_bin(path: &Path) -> Option<RejectBin> {
         .collect();
     if names
         .windows(2)
-        .any(|w| w[0] == "_ops" && w[1] == "needs-split")
+        .any(|w| (w[0] == "_ops" || w[0] == "_incoming") && w[1] == "needs-split")
     {
         return Some(RejectBin::NeedsSplit);
     }
     if names
         .windows(2)
-        .any(|w| w[0] == "_ops" && w[1] == "needs-year")
+        .any(|w| (w[0] == "_ops" || w[0] == "_incoming") && w[1] == "needs-year")
     {
         return Some(RejectBin::NeedsYear);
     }
     None
 }
 
-fn parse_title_folder<'a>(
-    folder: &'a str,
-    raw: &str,
-) -> Result<(String, u16, TitleSource, &'a str), PathSchemaError> {
-    let Some(brace) = folder.rfind(".{") else {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    };
-    if !folder.ends_with('}') {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    let token = &folder[brace + 2..folder.len() - 1];
-    let prefix = &folder[..brace];
-    let Some((title, year_suffix)) = split_tail(prefix, 7) else {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    };
-    if !year_suffix.starts_with(".(") || !year_suffix.ends_with(')') {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    let year = parse_year_4(&year_suffix[2..6], raw)?;
-    if title.is_empty() {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    // P23: `render` refuses these in a display token, so `parse` must not accept
-    // them back -- otherwise the parser is a weaker gate than the renderer.
-    validate_display_token(title).map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
-    let Some((source_raw, id)) = token.split_once('-') else {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    };
-    let source = match source_raw {
-        "tmdb" => TitleSource::Tmdb,
-        "tvdb" => TitleSource::Tvdb,
-        "mbid" => TitleSource::Mbid,
-        _ => return Err(PathSchemaError::Invalid(raw.to_string())),
-    };
-    if id.is_empty() {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    Ok((title.to_string(), year, source, id))
-}
-
-fn year_from_movie_stem(stem: &str, title: &str, raw: &str) -> Result<u16, PathSchemaError> {
-    let expected_prefix = format!("{title}.(");
-    let rest = stem
-        .strip_prefix(&expected_prefix)
-        .ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
-    let Some((year_str, after)) = rest.split_once(')') else {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    };
-    if !after.is_empty() {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    parse_year_4(year_str, raw)
-}
-
-fn episode_from_stem(stem: &str, title: &str, raw: &str) -> Result<(u16, u8, u8), PathSchemaError> {
-    let expected_prefix = format!("{title}.(");
-    let rest = stem
-        .strip_prefix(&expected_prefix)
-        .ok_or_else(|| PathSchemaError::Invalid(raw.to_string()))?;
-    let Some((year_str, after)) = rest.split_once(')') else {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    };
-    if !is_sxxexx(after) {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    let year = parse_year_4(year_str, raw)?;
-    let season: u8 = after[2..4]
-        .parse()
-        .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
-    let episode: u8 = after[5..7]
-        .parse()
-        .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
-    Ok((year, season, episode))
-}
-
-fn track_from_stem(stem: &str, raw: &str) -> Result<(u8, String, u16), PathSchemaError> {
-    // Grammar is `NN.<title>.(YYYY)`; movie and series stems are checked in full,
-    // so the track stem must be too.
-    let Some((track, rest)) = stem.split_once('.') else {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    };
-    if track.len() != 2 || !track.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    let track: u8 = track
-        .parse()
-        .map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
-    let Some((title, year_suffix)) = split_tail(rest, 7) else {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    };
-    if title.is_empty() || !year_suffix.starts_with(".(") || !year_suffix.ends_with(')') {
-        return Err(PathSchemaError::Invalid(raw.to_string()));
-    }
-    let year = parse_year_4(&year_suffix[2..6], raw)?;
-    Ok((track, title.to_string(), year))
-}
-
-fn is_sxxexx(after: &str) -> bool {
-    let b = after.as_bytes();
-    b.len() == 7
-        && b[0] == b'.'
-        && b[1] == b'S'
-        && b[4] == b'E'
-        && b[2].is_ascii_digit()
-        && b[3].is_ascii_digit()
-        && b[5].is_ascii_digit()
-        && b[6].is_ascii_digit()
-}
-
-fn file_stem<'a>(file: &'a str, raw: &str) -> Result<&'a str, PathSchemaError> {
-    let Some((stem, _ext)) = file.rsplit_once('.') else {
+fn split_stem_ext<'a>(file: &'a str, raw: &str) -> Result<(&'a str, String), PathSchemaError> {
+    let Some((stem, ext)) = file.rsplit_once('.') else {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     };
     if stem.is_empty() {
         return Err(PathSchemaError::Invalid(raw.to_string()));
     }
-    Ok(stem)
+    let extension =
+        validate_extension(ext).map_err(|_| PathSchemaError::Invalid(raw.to_string()))?;
+    Ok((stem, extension))
 }
 
 fn path_utf8(path: &Path) -> Result<&str, PathSchemaError> {
     path.to_str()
         .ok_or_else(|| PathSchemaError::Invalid(path.display().to_string()))
-}
-
-fn component_str<'a>(
-    component: Option<Component<'a>>,
-    raw: &str,
-) -> Result<&'a str, PathSchemaError> {
-    match component {
-        Some(Component::Normal(name)) => os_str(name, raw),
-        _ => Err(PathSchemaError::Invalid(raw.to_string())),
-    }
 }
 
 fn os_str<'a>(name: &'a std::ffi::OsStr, raw: &str) -> Result<&'a str, PathSchemaError> {
@@ -652,204 +1096,271 @@ fn os_str<'a>(name: &'a std::ffi::OsStr, raw: &str) -> Result<&'a str, PathSchem
 mod tests {
     use super::*;
 
-    const RELAYER_MBID: &str = "0f82b02e-c6cd-4242-b195-93d4bf3e0d63";
-
     fn movie_id() -> TitleId {
-        TitleId::movie("603").expect("movie")
+        TitleId::movie_key("The.Matrix", 1999).expect("movie")
     }
 
     fn series_id() -> TitleId {
-        TitleId::series("79126").expect("series")
+        TitleId::series_key("The.Wire", 2002).expect("series")
     }
 
     fn album_id() -> TitleId {
-        TitleId::album(RELAYER_MBID).expect("album")
+        TitleId::album_key("Yes", "Relayer").expect("album")
+    }
+
+    fn relayer_track() -> Placement {
+        Placement::track(
+            "Yes",
+            "Relayer",
+            1974,
+            None,
+            Some(1),
+            "The.Gates.Of.Delirium",
+            "flac",
+        )
     }
 
     #[test]
-    fn grammar_v1_golden_paths_are_stable() {
-        // These three strings *are* grammar v1. If a change to `render` moves any
-        // of them, that is a grammar break: bump GRAMMAR_VERSION with it.
-        assert_eq!(GRAMMAR_VERSION, 1);
+    fn grammar_v2_golden_paths_are_stable() {
+        assert_eq!(GRAMMAR_VERSION, 2);
         let cases = [
             (
                 movie_id(),
                 Placement::movie("The.Matrix", 1999, "mkv"),
-                "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+                "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
             ),
             (
                 series_id(),
-                Placement::episode("The.Wire", 2002, 1, 1, "mkv"),
-                "series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.mkv",
+                Placement::episode_titled(
+                    "The.Wire",
+                    2002,
+                    1,
+                    1,
+                    None,
+                    Some("The.Target".into()),
+                    "mkv",
+                ),
+                "series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E01.The.Target.mkv",
+            ),
+            (
+                series_id(),
+                Placement::episode("The.Wire", 2002, 1, 2, "mkv"),
+                "series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E02.mkv",
             ),
             (
                 album_id(),
-                Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac"),
-                "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/\
-01.The.Gates.Of.Delirium.(2013).flac",
+                relayer_track(),
+                "music/Yes/Relayer.(1974)/Relayer.(1974).01.The.Gates.Of.Delirium.flac",
+            ),
+            (
+                TitleId::album_key("Radiohead", "OK.Computer").expect("album"),
+                Placement::track(
+                    "Radiohead",
+                    "OK.Computer",
+                    1997,
+                    Some(2),
+                    Some(3),
+                    "Airbag",
+                    "flac",
+                ),
+                "music/Radiohead/OK.Computer.(1997)/Disc.02/OK.Computer.(1997).03.Airbag.flac",
             ),
         ];
         for (id, placement, expected) in cases {
             let rendered = render(&id, &placement).expect("render");
             assert_eq!(rendered.to_str().expect("utf8"), expected);
-            assert_eq!(parse(&rendered).expect("parse"), id);
+            let (back_id, back_placement) = parse_placement(&rendered).expect("parse");
+            assert_eq!(back_id, id, "{expected}");
+            assert_eq!(back_placement, placement, "{expected}");
+            assert_eq!(
+                render(&back_id, &back_placement).expect("re-render"),
+                rendered
+            );
         }
     }
 
     #[test]
-    fn pathschema_parse_render_identity_movie_series_album() {
-        let movie = render(&movie_id(), &Placement::movie("The.Matrix", 1999, "mkv"))
-            .expect("render movie");
+    fn render_ignores_authority_source_but_checks_kind() {
+        let tmdb = TitleId::movie("603").expect("tmdb");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let path = render(&tmdb, &placement).expect("render");
         assert_eq!(
-            movie.to_str().expect("utf8"),
-            "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"
+            path.to_str().expect("utf8"),
+            "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"
         );
-        assert_eq!(parse(&movie).expect("parse movie"), movie_id());
+        // Parsing recovers the key identity, never the tmdb one.
+        assert_eq!(parse(&path).expect("parse"), movie_id());
+        assert!(matches!(
+            render(&tmdb, &Placement::episode("The.Wire", 2002, 1, 1, "mkv")),
+            Err(PathSchemaError::KindMismatch)
+        ));
+    }
 
-        let series = render(
-            &series_id(),
-            &Placement::episode("The.Wire", 2002, 1, 1, "mkv"),
+    #[test]
+    fn parse_is_lenient_about_spaces_and_arr_folder_styles() {
+        // Radarr folder created before dotted naming: spaces and ` - `.
+        let (id, placement) = parse_remote(
+            Some(TitleKind::Movie),
+            "Spider-Man - Brand New Day (2026)/Spider-Man.Brand.New.Day.(2026).mkv",
         )
-        .expect("render series");
+        .expect("spaced folder");
+        assert_eq!(id.render(), "movie:key:spidermanbrandnewday.2026");
         assert_eq!(
-            series.to_str().expect("utf8"),
-            "series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.mkv"
+            placement,
+            Placement::movie("Spider-Man.Brand.New.Day", 2026, "mkv")
         );
-        assert_eq!(parse(&series).expect("parse series"), series_id());
+        assert_eq!(
+            render(&id, &placement)
+                .expect("render")
+                .to_str()
+                .expect("utf8"),
+            "movies/Spider-Man.Brand.New.Day.(2026)/Spider-Man.Brand.New.Day.(2026).mkv"
+        );
 
-        let album = render(
-            &album_id(),
-            &Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac"),
+        // Lidarr `{Artist Name}` / `{Album Title}` on the box keep spaces.
+        let (id, placement) = parse_remote(
+            Some(TitleKind::Album),
+            "Radiohead/OK Computer.(1997)/Disc.01/OK Computer.(1997).01.Airbag.flac",
         )
-        .expect("render album");
+        .expect("lidarr spaces");
+        assert_eq!(id.render(), "album:key:radiohead.okcomputer");
         assert_eq!(
-            album.to_str().expect("utf8"),
-            "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.The.Gates.Of.Delirium.(2013).flac"
+            placement,
+            Placement::track(
+                "Radiohead",
+                "OK.Computer",
+                1997,
+                Some(1),
+                Some(1),
+                "Airbag",
+                "flac"
+            )
         );
-        assert_eq!(parse(&album).expect("parse album"), album_id());
+        assert_eq!(placement.file_key(), FileKey::Track { disc: 1, track: 1 });
     }
 
     #[test]
-    fn library_year_matches_folder_and_file_stem() {
-        let path =
-            render(&movie_id(), &Placement::movie("The.Matrix", 1999, "mkv")).expect("render");
-        let text = path.to_str().expect("utf8");
-        let folder_year = text
-            .split('/')
-            .nth(1)
-            .expect("folder")
-            .matches("(1999)")
-            .count();
-        let file_year = text
-            .split('/')
-            .nth(2)
-            .expect("file")
-            .matches("(1999)")
-            .count();
-        assert_eq!(folder_year, 1);
-        assert_eq!(file_year, 1);
-        assert!(!text.contains(' '));
-
-        let mismatch = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1998).mkv");
-        assert!(matches!(
-            parse(&mismatch),
-            Err(PathSchemaError::YearMismatch {
-                folder: 1999,
-                file: 1998
-            })
-        ));
-
-        let album = render(
-            &album_id(),
-            &Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac"),
+    fn remote_kind_inference_and_tv_root_alias() {
+        let (id, p) = parse_remote(
+            None,
+            "Silo.(2023)/Season.01/Silo.(2023).S01E01.Freedom.Day.mkv",
         )
-        .expect("render album");
-        let album_text = album.to_str().expect("utf8");
-        assert!(album_text.contains("/Relayer.(2013).{"));
-        assert!(album_text.ends_with("01.The.Gates.Of.Delirium.(2013).flac"));
-        let album_mismatch = PathBuf::from(format!(
-            "music/Relayer.(2013).{{mbid-{RELAYER_MBID}}}/01.The.Gates.Of.Delirium.(1974).flac"
-        ));
-        assert!(matches!(
-            parse(&album_mismatch),
-            Err(PathSchemaError::YearMismatch {
-                folder: 2013,
-                file: 1974
-            })
-        ));
-    }
-
-    #[test]
-    fn spaces_in_title_are_refused() {
-        let err =
-            render(&movie_id(), &Placement::movie("The Matrix", 1999, "mkv")).expect_err("space");
-        assert!(matches!(err, PathSchemaError::SpaceRefused(_)));
-        assert!(matches!(
-            parse("movies/The Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
-            Err(PathSchemaError::SpaceRefused(_))
-        ));
-    }
-
-    #[test]
-    fn remaster_folders_share_album_title_id() {
-        let id = album_id();
-        let y1974 = PathBuf::from(format!(
-            "music/Relayer.(1974).{{mbid-{RELAYER_MBID}}}/01.The.Gates.Of.Delirium.(1974).flac"
-        ));
-        let y2013 = PathBuf::from(format!(
-            "music/Relayer.(2013).{{mbid-{RELAYER_MBID}}}/01.The.Gates.Of.Delirium.(2013).flac"
-        ));
-        assert_eq!(parse(&y1974).expect("1974"), id);
-        assert_eq!(parse(&y2013).expect("2013"), id);
-        assert_eq!(parse(&y1974).expect("1974"), parse(&y2013).expect("2013"));
-    }
-
-    #[test]
-    fn scene_tag_strip_removes_repacj_repack_proper() {
+        .expect("episode");
+        assert_eq!(id.render(), "series:key:silo.2023");
         assert_eq!(
-            strip_scene_tags("House.of.the.Dragon.S02E07.REPACJ.1080p"),
-            "House.of.the.Dragon.S02E07.1080p"
+            p,
+            Placement::episode_titled("Silo", 2023, 1, 1, None, Some("Freedom.Day".into()), "mkv")
         );
-        assert_eq!(strip_scene_tags("The.Matrix.REPACK.mkv"), "The.Matrix.mkv");
-        assert_eq!(strip_scene_tags("The.Wire.PROPER.mkv"), "The.Wire.mkv");
+        let (id, _) = parse_remote(None, "Coco.(2017)/Coco.(2017).mkv").expect("movie");
+        assert_eq!(id.render(), "movie:key:coco.2017");
+        let (id, _) = parse_remote(
+            None,
+            "Tool/Lateralus.(2001)/Lateralus.(2001).01.The.Grudge.flac",
+        )
+        .expect("track");
+        assert_eq!(id.render(), "album:key:tool.lateralus");
+        // Library-relative with the `tv` alias a seedbox root uses.
+        let (id, _) =
+            parse_placement("tv/Silo.(2023)/Season.01/Silo.(2023).S01E01.mkv").expect("tv alias");
+        assert_eq!(id.kind(), TitleKind::Series);
+        // Root-relative with a kind hint that also carries the kind dir.
+        let (id, _) = parse_remote(Some(TitleKind::Movie), "movies/Coco.(2017)/Coco.(2017).mkv")
+            .expect("hint + dir");
+        assert_eq!(id.render(), "movie:key:coco.2017");
+    }
+
+    #[test]
+    fn episode_tags_double_and_scene_noise_are_cut() {
+        let (_, p) = parse_placement(
+            "series/The.Simpsons.(1989)/Season.28/The.Simpsons.(1989).S28E12-E13.The.Great.Phatsby.mkv",
+        )
+        .expect("double");
         assert_eq!(
-            strip_scene_tags("Title.REPACJ.REPACK.PROPER.mkv"),
-            "Title.mkv"
+            p,
+            Placement::episode_titled(
+                "The.Simpsons",
+                1989,
+                28,
+                12,
+                Some(13),
+                Some("The.Great.Phatsby".into()),
+                "mkv"
+            )
+        );
+        assert_eq!(p.label(), "The.Simpsons.(1989) S28E12-E13");
+        let rendered = render_placement(&p).expect("render");
+        assert!(
+            rendered
+                .to_str()
+                .expect("utf8")
+                .ends_with("S28E12-E13.The.Great.Phatsby.mkv")
+        );
+
+        // A scene file inside a proper show folder: noise after the tag is dropped.
+        let (_, p) = parse_remote(
+            Some(TitleKind::Series),
+            "Silo.(2023)/Season.01/Silo.S01E03.Machines.1080p.ATVP.WEB-DL.DDP5.1.H.264-NTb.mkv",
+        )
+        .expect("scene");
+        assert_eq!(
+            p,
+            Placement::episode_titled("Silo", 2023, 1, 3, None, Some("Machines".into()), "mkv")
+        );
+        let (_, p) = parse_remote(
+            Some(TitleKind::Series),
+            "Silo.(2023)/Silo.S01E04.1080p.WEB-DL-GROUP.mkv",
+        )
+        .expect("no season dir, no title");
+        assert_eq!(p, Placement::episode("Silo", 2023, 1, 4, "mkv"));
+        assert_eq!(
+            p.file_key(),
+            FileKey::Episode {
+                season: 1,
+                episode: 4
+            }
         );
     }
 
     #[test]
-    fn leftover_scene_tag_in_library_path_is_not_a_successful_parse() {
-        assert!(matches!(
-            parse("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).REPACK.mkv"),
-            Err(PathSchemaError::LeftoverSceneTag(_))
-        ));
-        assert!(matches!(
-            parse("movies/The.Matrix.PROPER.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
-            Err(PathSchemaError::LeftoverSceneTag(_))
-        ));
-        assert!(matches!(
-            parse("series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.REPACJ.mkv"),
-            Err(PathSchemaError::LeftoverSceneTag(_))
-        ));
+    fn season_dir_must_agree_with_tag_and_specials_are_season_zero() {
+        assert!(
+            parse_placement("series/Silo.(2023)/Season.02/Silo.(2023).S01E01.mkv").is_err(),
+            "Season.02 folder with an S01 file"
+        );
+        let (_, p) = parse_placement("series/Silo.(2023)/Season.00/Silo.(2023).S00E01.Recap.mkv")
+            .expect("specials");
+        assert_eq!(
+            p.file_key(),
+            FileKey::Episode {
+                season: 0,
+                episode: 1
+            }
+        );
     }
 
     #[test]
-    fn reject_bins_needs_split_and_needs_year() {
-        let split = parse("_ops/needs-split/season-pack.mkv").expect_err("split");
-        assert_eq!(split.reject_bin(), Some(RejectBin::NeedsSplit));
-        assert!(matches!(
-            split,
-            PathSchemaError::RejectBin(RejectBin::NeedsSplit)
-        ));
+    fn movie_stem_must_start_with_folder_name() {
+        assert!(parse_placement("movies/The.Matrix.(1999)/The.Matrix.(1998).mkv").is_err());
+        assert!(parse_placement("movies/The.Matrix.(1999)/Some.Other.File.mkv").is_err());
+        // Extra tokens after the prefix are tolerated (edition tags).
+        let (_, p) = parse_placement("movies/The.Matrix.(1999)/The.Matrix.(1999).Remastered.mkv")
+            .expect("suffix");
+        assert_eq!(p, Placement::movie("The.Matrix", 1999, "mkv"));
+    }
 
-        let year = parse("_ops/needs-year/unknown.mkv").expect_err("year");
-        assert_eq!(year.reject_bin(), Some(RejectBin::NeedsYear));
+    #[test]
+    fn missing_year_is_needs_year_and_folder_only_is_invalid() {
         assert!(matches!(
-            year,
-            PathSchemaError::RejectBin(RejectBin::NeedsYear)
+            parse_placement("movies/The.Matrix/The.Matrix.mkv"),
+            Err(PathSchemaError::RejectBin(RejectBin::NeedsYear))
         ));
-
+        assert!(parse_placement("movies/The.Matrix.(1999)").is_err());
+        assert!(parse_placement("movies").is_err());
+        assert!(parse_placement("_incoming/movie-key-x/y.mkv").is_err());
+        assert!(matches!(
+            parse("_ops/needs-split/Show.S01.1080p"),
+            Err(PathSchemaError::RejectBin(RejectBin::NeedsSplit))
+        ));
         assert_eq!(
             RejectBin::NeedsSplit.rel_dir(),
             PathBuf::from("_ops/needs-split")
@@ -858,250 +1369,177 @@ mod tests {
             RejectBin::NeedsYear.rel_dir(),
             PathBuf::from("_ops/needs-year")
         );
-
-        let not_ops = parse("needs-split/season-pack.mkv").expect_err("not ops");
-        assert!(not_ops.reject_bin().is_none());
-        assert!(matches!(not_ops, PathSchemaError::Invalid(_)));
-        let nested = parse("movies/needs-split/x.mkv").expect_err("component");
-        assert!(nested.reject_bin().is_none());
     }
 
     #[test]
-    fn render_rejects_years_outside_four_digit_range() {
-        assert!(matches!(
-            render(&movie_id(), &Placement::movie("The.Matrix", 999, "mkv")),
-            Err(PathSchemaError::InvalidYear(999))
-        ));
-        assert!(matches!(
-            render(&movie_id(), &Placement::movie("The.Matrix", 10000, "mkv")),
-            Err(PathSchemaError::InvalidYear(10000))
-        ));
-        assert!(render(&movie_id(), &Placement::movie("The.Matrix", 1000, "mkv")).is_ok());
-        assert!(render(&movie_id(), &Placement::movie("The.Matrix", 9999, "mkv")).is_ok());
-    }
-
-    #[test]
-    fn reserved_dot_dotdot_and_nul_are_rejected() {
-        let id = movie_id();
-        assert!(matches!(
-            staging_path(&id, "."),
-            Err(PathSchemaError::Invalid(_))
-        ));
-        assert!(matches!(
-            staging_path(&id, ".."),
-            Err(PathSchemaError::Invalid(_))
-        ));
-        assert!(matches!(
-            staging_path(&id, "file\0name.mkv"),
-            Err(PathSchemaError::Invalid(_))
-        ));
-        assert!(matches!(
-            render(&id, &Placement::movie(".", 1999, "mkv")),
-            Err(PathSchemaError::Invalid(_))
-        ));
-        assert!(matches!(
-            render(&id, &Placement::movie("..", 1999, "mkv")),
-            Err(PathSchemaError::Invalid(_))
-        ));
-        assert!(matches!(
-            render(&id, &Placement::movie("The.Matrix\0x", 1999, "mkv")),
-            Err(PathSchemaError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn movie_and_series_stems_are_strict() {
-        assert!(matches!(
-            parse("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).S01E01.mkv"),
-            Err(PathSchemaError::Invalid(_))
-        ));
-        assert!(matches!(
-            parse("series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S1E01.mkv"),
-            Err(PathSchemaError::Invalid(_))
-        ));
-        assert!(matches!(
-            parse("series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.Director.mkv"),
-            Err(PathSchemaError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn staging_path_uses_filesystem_safe_title_token() {
-        let id = movie_id();
-        let staged = staging_path(&id, "The.Matrix.(1999).mkv").expect("staging");
+    fn spaces_are_refused_on_render_and_normalized_by_dotted() {
+        let err =
+            render(&movie_id(), &Placement::movie("The Matrix", 1999, "mkv")).expect_err("space");
+        assert!(matches!(err, PathSchemaError::SpaceRefused(_)));
+        assert_eq!(dotted("The Matrix"), "The.Matrix");
         assert_eq!(
-            staged.to_str().expect("utf8"),
-            "_incoming/movie-tmdb-603/The.Matrix.(1999).mkv"
+            dotted("Spider-Man - Brand New Day (2026)"),
+            "Spider-Man.Brand.New.Day.(2026)"
         );
-        // The identity itself keeps its colon form; only the path token differs.
-        assert_eq!(id.render(), "movie:tmdb:603");
-        assert!(
-            !staged.to_str().expect("utf8").contains(':'),
-            "staging paths must be creatable on SMB, exFAT, and NTFS"
+        assert_eq!(
+            dotted("It's Always Sunny: Philly"),
+            "It's.Always.Sunny.Philly"
         );
-        let album = album_id();
-        let album_staged = staging_path(&album, "01.The.Gates.(2013).flac").expect("staging");
-        assert!(!album_staged.to_str().expect("utf8").contains(':'));
+        assert_eq!(dotted("  a   b  "), "a.b");
+        assert_eq!(dotted("Blade.Runner.(2049)"), "Blade.Runner.(2049)");
+        let normalized =
+            normalize_placement(&Placement::movie("Spider-Man: Brand New Day", 2026, ".MKV"));
+        assert_eq!(
+            normalized,
+            Placement::movie("Spider-Man.Brand.New.Day", 2026, "MKV")
+        );
+        assert_eq!(
+            render_placement(&normalized)
+                .expect("render")
+                .to_str()
+                .expect("utf8"),
+            "movies/Spider-Man.Brand.New.Day.(2026)/Spider-Man.Brand.New.Day.(2026).mkv"
+        );
+    }
+
+    #[test]
+    fn scene_tags_strip_and_leftovers_refuse() {
+        assert_eq!(strip_scene_tags("The.Matrix.REPACK.mkv"), "The.Matrix.mkv");
+        assert_eq!(
+            strip_scene_tags("Title.REPACJ.REPACK.PROPER.mkv"),
+            "Title.mkv"
+        );
+        assert_eq!(strip_scene_tags("Spider-Man.REPACK"), "Spider-Man");
+        assert_eq!(strip_scene_tags("REPACK.PROPER"), "");
         assert!(matches!(
-            staging_path(&id, ""),
+            parse("movies/The.Matrix.(1999)/The.Matrix.(1999).REPACK.mkv"),
+            Err(PathSchemaError::LeftoverSceneTag(_))
+        ));
+        assert!(matches!(
+            render(
+                &movie_id(),
+                &Placement::movie("The.Matrix.PROPER", 1999, "mkv")
+            ),
+            Err(PathSchemaError::LeftoverSceneTag(_))
+        ));
+        let stripped = strip_placement(&Placement::movie("The.Matrix.PROPER", 1999, "mkv"));
+        assert_eq!(stripped, Placement::movie("The.Matrix", 1999, "mkv"));
+    }
+
+    #[test]
+    fn remaster_years_share_an_album_identity_but_not_a_path() {
+        let a = parse_placement(
+            "music/Yes/Relayer.(1974)/Relayer.(1974).01.The.Gates.Of.Delirium.flac",
+        )
+        .expect("1974");
+        let b = parse_placement(
+            "music/Yes/Relayer.(2013)/Relayer.(2013).01.The.Gates.Of.Delirium.flac",
+        )
+        .expect("2013");
+        assert_eq!(a.0, b.0);
+        assert_eq!(a.1.file_key(), b.1.file_key());
+        assert_ne!(render_placement(&a.1), render_placement(&b.1));
+        // Lidarr multi-disc; `CD1` style discs too.
+        let (_, p) = parse_remote(
+            Some(TitleKind::Album),
+            "Radiohead/Amnesiac.(2001)/CD2/Amnesiac.(2001).04.You.and.Whose.Army.flac",
+        )
+        .expect("cd2");
+        assert_eq!(p.file_key(), FileKey::Track { disc: 2, track: 4 });
+        // A track without a number is one Whole per album.
+        let (_, p) = parse_placement("music/Yes/Relayer.(1974)/Relayer.(1974).Sound.Chaser.flac")
+            .expect("no number");
+        assert_eq!(p.file_key(), FileKey::Whole);
+        assert!(
+            render_placement(&p)
+                .expect("render")
+                .ends_with("Relayer.(1974).Sound.Chaser.flac")
+        );
+    }
+
+    #[test]
+    fn staging_path_uses_hyphen_token_and_refuses_junk() {
+        let path = staging_path(&movie_id(), "The.Matrix.(1999).mkv").expect("staging");
+        assert_eq!(
+            path.to_str().expect("utf8"),
+            "_incoming/movie-key-thematrix.1999/The.Matrix.(1999).mkv"
+        );
+        assert!(matches!(
+            staging_path(&movie_id(), ""),
             Err(PathSchemaError::EmptyFinalName)
         ));
-        assert!(TitleId::parse("").is_err());
-        assert!(TitleId::parse("movie:tmdb:").is_err());
+        assert!(matches!(
+            staging_path(&movie_id(), "a b.mkv"),
+            Err(PathSchemaError::SpaceRefused(_))
+        ));
+        assert!(staging_path(&movie_id(), "a/b.mkv").is_err());
+        assert!(staging_path(&movie_id(), "..").is_err());
     }
 
     #[test]
-    fn non_ascii_paths_return_errors_instead_of_panicking() {
-        // Both sites used to guard with a byte-length check and then slice at a
-        // byte offset, which panicked mid-character. `parse` is fed remote
-        // filenames, so these must be ordinary errors.
-        for raw in [
-            "movies/\u{65e5}\u{672c}\u{8a9e}.{tmdb-603}/x.mkv",
-            "movies/\u{e9}.{tmdb-603}/x.mkv",
-            "music/Relayer.(1974).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/\u{65e5}\u{672c}\u{8a9e}\u{ff01}.flac",
-            "music/Relayer.(1974).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.\u{e9}.flac",
-            "series/\u{4e2d}.{tvdb-79126}/\u{4e2d}.mkv",
+    fn unicode_titles_round_trip() {
+        for path in [
+            "movies/\u{65e5}\u{672c}\u{8a9e}.(2001)/\u{65e5}\u{672c}\u{8a9e}.(2001).mkv",
+            "movies/Am\u{e9}lie.(2001)/Am\u{e9}lie.(2001).mkv",
+            "music/Sigur.R\u{f3}s/\u{c1}g\u{e6}tis.byrjun.(1999)/\u{c1}g\u{e6}tis.byrjun.(1999).01.Intro.flac",
         ] {
-            assert!(parse(raw).is_err(), "{raw} must be an error, not a panic");
+            let (id, p) = parse_placement(path).expect(path);
+            assert_eq!(
+                render(&id, &p).expect("render").to_str().expect("utf8"),
+                path
+            );
         }
-        // A legitimate non-ASCII display title still round-trips.
-        let id = movie_id();
-        let p = render(&id, &Placement::movie("Am\u{e9}lie", 2001, "mkv")).expect("render");
-        assert_eq!(parse(&p).expect("parse"), id);
     }
 
     #[test]
-    fn render_refuses_season_episode_and_track_the_grammar_cannot_parse() {
-        let series = series_id();
+    fn out_of_range_numbers_refuse() {
         assert!(matches!(
-            render(
-                &series,
-                &Placement::episode("The.Wire", 2002, 1, 100, "mkv")
-            ),
-            Err(PathSchemaError::SeasonEpisodeOutOfRange {
-                season: 1,
-                episode: 100
-            })
+            render_placement(&Placement::episode("X", 2000, 100, 1, "mkv")),
+            Err(PathSchemaError::SeasonEpisodeOutOfRange { .. })
         ));
         assert!(matches!(
-            render(
-                &series,
-                &Placement::episode("The.Wire", 2002, 100, 1, "mkv")
-            ),
-            Err(PathSchemaError::SeasonEpisodeOutOfRange {
-                season: 100,
-                episode: 1
-            })
-        ));
-        let album = album_id();
-        assert!(matches!(
-            render(
-                &album,
-                &Placement::track("Relayer", 2013, 0, "The.Gates", "flac")
-            ),
+            render_placement(&Placement::track(
+                "A",
+                "B",
+                2000,
+                None,
+                Some(0),
+                "T",
+                "flac"
+            )),
             Err(PathSchemaError::TrackOutOfRange(0))
         ));
         assert!(matches!(
-            render(
-                &album,
-                &Placement::track("Relayer", 2013, 100, "The.Gates", "flac")
-            ),
-            Err(PathSchemaError::TrackOutOfRange(100))
+            render_placement(&Placement::movie("X", 999, "mkv")),
+            Err(PathSchemaError::InvalidYear(999))
         ));
+        assert!(render_placement(&Placement::movie("X", 2000, "m k v")).is_err());
     }
 
     #[test]
-    fn identity_law_holds_across_the_whole_renderable_range() {
-        // Whatever `render` accepts, `parse` must return unchanged.
-        let series = series_id();
-        for (season, episode) in [(0u8, 0u8), (1, 1), (9, 9), (10, 99), (99, 99)] {
-            let p = render(
-                &series,
-                &Placement::episode("The.Wire", 2002, season, episode, "mkv"),
-            )
-            .expect("render");
-            assert_eq!(parse(&p).expect("parse"), series, "S{season}E{episode}");
-        }
-        let album = album_id();
-        for track in [1u8, 9, 10, 99] {
-            let p = render(
-                &album,
-                &Placement::track("Relayer", 2013, track, "The.Gates", "flac"),
-            )
-            .expect("render");
-            assert_eq!(parse(&p).expect("parse"), album, "track {track}");
-        }
-    }
-
-    #[test]
-    fn track_stems_are_as_strict_as_movie_and_series_stems() {
-        let base = "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}";
-        // Missing the two-digit track prefix.
-        assert!(parse(format!("{base}/whatever.(2013).flac")).is_err());
-        // Three-digit prefix is not the grammar.
-        assert!(parse(format!("{base}/001.The.Gates.(2013).flac")).is_err());
-        // Empty title between prefix and year.
-        assert!(parse(format!("{base}/01.(2013).flac")).is_err());
-        // The real shape still parses.
+    fn placement_labels_and_kinds() {
+        assert_eq!(Placement::movie("Coco", 2017, "mkv").label(), "Coco.(2017)");
         assert_eq!(
-            parse(format!("{base}/01.The.Gates.(2013).flac")).expect("parse"),
-            album_id()
+            Placement::episode("Silo", 2023, 1, 1, "mkv").label(),
+            "Silo.(2023) S01E01"
         );
+        assert_eq!(relayer_track().label(), "Yes/Relayer.(1974) 01");
+        assert_eq!(relayer_track().kind(), TitleKind::Album);
+        assert_eq!(relayer_track().extension(), "flac");
+        assert_eq!(kind_dir("tv"), Some(TitleKind::Series));
+        assert_eq!(kind_dir("photos"), None);
     }
 
     #[test]
-    fn strip_scene_tags_preserves_separators_it_was_not_asked_to_touch() {
-        assert_eq!(strip_scene_tags("Spider-Man.REPACK"), "Spider-Man");
-        assert_eq!(strip_scene_tags("Some_Show_Name"), "Some_Show_Name");
+    fn v1_plan_json_placement_still_loads() {
+        let json = r#"{"kind":"episode","title":"The.Wire","year":2002,"season":1,"episode":1,"extension":"mkv"}"#;
+        let p: Placement = serde_json::from_str(json).expect("v1 episode");
+        assert_eq!(p, Placement::episode("The.Wire", 2002, 1, 1, "mkv"));
+        let json = r#"{"kind":"track","album":"Relayer","year":2013,"track":1,"title":"X","extension":"flac"}"#;
+        let p: Placement = serde_json::from_str(json).expect("v1 track");
         assert_eq!(
-            strip_scene_tags("The.Matrix.PROPER.1999"),
-            "The.Matrix.1999"
-        );
-        assert_eq!(strip_scene_tags("The-Matrix_1999"), "The-Matrix_1999");
-        assert_eq!(strip_scene_tags("repack.The.Matrix"), "The.Matrix");
-        // All-tag input collapses to empty rather than to a bare separator.
-        assert_eq!(strip_scene_tags("REPACK.PROPER"), "");
-    }
-
-    #[test]
-    fn parse_is_not_a_weaker_gate_than_render() {
-        // `render` refuses braces in a display token, so `parse` must too.
-        assert!(render(&movie_id(), &Placement::movie("A{B", 1999, "mkv")).is_err());
-        assert!(parse("movies/A{B.(1999).{tmdb-603}/A{B.(1999).mkv").is_err());
-        assert!(parse("movies/...(1999).{tmdb-603}/x.mkv").is_err());
-    }
-
-    #[test]
-    fn parse_placement_requires_a_file_and_round_trips_render() {
-        let movie = render(&movie_id(), &Placement::movie("The.Matrix", 1999, "mkv")).expect("r");
-        let (id, placement) = parse_placement(&movie).expect("placement");
-        assert_eq!(id, movie_id());
-        assert_eq!(placement, Placement::movie("The.Matrix", 1999, "mkv"));
-
-        let series = render(
-            &series_id(),
-            &Placement::episode("The.Wire", 2002, 1, 1, "mkv"),
-        )
-        .expect("r");
-        let (id, placement) = parse_placement(&series).expect("placement");
-        assert_eq!(id, series_id());
-        assert_eq!(placement, Placement::episode("The.Wire", 2002, 1, 1, "mkv"));
-
-        let album = render(
-            &album_id(),
-            &Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac"),
-        )
-        .expect("r");
-        let (id, placement) = parse_placement(&album).expect("placement");
-        assert_eq!(id, album_id());
-        assert_eq!(
-            placement,
-            Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac")
-        );
-
-        assert!(
-            parse_placement("movies/The.Matrix.(1999).{tmdb-603}").is_err(),
-            "folder-only paths are not Copy"
+            p,
+            Placement::track("", "Relayer", 2013, None, Some(1), "X", "flac")
         );
     }
 }

@@ -11,16 +11,17 @@ Story commits put the story key in the subject as `N-M` (hyphen, e.g. `2-1`), so
 - Rust **1.98** (`rust-toolchain.toml` pins it)
 - `protobuf-compiler` (`protoc`) — `crates/proto` builds the gRPC stubs
 - A lockfile-aware Cargo (`make` passes `--locked`)
-- `musl-tools` + `cmake` — only for `make musl` (not `make test`)
+- For `make musl` (the static daemon the seedbox runs): **either** `musl-tools` + `cmake`, **or** just `zig`. Without `musl-gcc` the Makefile uses `zig cc` as the musl C toolchain (`scripts/zig-musl-cc`). Not needed for `make test`.
 
 On Debian/Arch:
 
 ```bash
 sudo apt-get install -y protobuf-compiler   # Debian/Ubuntu
 # sudo pacman -S protobuf                    # Arch
-# make musl only:
+# make musl only (pick one):
 sudo apt-get install -y musl-tools cmake    # Debian/Ubuntu (`musl-gcc`)
-# sudo pacman -S musl cmake                  # Arch (may ship x86_64-linux-musl-gcc as an alias)
+# sudo pacman -S musl cmake                  # Arch
+# ...or have `zig` on PATH (mise/pacman); no musl-gcc needed
 ```
 
 ## Make targets
@@ -38,7 +39,7 @@ make fmt
 make mediaops ARGS='--help'
 make daemon  ARGS='--help'
 make ci            # fetch + test --offline --locked, then make musl (same as GitHub Actions)
-make musl          # link musl-static mediaopsd (needs musl-gcc + cmake; not part of make test)
+make musl          # link musl-static mediaopsd (musl-gcc, or zig as the C toolchain; not part of make test)
 make install       # both binaries into ~/.cargo/bin
 ```
 
@@ -77,30 +78,107 @@ make build
 | `seedbox apply\|upgrade` | Grabber set-diff apply; re-copy musl `mediaopsd` and restart. |
 | `encode scan\|run\|pause` | Home GPU only. Not linked into `mediaopsd`. |
 
-`TITLE` is `movie:tmdb:…`, `series:tvdb:…`, or `album:mbid:…`.
+`TITLE` is `movie:key:<title>.<year>`, `series:key:<title>.<year>`, `album:key:<artist>.<album>` (what a library path names; see [Library layout](#library-layout)), or an *arr authority id `movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…` (what the hold inbox carries).
 
 ### Daemon (`mediaopsd serve`)
 
+Both units are written for you (`seedbox bootstrap` on the box, `library bootstrap` at home). For reference:
+
 ```bash
-# seedbox (default bind 0.0.0.0:50051)
-mediaopsd serve --role seedbox --tls-dir ~/.config/mediaops/tls --root media=/data/media
+# seedbox: what the generated user unit runs (bind port = the port in seedbox_address)
+mediaopsd serve --role seedbox --bind 0.0.0.0:25410 \
+  --tls-dir ~/.config/mediaops/tls --desired-state ~/.config/mediaops/desired-state.toml \
+  --nginx-dir /etc/nginx/apps --root movies=/home/me/media/movies --root tv=/home/me/media/tv
 
 # home gateway (unix socket; seedbox address comes from desired-state, not the CLI)
-mediaopsd serve --role home --tls-dir ~/.config/mediaops/tls \
-  --desired-state ~/.config/mediaops/desired-state.toml
+mediaopsd serve --role home --tls-dir <config-dir>/tls --desired-state <config-dir>/desired-state.toml
 ```
 
 ## Default paths
 
 | What | Where |
 | ---- | ----- |
-| Desired-state | `~/.config/mediaops/desired-state.toml` |
-| mTLS PEMs | `~/.config/mediaops/tls/` (gitignored; never commit) |
+| Config dir (desired-state + `tls/`) | `~/.config/mediaops`, **or** `~/.local/share/mediaops` when `~/.config` is a git work tree (dotfiles), **or** `$MEDIAOPS_CONFIG_DIR` |
+| Desired-state | `<config-dir>/desired-state.toml` |
+| mTLS PEMs | `<config-dir>/tls/` (never in a git work tree; bootstrap refuses) |
 | sqlite + lock | `~/.local/state/mediaops/state.db` |
 | Plan artifacts | `~/.local/state/mediaops/plans/` |
 | Home socket | `$XDG_RUNTIME_DIR/mediaopsd.sock` |
+| On the box | `~/.local/bin/mediaopsd`, `~/.config/mediaops/{desired-state.toml,tls/}`, `~/.config/systemd/user/mediaopsd.service` |
+
+Every verb and every generated unit derives its paths from the same defaults, so the config dir is one consistent choice per machine.
 
 Desired-state is deny-unknown-fields TOML. Sizes are `*_gib` / `*_mib` in the file and bytes in code.
+
+### Desired-state example (this operator's)
+
+```toml
+schema_version = 1
+max_copy_gib = 80            # per-run copy budget on video (music first, same cap)
+min_free_gib = 256           # never drop the library disk below this
+range_len_mib = 32           # one Range RPC; the seedbox serves at most 64
+range_concurrency = 8        # parallel Range streams; set it and the probe is skipped
+max_nvenc = 3
+lock = false
+grabber = "servarr"          # or "none": a schema folder on the box, no *arr
+provider = "swizzin_box"
+# seedbox_address is written by `seedbox bootstrap`, never typed
+
+[[paths.roots]]              # allowlisted roots on the box and what each holds
+id = "movies"
+path = "/home/seedit4me/media/movies"
+kind = "movie"               # movie | series | album; omit to infer from path shape
+[[paths.roots]]
+id = "tv"
+path = "/home/seedit4me/media/tv"
+kind = "series"
+[[paths.roots]]
+id = "music"
+path = "/home/seedit4me/media/music"
+kind = "album"
+[[paths.roots]]
+id = "usenet_movies"
+path = "/home/seedit4me/downloads/usenet/complete/movies"
+kind = "movie"
+```
+
+An `[edge]` table (`bind`, `auth`, `url_bases`) turns on the nginx/Forms edge invariant check on every `plan`; without it `plan` never freezes on the panel. `[grab]` sets are optional: an empty set is a no-op, never a wipe.
+
+## Library layout
+
+The grammar is the dotted Jellyfin layout Radarr/Sonarr/Lidarr are configured to write on the box (`{Movie.CleanTitle}.({Release Year})`, `Season.{season:00}`, `{Artist Name}/{Album Title}.({Release Year})/...`). No id tokens live in paths; identity recovered from a path is the `key` form (normalised title + year; artist + album for music, so a remaster is the same album):
+
+```
+movies/The.Matrix.(1999)/The.Matrix.(1999).mkv                          movie:key:thematrix.1999
+series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E01.The.Target.mkv   series:key:thewire.2002  (S01E01)
+music/Yes/Relayer.(1974)/Relayer.(1974).01.The.Gates.Of.Delirium.flac    album:key:yes.relayer    (track 01)
+music/Radiohead/OK.Computer.(1997)/Disc.02/OK.Computer.(1997).03.Airbag.flac
+```
+
+Identity is **per file**: an episode is `(show, season, episode)`, a track is `(album, disc, track)`. A show with one episode on disk still copies its other episodes; a half-copied album finishes. Parsing is lenient about spaces and `Title - Subtitle (Year)` folders (what *arr leaves on the box); rendering is strict dots. Media files the grammar cannot place show up in `plan` as `review` actions with a reason (`needs-year`, `unparseable`) instead of vanishing. `.nfo`, samples, `.par2`, subtitles are ignored.
+
+## Setting it up (replacing `media-sync`)
+
+1. `make install` — `mediaops` and `mediaopsd` into `~/.cargo/bin`.
+2. Write `<config-dir>/desired-state.toml` (example above).
+3. Bootstrap the box. The daemon must bind a port the box actually forwards; a rented box usually only forwards its per-user ports (`~/.<app>_port` on Swizzin/SeedIt4Me) — pick a free one with `--address`:
+
+   ```bash
+   mediaops seedbox bootstrap --provider swizzin_box --address ftl28.seedit4.me:25410 \
+     --root movies=/home/seedit4me/media/movies --root tv=/home/seedit4me/media/tv \
+     --root music=/home/seedit4me/media/music \
+     --root usenet_movies=/home/seedit4me/downloads/usenet/complete/movies \
+     --root usenet_tv=/home/seedit4me/downloads/usenet/complete/tv \
+     --root usenet_music=/home/seedit4me/downloads/usenet/complete/music        # plan
+   mediaops seedbox bootstrap --yes ...same flags...                               # apply
+   ```
+
+   It mints certs, ships `mediaopsd` + server certs + desired-state + a user unit, writes `seedbox_address` into desired-state, and edge-checks the box.
+4. `mediaops library bootstrap --library-root /mnt/storage/videos` — schema dirs, sqlite, NVENC probe (prefers `/usr/lib/jellyfin-ffmpeg/ffmpeg`), and the `mediaopsd-home.service` / `mediaops-run.{service,timer}` user units.
+5. `systemctl --user daemon-reload && systemctl --user enable --now mediaopsd-home.service`, then `mediaops plan` (read-only) and `mediaops run`.
+6. Cut over: `systemctl --user disable --now media-sync.timer && systemctl --user enable --now mediaops-run.timer`. The timer fires one hour after the previous run finishes, like the old one; the service is niced for the spinning disk. Do not run both timers: both would pull the same files.
+
+`mediaops status`, `mediaops why TITLE`, `mediaops doctor`, and `mediaops reclaim preview` are lock-free and safe at any time. `reclaim apply` unlinks box copies that are proved installed at home (index row + file on disk) and not seeding.
 
 ## Tests
 
@@ -126,7 +204,7 @@ Live bootstrap, pull, and NVENC are **not** automatic. The ordered runbook, incl
 ```
 bins/mediaops     CLI composition root
 bins/mediaopsd    daemon composition root
-crates/core       TitleId, PathSchema, desired-state, Plan, jobs (no I/O)
+crates/core       TitleId (key/tmdb/tvdb/mbid), PathSchema v2, desired-state, Plan, jobs (no I/O)
 crates/proto      gRPC / prost (built from proto/mediaops.proto)
 crates/store      sqlite
 crates/net        mTLS, channels, seedbox + home serve

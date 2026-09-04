@@ -16,8 +16,9 @@ mod transport;
 pub use apply::{LocalhostGrabOps, hold_items_from_queue, host_config_drift};
 pub use cassette::{CassetteTransport, cassette_body_digest, cassette_key};
 pub use keys::{
-    DiscoveredKeys, KeyError, KeyPaths, discover_keys, discover_sab_key, discover_servarr_key,
-    is_masked_key, refuse_key, refuse_masked,
+    DiscoveredEndpoints, DiscoveredKeys, Endpoint, KeyError, KeyPaths, discover_endpoints,
+    discover_keys, discover_sab_key, discover_servarr_key, is_masked_key, refuse_key,
+    refuse_masked,
 };
 pub use lidarr::Lidarr;
 pub use prowlarr::Prowlarr;

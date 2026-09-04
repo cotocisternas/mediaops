@@ -31,12 +31,20 @@ pub struct PullSpec {
     pub concurrency: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullOutcome {
     pub staged: PathBuf,
-    pub whole_file_b3: Blake3Hex,
+    /// Ranges the sidecar already had; empty for a fresh pull. A pull that
+    /// found the file fully staged (a previous run died between the final
+    /// rename and its job write) reports `already_staged`.
     pub resumed_ranges: Vec<(u64, u64)>,
+    pub already_staged: bool,
 }
 
+/// Pull `spec.remote` into `_incoming/<token>/<final-name>`.
+///
+/// The staged file is **not** hashed here: the install gate hashes it once
+/// when it places the file, and that digest is what the index records.
 pub async fn pull_file<S: RangeSource + 'static>(
     src: Arc<S>,
     spec: &PullSpec,
@@ -60,9 +68,21 @@ pub async fn pull_file<S: RangeSource + 'static>(
     if let Some(parent) = partial.parent() {
         fs::create_dir_all(parent).map_err(|err| TransferError::io(parent, err))?;
     }
-    if staged.exists() {
+    if let Ok(meta) = fs::symlink_metadata(&staged) {
+        // A complete staged file with no `.partial` beside it is the crash
+        // window after the final rename: the bytes are all here, only the job
+        // row was not advanced. Hand it to the install gate instead of
+        // refusing forever.
+        if meta.is_file() && !partial.exists() && meta.len() == spec.file_len {
+            let _ = fs::remove_file(&sidecar_path);
+            return Ok(PullOutcome {
+                staged,
+                resumed_ranges: Vec::new(),
+                already_staged: true,
+            });
+        }
         return Err(TransferError::Path(format!(
-            "staged file already exists: {}",
+            "staged file already exists with unexpected shape: {}",
             staged.display()
         )));
     }
@@ -136,21 +156,15 @@ pub async fn pull_file<S: RangeSource + 'static>(
         }
     }
 
-    let whole = hash_file(&partial)?;
-    if staged.exists() {
-        return Err(TransferError::Path(format!(
-            "staged file already exists: {}",
-            staged.display()
-        )));
-    }
+    // Every range is on disk and recorded: this is where the file becomes a
+    // whole. Rename first; a crash before the sidecar is removed leaves
+    // (staged, sidecar, no partial), which the check at the top recognises.
     fs::rename(&partial, &staged).map_err(|err| TransferError::io(&staged, err))?;
     fs::remove_file(&sidecar_path).map_err(|err| TransferError::io(&sidecar_path, err))?;
-    let incoming = spec.library_root.join("_incoming");
-    let _ = crate::prune_empty_incoming(&incoming);
     Ok(PullOutcome {
         staged,
-        whole_file_b3: whole,
         resumed_ranges,
+        already_staged: false,
     })
 }
 
@@ -190,11 +204,6 @@ fn write_range(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), TransferErr
     file.sync_all()
         .map_err(|err| TransferError::io(path, err))?;
     Ok(())
-}
-
-fn hash_file(path: &Path) -> Result<Blake3Hex, TransferError> {
-    let file = File::open(path).map_err(|err| TransferError::io(path, err))?;
-    Blake3Hex::of_reader(file).map_err(|err| TransferError::io(path, err))
 }
 
 #[cfg(test)]
@@ -256,13 +265,56 @@ mod tests {
             range_len: 4,
             concurrency: 2,
         };
-        let out = pull_file(src, &spec).await.expect("pull");
+        let out = pull_file(src.clone(), &spec).await.expect("pull");
         assert_eq!(fs::read(&out.staged).expect("read"), body);
-        assert_eq!(out.whole_file_b3, Blake3Hex::of_bytes(&body));
         assert!(out.resumed_ranges.is_empty());
+        assert!(!out.already_staged);
         let mut leftover = out.staged.clone();
         leftover.as_mut_os_string().push(".partial");
         assert!(!leftover.exists());
+        let mut sidecar = out.staged.clone();
+        sidecar.as_mut_os_string().push(".partial.b3");
+        assert!(!sidecar.exists());
+
+        // Crash window: the file is fully staged but the job row never moved.
+        // The next pull must hand it on, not refuse, and must not fetch.
+        let hits_before = src.hits.lock().expect("hits").len();
+        fs::write(&sidecar, b"{}").expect("stale sidecar");
+        let again = pull_file(src.clone(), &spec).await.expect("already staged");
+        assert!(again.already_staged);
+        assert_eq!(again.staged, out.staged);
+        assert_eq!(
+            src.hits.lock().expect("hits").len(),
+            hits_before,
+            "no refetch"
+        );
+        assert!(!sidecar.exists(), "stale sidecar is cleaned up");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn staged_file_of_the_wrong_length_is_refused() {
+        let root = scratch("wrong-len");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        let rel = staging_path(&title, "The.Matrix.(1999).mkv").expect("staging");
+        let staged = root.join(&rel);
+        fs::create_dir_all(staged.parent().expect("parent")).expect("mkdir");
+        fs::write(&staged, b"short").expect("staged");
+        let src = Arc::new(Mem {
+            body: b"abcdefghij".to_vec(),
+            hits: Mutex::new(Vec::new()),
+        });
+        let spec = PullSpec {
+            library_root: root.clone(),
+            title_id: title,
+            final_name: "The.Matrix.(1999).mkv".into(),
+            remote: remote(),
+            file_len: 10,
+            range_len: 4,
+            concurrency: 1,
+        };
+        let err = pull_file(src, &spec).await.expect_err("wrong shape");
+        assert!(matches!(err, TransferError::Path(_)), "{err}");
         let _ = fs::remove_dir_all(root);
     }
 

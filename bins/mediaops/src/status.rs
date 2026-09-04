@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use mediaops_core::{
     ControlPort, DesiredState, Envelope, JobKind, JobState, ReclaimCandidate, TitleId,
-    TitleIndexEntry, WantState, free_bytes, parse_placement, reclaim_preview,
+    TitleIndexEntry, WantState, free_bytes, reclaim_preview,
 };
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
@@ -157,20 +157,21 @@ pub async fn why(
     let watermark = watermark_view(library_root.as_deref(), &desired_state);
     let lock = bootstrap::lock_holder_if_contended(&bootstrap::lock_path(&state_db))
         .map_err(map_bootstrap)?;
-    let titles = match store
+    let titles = store
         .get_title(&title_id)
         .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-    {
-        Some(row) => vec![row],
-        None => Vec::new(),
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let on_disk = match library_root.as_deref() {
+        Some(root) if root.exists() => scan_schema_files(root)
+            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
+            .into_iter()
+            .filter(|file| file.title_id == title_id)
+            .collect(),
+        _ => Vec::new(),
     };
-    let on_disk = if library.as_ref().is_some_and(|view| view.present) {
-        vec![title_id.clone()]
-    } else {
-        Vec::new()
-    };
-    let remote = load_remote_why(&socket, &tls_dir, &title_id, &titles, &on_disk).await;
+    let root_kinds = crate::reclaim::root_kinds_from(&desired_state);
+    let remote =
+        load_remote_why(&socket, &tls_dir, &title_id, &root_kinds, &titles, &on_disk).await;
 
     let data = WhyData {
         title_id: title_id.render(),
@@ -296,8 +297,9 @@ async fn load_remote_why(
     socket: &Path,
     tls_dir: &Path,
     title: &TitleId,
+    root_kinds: &mediaops_core::RootKinds,
     titles: &[TitleIndexEntry],
-    on_disk: &[TitleId],
+    on_disk: &[mediaops_core::InstalledFile],
 ) -> RemoteWhy {
     let Ok(channel) = connect_home(socket, tls_dir).await else {
         return RemoteWhy {
@@ -318,7 +320,7 @@ async fn load_remote_why(
     let torrents = control.guard_preview().await.ok();
     let reclaim = match (listings.as_ref(), torrents.as_ref()) {
         (Some(entries), Some(items)) => {
-            let mut candidates = reclaim_preview(entries, titles, on_disk, items);
+            let mut candidates = reclaim_preview(entries, root_kinds, titles, on_disk, items);
             candidates.retain(|c| c.title_id == *title);
             Some(ReclaimView { candidates })
         }
@@ -342,7 +344,7 @@ async fn load_remote_why(
         .and_then(|items| items.iter().find(|item| item.key.title_id == *title));
     let import = listings.as_ref().and_then(|entries| {
         entries.iter().find_map(|entry| {
-            let Ok((id, _)) = parse_placement(entry.r#ref().rel_path()) else {
+            let Ok((id, _)) = mediaops_core::classify_remote(root_kinds, entry) else {
                 return None;
             };
             (id == *title).then(|| ImportView {
@@ -402,10 +404,16 @@ async fn library_view(
     title_id: &TitleId,
     library_root: Option<&Path>,
 ) -> Result<Option<LibraryView>, AppError> {
-    let Some(entry) = store
+    // A show or album is many rows; the first with a path stands for the title.
+    let rows = store
         .get_title(title_id)
         .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let Some(entry) = rows
+        .iter()
+        .find(|row| !row.path_missing())
+        .or_else(|| rows.first())
+        .cloned()
     else {
         return Ok(None);
     };
@@ -420,10 +428,10 @@ async fn library_view(
         };
         let files =
             scan_schema_files(root).map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        match files.into_iter().find(|(id, _, _)| id == title_id) {
-            Some((_, rel, _)) => {
-                let present = root.join(&rel).is_file();
-                (rel.display().to_string(), present)
+        match files.into_iter().find(|file| &file.title_id == title_id) {
+            Some(file) => {
+                let present = root.join(&file.path).is_file();
+                (file.path, present)
             }
             None => (String::new(), false),
         }
@@ -507,7 +515,7 @@ mod tests {
         let library = crate::test_support::library_root(&dir);
         let db = dir.join("state.db");
         let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let old = store
             .create_job(JobKind::Want, &title, None)
             .await
@@ -534,7 +542,7 @@ mod tests {
         let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
         let json = why(
             true,
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             Some(db.clone()),
             Some(ds.clone()),
             Some(library.clone()),
@@ -556,7 +564,7 @@ mod tests {
         std::fs::remove_file(&movie).expect("unlink");
         let json = why(
             true,
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             Some(db),
             Some(ds),
             Some(library),
@@ -581,7 +589,7 @@ mod tests {
             .put_machine("library_root", &library.display().to_string())
             .await
             .expect("root");
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         store
             .create_job(JobKind::Want, &title, None)
             .await
@@ -732,7 +740,7 @@ mod tests {
         let library = crate::test_support::library_root(&dir);
         let db = dir.join("state.db");
         let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         store
             .create_job(JobKind::Want, &title, None)
             .await
@@ -782,7 +790,7 @@ mod tests {
         let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
         let json = why(
             true,
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             Some(db.clone()),
             Some(ds.clone()),
             Some(library.clone()),
@@ -816,7 +824,7 @@ mod tests {
             .as_array()
             .expect("why reclaim candidates");
         assert_eq!(why_cands.len(), 1, "{json}");
-        assert_eq!(why_cands[0]["title_id"], "movie:tmdb:603");
+        assert_eq!(why_cands[0]["title_id"], "movie:key:thematrix.1999");
         let status_json = status(
             true,
             Some(db),
@@ -861,7 +869,7 @@ mod tests {
         let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
         let json = why(
             true,
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             Some(db.clone()),
             Some(ds.clone()),
             None,

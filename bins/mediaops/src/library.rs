@@ -264,7 +264,8 @@ fn write_library_units(
 ) -> Result<(), AppError> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mediaops"));
     let state_db_arg = state_db.display().to_string();
-    let exec_start = systemd_exec_start(&exe, &["--state-db", &state_db_arg, "run"]);
+    // `--state-db` is a `run` option, not a global one: it must follow the verb.
+    let exec_start = systemd_exec_start(&exe, &["run", "--state-db", &state_db_arg]);
     write_user_units(unit_dir, &exec_start).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
 
     let mut daemon = exe;
@@ -426,14 +427,14 @@ mod tests {
         std::fs::write(&ds, DS).expect("ds");
         let old = dir.join("old");
         mediaops_sync::ensure_layout(&old).expect("old layout");
-        let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let rel = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         let media = old.join(rel);
         std::fs::create_dir_all(media.parent().expect("parent")).expect("mkdir");
         std::fs::write(&media, b"orig").expect("media");
         let db = dir.join("state.db");
         let store = Store::open(&db).await.expect("store");
-        let title = mediaops_core::TitleId::movie("603").expect("title");
-        let abs_title = mediaops_core::TitleId::movie("604").expect("abs");
+        let title = mediaops_core::TitleId::movie_key("The.Matrix", 1999).expect("title");
+        let abs_title = mediaops_core::TitleId::movie_key("Other", 2000).expect("abs");
         let digest = mediaops_core::Blake3Hex::of_bytes(b"orig");
         let old_canon = std::fs::canonicalize(&old).expect("canon old");
         store
@@ -495,7 +496,13 @@ mod tests {
                 .as_deref(),
             Some(root)
         );
-        let entry = store.get_title(&title).await.expect("get").expect("row");
+        let entry = store
+            .get_title(&title)
+            .await
+            .expect("get")
+            .into_iter()
+            .next()
+            .expect("row");
         assert_eq!(
             entry.path(),
             rel,
@@ -505,6 +512,8 @@ mod tests {
             .get_title(&abs_title)
             .await
             .expect("get")
+            .into_iter()
+            .next()
             .expect("abs row");
         assert!(
             abs_entry.path().starts_with(root),

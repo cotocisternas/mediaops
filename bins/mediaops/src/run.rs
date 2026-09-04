@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use mediaops_core::{
     Action, ControlPort, DesiredState, Envelope, ExecPort, ExitCode, HoldDecision, JobState, Plan,
-    Probe, TitleId, WantState, free_bytes,
+    Probe, WantState, free_bytes,
 };
 use mediaops_store::Store;
 use mediaops_sync::{ApplyCtx, ApplyError, PlanRequest, apply, plan_actions, scan_schema_files};
@@ -38,11 +38,23 @@ struct UnmonitorFailureView {
 }
 
 #[derive(Debug, Serialize)]
+struct CopyFailureView {
+    title_id: String,
+    remote: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
 struct RunData {
     path: String,
     copies: usize,
     skips: usize,
+    /// Media files on the box the schema could not place (see the plan).
+    reviews: usize,
     installed: Vec<String>,
+    /// Copies that did not land this run. Their `.partial` stays; next run
+    /// resumes them. Reported, not an exit code: the rest of the plan ran.
+    copy_failed: Vec<CopyFailureView>,
     encode: EncodeData,
     /// Grabber refused these Unmonitors. The copies still landed and the next
     /// run re-emits the action, so this is reported, not an exit code.
@@ -136,14 +148,18 @@ pub async fn cmd_run(
     let channel = connect_home(&prepared.socket, &prepared.tls_dir)
         .await
         .map_err(runtime_display)?;
-    let n = configure_from_probes(&prepared.store, channel.clone()).await?;
-    let control = mediaops_proto::ControlPortClient::new(
-        mediaops_proto::control_client::ControlClient::new(channel.clone()),
-    );
     let active =
         std::fs::read(&prepared.desired_state).map_err(|err| AppError::Runtime(err.into()))?;
     let bytes = std::fs::read(&prepared.path).map_err(|err| AppError::Runtime(err.into()))?;
     let plan = Plan::from_json_slice(&bytes).map_err(runtime_display)?;
+    let pinned = plan
+        .desired_state()
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
+        .range_concurrency();
+    let n = configure_from_probes(&prepared.store, channel.clone(), pinned).await?;
+    let control = mediaops_proto::ControlPortClient::new(
+        mediaops_proto::control_client::ControlClient::new(channel.clone()),
+    );
     let report = apply(
         &plan,
         &active,
@@ -190,6 +206,12 @@ pub async fn cmd_run(
         error: None,
     };
     for inst in &report.installed {
+        // Only movies are encode candidates; a FLAC has no video stream to
+        // probe and a show is left alone by policy.
+        if inst.title_id.kind() != mediaops_core::TitleKind::Movie {
+            encode.skipped += 1;
+            continue;
+        }
         if let Some(pull) = prepared
             .store
             .get_job(inst.pull_job_id)
@@ -211,10 +233,21 @@ pub async fn cmd_run(
             {
                 Ok(AfterInstall::Ran) => encode.ran += 1,
                 Ok(AfterInstall::Skipped) => encode.skipped += 1,
+                // The copies already landed and are indexed; an encode that
+                // cannot start is data in the report, not a lost run. The
+                // Encode job (when one was created) stays for `encode run`.
                 Err(err) => {
-                    encode.error = Some(err.to_string());
-                    let _ = std::fs::remove_file(&prepared.path);
-                    return Err(err);
+                    tracing::warn!(
+                        title = %inst.title_id,
+                        path = %inst.path.display(),
+                        error = %err,
+                        "post-install encode failed; continuing"
+                    );
+                    encode.skipped += 1;
+                    encode.error = Some(match encode.error.take() {
+                        Some(prev) => format!("{prev}; {err}"),
+                        None => err.to_string(),
+                    });
                 }
             }
         } else {
@@ -227,10 +260,20 @@ pub async fn cmd_run(
         path: prepared.path.display().to_string(),
         copies: report.copies,
         skips: report.skips,
+        reviews: report.reviews,
         installed: report
             .installed
             .iter()
             .map(|i| i.path.display().to_string())
+            .collect(),
+        copy_failed: report
+            .copy_failed
+            .iter()
+            .map(|f| CopyFailureView {
+                title_id: f.title_id.render(),
+                remote: f.remote.rel_path().display().to_string(),
+                error: f.error.clone(),
+            })
             .collect(),
         encode,
         unmonitor_failed: report
@@ -246,10 +289,12 @@ pub async fn cmd_run(
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         Ok(format!(
-            "run copies {} skips {} installed {} unmonitor_failed {}",
+            "run copies {} skips {} reviews {} installed {} copy_failed {} unmonitor_failed {}",
             data.copies,
             data.skips,
+            data.reviews,
             data.installed.len(),
+            data.copy_failed.len(),
             data.unmonitor_failed.len()
         ))
     }
@@ -301,11 +346,7 @@ async fn prepare(
         .await
         .map_err(runtime_display)?;
     let title_index = store.list_titles().await.map_err(runtime_display)?;
-    let on_disk: Vec<TitleId> = scan_schema_files(&library_root)
-        .map_err(runtime_display)?
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect();
+    let on_disk = scan_schema_files(&library_root).map_err(runtime_display)?;
     let jobs = store.list_jobs().await.map_err(runtime_display)?;
     let open_wants: Vec<_> = jobs
         .into_iter()
@@ -314,29 +355,39 @@ async fn prepare(
     let control = mediaops_proto::ControlPortClient::new(
         mediaops_proto::control_client::ControlClient::new(channel.clone()),
     );
-    let edge = control.edge_check().await.map_err(runtime_display)?;
-    let last = store
-        .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
-        .await
-        .map_err(runtime_display)?;
-    let edge_frozen = crate::doctor::is_frozen(&edge, last.as_deref());
+    // Only a desired-state with an `[edge]` table has an nginx edge to freeze
+    // on. A plain folder on a box (or a non-Swizzin box) planned fine before
+    // the panel existed and must keep planning.
+    let edge_frozen = if ds.has_edge() {
+        let edge = control.edge_check().await.map_err(runtime_display)?;
+        let last = store
+            .get_machine(crate::doctor::EDGE_FINGERPRINT_KEY)
+            .await
+            .map_err(runtime_display)?;
+        crate::doctor::is_frozen(&edge, last.as_deref())
+    } else {
+        false
+    };
     let live = control.hold_list().await.map_err(runtime_display)?;
     let mut approved = Vec::new();
-    for item in live {
+    for item in &live {
         if store.get_hold(&item.key).await.map_err(runtime_display)? == Some(HoldDecision::Approved)
         {
-            approved.push(item);
+            approved.push(item.clone());
         }
     }
     let wanted_missing = control.wanted_missing().await.map_err(runtime_display)?;
+    let root_kinds = ds.root_kinds();
     let planned = plan_actions(PlanRequest {
         listings: &listings,
+        root_kinds: &root_kinds,
         title_index: &title_index,
         on_disk: &on_disk,
         open_wants: &open_wants,
         desired: &ds,
         free_bytes: free,
         edge_frozen,
+        holds: &live,
         approved: &approved,
         wanted_missing: &wanted_missing,
     });
@@ -357,7 +408,18 @@ async fn prepare(
     })
 }
 
-async fn configure_from_probes(store: &Store, channel: HomeChannel) -> Result<u32, AppError> {
+async fn configure_from_probes(
+    store: &Store,
+    channel: HomeChannel,
+    pinned: Option<u32>,
+) -> Result<u32, AppError> {
+    // An operator-pinned `range_concurrency` wins over the probe: the probe
+    // measures 1 MiB bursts through TLS handshakes and is a poor judge of a
+    // WAN, and the pin is the desired-state way to say "I know my link".
+    if let Some(n) = pinned {
+        configure_pool(channel, n).await.map_err(runtime_display)?;
+        return Ok(n);
+    }
     let (fingerprint, _) = pool_status(channel.clone())
         .await
         .map_err(runtime_display)?;
@@ -454,6 +516,7 @@ fn unique_plan_path(plans_dir: &Path, plan: &Plan) -> Result<PathBuf, AppError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mediaops_core::TitleId;
 
     #[test]
     fn map_apply_preserves_control_usage() {
@@ -559,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn cmd_plan_emits_unmonitor_for_install_b3_and_wanted_missing() {
         let _serial = crate::test_support::serial_net();
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let lb = crate::test_support::start_pair_with_grab_ops(
             mediaops_core::Grabber::Servarr,
             Some(std::sync::Arc::new(HoldGrabOps {
@@ -604,9 +667,9 @@ mod tests {
         assert_eq!(value["ok"], true, "{json}");
         let actions = value["data"]["actions"].as_array().expect("actions");
         assert!(
-            actions
-                .iter()
-                .any(|a| { a["type"] == "unmonitor" && a["title_id"] == "movie:tmdb:603" }),
+            actions.iter().any(|a| {
+                a["type"] == "unmonitor" && a["title_id"] == "movie:key:thematrix.1999"
+            }),
             "plan JSON must contain unmonitor for the installed title: {actions:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -644,9 +707,11 @@ mod tests {
         let path = installed[0].as_str().expect("path");
         assert!(std::path::Path::new(path).is_file(), "{path}");
         let title = store
-            .get_title(&TitleId::movie("603").expect("id"))
+            .get_title(&TitleId::movie_key("The.Matrix", 1999).expect("id"))
             .await
             .expect("title")
+            .into_iter()
+            .next()
             .expect("indexed");
         assert!(!title.path_missing());
         let _ = std::fs::remove_dir_all(dir);
@@ -740,9 +805,11 @@ mod tests {
         assert_eq!(value["data"]["encode"]["ran"], 1, "{json}");
         assert_eq!(value["data"]["encode"]["error"], serde_json::Value::Null);
         let title = store
-            .get_title(&TitleId::movie("603").expect("id"))
+            .get_title(&TitleId::movie_key("The.Matrix", 1999).expect("id"))
             .await
             .expect("title")
+            .into_iter()
+            .next()
             .expect("indexed");
         assert_ne!(
             title.current_b3().as_str(),
@@ -770,21 +837,33 @@ mod tests {
             fail_probe: true,
             calls: std::sync::Mutex::new(Vec::new()),
         };
-        let err = cmd_run(
+        let json = cmd_run(
             &exec,
             true,
             Some(dir.join("state.db")),
             Some(ds),
-            Some(library),
+            Some(library.clone()),
             Some(lb.sock.clone()),
             Some(lb.tls_dir.clone()),
             None,
             Some(dir.join("plans")),
         )
         .await
-        .expect_err("probe");
-        let msg = err.to_string();
-        assert!(msg.contains("probe_error"), "{msg}");
+        .expect("the copy landed; a probe failure is reported, not fatal");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["data"]["copies"], 1, "{json}");
+        assert!(
+            value["data"]["encode"]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("probe_error")),
+            "{json}"
+        );
+        assert!(
+            library
+                .join("movies/The.Matrix.(1999)/The.Matrix.(1999).mkv")
+                .is_file(),
+            "installed file stays installed"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -794,7 +873,7 @@ mod tests {
         let scene = "The.Matrix.1999.REPACK.mkv";
         let mut item = mediaops_core::HoldLiveItem::new(
             mediaops_core::HoldKey::new(
-                TitleId::movie("603").expect("id"),
+                TitleId::movie_key("The.Matrix", 1999).expect("id"),
                 mediaops_core::ReleaseId::parse("deadbeef").expect("id"),
             ),
             1,
@@ -849,7 +928,7 @@ mod tests {
         assert_eq!(copy["placement"]["year"], 1999);
         assert_eq!(copy["placement"]["extension"], "mkv");
         let dest = mediaops_core::render(
-            &TitleId::movie("603").expect("id"),
+            &TitleId::movie_key("The.Matrix", 1999).expect("id"),
             &mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"),
         )
         .expect("schema");
@@ -868,7 +947,7 @@ mod tests {
         let scene = "The.Matrix.1999.REPACK.mkv";
         let mut item = mediaops_core::HoldLiveItem::new(
             mediaops_core::HoldKey::new(
-                TitleId::movie("603").expect("id"),
+                TitleId::movie_key("The.Matrix", 1999).expect("id"),
                 mediaops_core::ReleaseId::parse("deadbeef").expect("id"),
             ),
             1,
@@ -886,7 +965,7 @@ mod tests {
         let dir = crate::test_support::scratch("run-hold");
         let library = crate::test_support::library_root(&dir);
         let schema = mediaops_core::render(
-            &TitleId::movie("603").expect("id"),
+            &TitleId::movie_key("The.Matrix", 1999).expect("id"),
             &mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"),
         )
         .expect("schema");

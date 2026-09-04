@@ -119,6 +119,8 @@ enum DeleteRemoteResult {
   DELETE_REMOTE_RESULT_UNSPECIFIED = 0;
   DELETED = 1;
   SKIPPED_SEEDING = 2;
+  // qBittorrent is configured but could not be asked; nothing was deleted.
+  QBIT_UNAVAILABLE = 3;
 }
 
 message DeleteRemoteResponse {
@@ -246,12 +248,19 @@ message EpisodePlacement {
   uint32 season = 3;
   uint32 episode = 4;
   string extension = 5;
+  // 0 = single episode.
+  uint32 episode_end = 6;
+  string episode_title = 7;
 }
 
 message TrackPlacement {
   string album = 1;
   uint32 year = 2;
+  // 0 = no track number.
   uint32 track = 3;
   string title = 4;
   string extension = 5;
+  string artist = 6;
+  // 0 = single disc.
+  uint32 disc = 7;
 }

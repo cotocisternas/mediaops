@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use mediaops_core::{
     ControlPort, DesiredState, Envelope, EnvelopeError, ExecPort, ExitCode, Probe, ProviderKind,
-    TlsIdentity, endpoint_fingerprint, pin_matrix_refuse, upsert_tls_table,
+    TlsIdentity, endpoint_fingerprint, pin_matrix_refuse, upsert_seedbox_address, upsert_tls_table,
 };
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
@@ -87,7 +87,14 @@ pub fn plan_steps(args: &BootstrapArgs, address: &str) -> Vec<String> {
         ProviderKind::AlreadyThere => steps.push("AlreadyThere: no-op install".into()),
         ProviderKind::SwizzinBox => {
             steps.push("build x86_64-unknown-linux-musl mediaopsd".into());
-            steps.push("scp binary + systemd user unit to Host seedbox".into());
+            steps.push(
+                "scp binary + server certs + desired-state + systemd user unit to Host seedbox"
+                    .into(),
+            );
+            steps.push(format!(
+                "write seedbox_address = \"{address}\" into {}",
+                args.desired_state.display()
+            ));
         }
         other => steps.push(format!("provider {other} is unimplemented")),
     }
@@ -161,7 +168,18 @@ pub async fn bootstrap(
         .get_probe(&fingerprint)
         .await
         .map_err(|err| BootstrapError::Io(err.to_string()))?;
-    let probe_plan = if args.skip_probe {
+    let probe_plan = if let Some(pinned) = ds.range_concurrency() {
+        // The operator said how many streams their link takes; record it as
+        // this endpoint's probe result and never sweep.
+        store
+            .put_probe(&Probe {
+                endpoint_fingerprint: fingerprint.clone(),
+                range_concurrency: pinned,
+            })
+            .await
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+        ProbePlan::Reuse(pinned)
+    } else if args.skip_probe {
         match existing {
             Some(probe) => ProbePlan::Reuse(probe.range_concurrency),
             None => {
@@ -195,19 +213,30 @@ pub async fn bootstrap(
             .map_err(|err| BootstrapError::Io(err.to_string()))?;
         bundle
     };
+    // Desired-state is the one file bootstrap is allowed to edit, and only for
+    // the two values it alone knows: the TLS fingerprints it minted and the
+    // gRPC address the home gateway must dial.
+    let mut updated_text = toml_text.clone();
     if !reuse_tls || ds.tls().is_none() {
         let tls = tls_identity_from_bundle(&tls_dir, &bundle);
-        let updated = upsert_tls_table(&toml_text, &tls)
+        updated_text = upsert_tls_table(&updated_text, &tls)
             .map_err(|err| BootstrapError::Io(err.to_string()))?;
-        if updated.contains("BEGIN ") {
+        if updated_text.contains("BEGIN ") {
             return Err(BootstrapError::Io(
                 "desired-state grew a PEM body; refusing to write".into(),
             ));
         }
-        write_atomic(&args.desired_state, &updated)?;
+    }
+    if ds.seedbox_address() != Some(address.as_str()) {
+        updated_text = upsert_seedbox_address(&updated_text, &address)
+            .map_err(|err| BootstrapError::Io(err.to_string()))?;
+    }
+    if updated_text != toml_text {
+        write_atomic(&args.desired_state, &updated_text)?;
     }
 
-    let unit = systemd_user_unit(&seedbox_exec_start(&args.roots));
+    let bind_port = grpc_port(&address)?;
+    let unit = systemd_user_unit(&seedbox_exec_start(&args.roots, bind_port));
     let unit_path = args.config_dir.join("mediaopsd.service");
     install_provider(
         exec,
@@ -216,6 +245,7 @@ pub async fn bootstrap(
         &unit,
         &unit_path,
         &tls_dir,
+        &args.desired_state,
         &args.ssh_config,
     )
     .await
@@ -452,9 +482,12 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn seedbox_exec_start(roots: &[(String, PathBuf)]) -> String {
-    let mut cmd = String::from(
-        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls --desired-state %h/.config/mediaops/desired-state.toml --nginx-dir /etc/nginx/apps",
+/// The daemon binds the port the home side dials. A rented box usually only
+/// forwards a handful of per-user ports, so `--address host:PORT` is how the
+/// operator picks one of them.
+fn seedbox_exec_start(roots: &[(String, PathBuf)], bind_port: u16) -> String {
+    let mut cmd = format!(
+        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:{bind_port} --tls-dir %h/.config/mediaops/tls --desired-state %h/.config/mediaops/desired-state.toml --nginx-dir /etc/nginx/apps",
     );
     for (id, path) in roots {
         cmd.push_str(" --root ");
@@ -478,7 +511,15 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), BootstrapError> {
     Ok(())
 }
 
-/// gRPC listen port is 50051; ssh `Port` (often 2097) is not the probe address.
+/// Port component of `host:port`.
+fn grpc_port(address: &str) -> Result<u16, BootstrapError> {
+    address
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .ok_or_else(|| BootstrapError::Usage(format!("address `{address}` needs host:port")))
+}
+
+/// gRPC listen port defaults to 50051; ssh `Port` (often 2097) is not the probe address.
 fn resolve_grpc_address(explicit: Option<&str>, host: &SshHost) -> Result<String, BootstrapError> {
     if let Some(address) = explicit.filter(|a| !a.is_empty()) {
         return Ok(address.to_string());
@@ -607,10 +648,31 @@ pub fn render_needs_confirm(
     }
 }
 
+/// The active config dir: `desired-state.toml` + `tls/`.
+///
+/// `$MEDIAOPS_CONFIG_DIR` wins. Otherwise `~/.config/mediaops`, unless
+/// `~/.config` is itself a git work tree (dotfiles repos are common), in which
+/// case the PEMs must not live there (AD-7) and the active dir moves to
+/// `~/.local/share/mediaops`. Every verb and every generated unit derives its
+/// paths from this one function, so the choice is consistent on a machine.
 pub fn default_config_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|b| b.config_dir().join("mediaops"))
-        .unwrap_or_else(|| PathBuf::from(".mediaops-config"))
+    if let Some(dir) = std::env::var_os("MEDIAOPS_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let Some(base) = directories::BaseDirs::new() else {
+        return PathBuf::from(".mediaops-config");
+    };
+    let xdg = base.config_dir().join("mediaops");
+    if refuse_git_work_tree(base.config_dir()).is_ok() {
+        return xdg;
+    }
+    let data = base.data_dir().join("mediaops");
+    tracing::debug!(
+        refused = %xdg.display(),
+        using = %data.display(),
+        "config dir is inside a git work tree; using the data dir instead"
+    );
+    data
 }
 
 pub fn default_state_db() -> PathBuf {

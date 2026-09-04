@@ -81,6 +81,11 @@ fn status_from_join(err: tokio::task::JoinError) -> Status {
     }))
 }
 
+/// The nginx app confs the edge invariant governs: the *arr apps behind
+/// `url_base` + Forms auth. A Swizzin box has a dozen other app confs
+/// (panel, fancyindex, rclone, …) whose `Host` headers are not ours to judge.
+const EDGE_APP_CONFS: &[&str] = &["sonarr.conf", "radarr.conf", "lidarr.conf", "prowlarr.conf"];
+
 fn nginx_fingerprint(dir: &std::path::Path) -> Result<(String, Vec<String>), String> {
     let mut files = Vec::new();
     let mut drift = Vec::new();
@@ -96,6 +101,9 @@ fn nginx_fingerprint(dir: &std::path::Path) -> Result<(String, Vec<String>), Str
             .and_then(|n| n.to_str())
             .unwrap_or("app.conf")
             .to_string();
+        if !EDGE_APP_CONFS.contains(&name.as_str()) {
+            continue;
+        }
         let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
         let text = String::from_utf8_lossy(&bytes);
         if !nginx_host_ok(&text) {
@@ -167,16 +175,29 @@ impl Control for Seedbox {
         request: Request<DeleteRemoteRequest>,
     ) -> Result<Response<DeleteRemoteResponse>, Status> {
         let remote = RemoteRef::try_from(request.into_inner()).map_err(status_from_convert)?;
-        let torrents = match qbit_or_skip(self.grab_ops.as_deref()).await {
-            Ok(t) => t,
-            Err(_) => {
-                let (semver, proto_package) = self.handshake();
-                return Ok(Response::new(DeleteRemoteResponse {
-                    semver,
-                    proto_package,
-                    result: DeleteRemoteResult::SkippedSeeding as i32,
-                }));
-            }
+        let (semver, proto_package) = self.handshake();
+        // Ask qBit whenever a client is wired in. With no client at all
+        // (grabber=None, no ops) an allowlisted file with nlink==1 is nobody's
+        // seed. A grabber stack whose qBit will not answer is different: fail
+        // closed and say so, rather than pretending it was seeding.
+        let torrents = match (&self.grab_ops, self.grabber) {
+            (None, _) => Vec::new(),
+            (Some(ops), grabber) => match ops.qbit_snapshot().await {
+                Ok(t) => t,
+                Err(err) if grabber == Grabber::Servarr => {
+                    tracing::warn!(error = %err, "qBit unavailable; refusing DeleteRemote");
+                    return Ok(Response::new(DeleteRemoteResponse {
+                        semver,
+                        proto_package,
+                        result: DeleteRemoteResult::from(DeleteRemoteOutcome::QbitUnavailable)
+                            as i32,
+                    }));
+                }
+                Err(err) => {
+                    tracing::info!(error = %err, "no qBit answering under grabber=none");
+                    Vec::new()
+                }
+            },
         };
         let allowlist = self.allowlist.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -185,14 +206,10 @@ impl Control for Seedbox {
         .await
         .map_err(status_from_join)?
         .map_err(status_from_walker)?;
-        let (semver, proto_package) = self.handshake();
         Ok(Response::new(DeleteRemoteResponse {
             semver,
             proto_package,
-            result: match outcome {
-                DeleteRemoteOutcome::Deleted => DeleteRemoteResult::Deleted as i32,
-                DeleteRemoteOutcome::SkippedSeeding => DeleteRemoteResult::SkippedSeeding as i32,
-            },
+            result: DeleteRemoteResult::from(outcome) as i32,
         }))
     }
 
@@ -236,15 +253,18 @@ impl Control for Seedbox {
         _request: Request<EdgeCheckRequest>,
     ) -> Result<Response<EdgeCheckResponse>, Status> {
         let (semver, proto_package) = self.handshake();
+        // No nginx dir (a box without a panel, or a plain folder root) means
+        // there is no edge to drift: report a stable empty fingerprint rather
+        // than failing every `plan` on the home side.
         let (fingerprint, mut drift) = match &self.nginx_dir {
-            Some(dir) => nginx_fingerprint(dir).map_err(|err| {
+            Some(dir) if dir.is_dir() => nginx_fingerprint(dir).map_err(|err| {
                 status_from_error_detail(&ErrorDetail::from(ControlError::runtime(err)))
             })?,
-            None => {
-                return Err(status_from_error_detail(&ErrorDetail::from(
-                    ControlError::runtime("nginx_dir required for panel fingerprint"),
-                )));
+            Some(dir) => {
+                tracing::warn!(dir = %dir.display(), "nginx dir missing; edge check is a no-op");
+                (String::new(), Vec::new())
             }
+            None => (String::new(), Vec::new()),
         };
         if self.grabber == Grabber::Servarr
             && let Some(ops) = &self.grab_ops
@@ -329,9 +349,19 @@ impl Control for Seedbox {
         &self,
         _request: Request<GuardPreviewRequest>,
     ) -> Result<Response<GuardPreviewResponse>, Status> {
-        let torrents = qbit_or_skip(self.grab_ops.as_deref())
-            .await
-            .map_err(|err| status_from_error_detail(&ErrorDetail::from(err)))?;
+        // No client wired in: the guard list is empty, not an error. A grabber
+        // stack whose qBit is down still errors (fail closed); under
+        // grabber=none a silent qBit just means nothing is seeding.
+        let torrents = match (self.grab_ops.as_deref(), self.grabber) {
+            (None, _) => Vec::new(),
+            (Some(ops), grabber) => match ops.qbit_snapshot().await {
+                Ok(t) => t,
+                Err(err) if grabber == Grabber::Servarr => {
+                    return Err(status_from_error_detail(&ErrorDetail::from(err)));
+                }
+                Err(_) => Vec::new(),
+            },
+        };
         let allowlist = self.allowlist.clone();
         let items = tokio::task::spawn_blocking(move || attach_guard_remotes(&allowlist, torrents))
             .await
@@ -429,15 +459,6 @@ impl Control for Seedbox {
             semver,
             proto_package,
         }))
-    }
-}
-
-async fn qbit_or_skip(
-    grab_ops: Option<&dyn GrabOps>,
-) -> Result<Vec<GuardPreviewItem>, ControlError> {
-    match grab_ops {
-        Some(ops) => ops.qbit_snapshot().await,
-        None => Err(ControlError::runtime("qbit unavailable")),
     }
 }
 
@@ -732,7 +753,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_remote_without_grab_ops_is_skipped_seeding() {
+    async fn delete_remote_without_any_client_deletes_an_unlinked_file() {
+        // grabber=None, nothing wired in: a plain usenet leftover is nobody's
+        // seed, and reclaim must be able to free it.
         let root = scratch("no-ops");
         write_file(&root.join(movie_rel()), b"copy");
         let seed = seedbox_with(root.clone());
@@ -749,10 +772,10 @@ mod tests {
                 }),
             }))
             .await
-            .expect("skip")
+            .expect("delete")
             .into_inner();
-        assert_eq!(resp.result, DeleteRemoteResult::SkippedSeeding as i32);
-        assert!(root.join(movie_rel()).is_file());
+        assert_eq!(resp.result, DeleteRemoteResult::Deleted as i32);
+        assert!(!root.join(movie_rel()).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -828,8 +851,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_remote_qbit_down_is_skipped_seeding() {
+    async fn delete_remote_qbit_down_under_servarr_is_qbit_unavailable() {
         let root = scratch("qbit-down");
+        write_file(&root.join(movie_rel()), b"x");
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("seedbox", root.clone()).expect("root");
+        let seed = Seedbox::new(allowlist, "0.1.0", Grabber::Servarr).with_grab_ops(Some(
+            std::sync::Arc::new(FakeGrabOps {
+                qbit_down: true,
+                ..Default::default()
+            }),
+        ));
+        let resp = seed
+            .delete_remote(Request::new(DeleteRemoteRequest {
+                r#ref: Some(WireRef {
+                    root_id: "seedbox".into(),
+                    rel_path: movie_rel().into(),
+                }),
+            }))
+            .await
+            .expect("fail-closed")
+            .into_inner();
+        assert_eq!(resp.result, DeleteRemoteResult::QbitUnavailable as i32);
+        assert!(
+            root.join(movie_rel()).exists(),
+            "fail closed keeps the file"
+        );
+        // Preview also fails closed under servarr.
+        assert!(
+            seed.guard_preview(Request::new(GuardPreviewRequest {}))
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn delete_remote_qbit_down_under_grabber_none_is_not_seeding() {
+        let root = scratch("qbit-down-none");
         write_file(&root.join(movie_rel()), b"x");
         let seed =
             seedbox_with(root.clone()).with_grab_ops(Some(std::sync::Arc::new(FakeGrabOps {
@@ -844,10 +903,15 @@ mod tests {
                 }),
             }))
             .await
-            .expect("fail-closed")
+            .expect("delete")
             .into_inner();
-        assert_eq!(resp.result, DeleteRemoteResult::SkippedSeeding as i32);
-        assert!(root.join(movie_rel()).exists());
+        assert_eq!(resp.result, DeleteRemoteResult::Deleted as i32);
+        let preview = seed
+            .guard_preview(Request::new(GuardPreviewRequest {}))
+            .await
+            .expect("empty guard list")
+            .into_inner();
+        assert!(preview.items.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

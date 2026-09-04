@@ -1,12 +1,14 @@
 //! Plan artifact: exact desired-state TOML bytes plus `blake3(bytes)`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::desired_state::{DesiredState, DesiredStateError};
 use crate::digest::Blake3Hex;
-use crate::pathschema::Placement;
-use crate::title_id::TitleId;
-use crate::walker::RemoteRef;
+use crate::pathschema::{PathSchemaError, Placement, parse_remote};
+use crate::title_id::{TitleId, TitleKind};
+use crate::walker::{RemoteEntry, RemoteRef};
 
 /// Skip reasons the grabber=None planner emits. Apply treats these as data.
 pub const SKIP_UPGRADE_NEVER: &str = "upgrade_never";
@@ -15,10 +17,28 @@ pub const SKIP_MAX_COPY: &str = "max_copy";
 pub const SKIP_LOCK: &str = "lock";
 pub const SKIP_DUPLICATE_TITLE: &str = "duplicate_title";
 
+/// Review reasons: a media file the schema could not place.
+pub const REVIEW_UNPARSEABLE: &str = "unparseable";
+pub const REVIEW_NEEDS_YEAR: &str = "needs-year";
+pub const REVIEW_NEEDS_SPLIT: &str = "needs-split";
+
+/// Which kind each allowlisted remote root holds, by `root_id`. `None` means
+/// infer from the path shape.
+pub type RootKinds = BTreeMap<String, Option<TitleKind>>;
+
+/// Parse one remote listing entry against the kind its root is declared to hold.
+pub fn classify_remote(
+    root_kinds: &RootKinds,
+    entry: &RemoteEntry,
+) -> Result<(TitleId, Placement), PathSchemaError> {
+    let kind = root_kinds.get(entry.r#ref().root_id()).copied().flatten();
+    parse_remote(kind, entry.r#ref().rel_path())
+}
+
 /// Exhaustive plan action. Match every variant; do not add a `_` arm.
 ///
-/// Internally tagged so Copy/Skip/Encode/Unmonitor can carry the payloads apply needs.
-/// Review and later verbs stay unit placeholders until their epics.
+/// Internally tagged so Copy/Skip/Review/Encode/Unmonitor can carry the
+/// payloads apply and `why` need.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
@@ -33,7 +53,14 @@ pub enum Action {
         title_id: Option<TitleId>,
         reason: String,
     },
-    Review,
+    /// A media file on the box the schema could not place. Nothing is copied;
+    /// the operator sees it in `plan`/`why` instead of it vanishing.
+    Review {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<RemoteRef>,
+        #[serde(default)]
+        reason: String,
+    },
     Unmonitor {
         title_id: TitleId,
     },
@@ -188,7 +215,7 @@ mod tests {
             title_id: sample_title(),
             remote: RemoteRef::from_wire_parts(
                 "seed".into(),
-                PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+                PathBuf::from("The.Matrix.(1999)/The.Matrix.(1999).mkv"),
             )
             .expect("ref"),
             file_len: 100,
@@ -212,7 +239,7 @@ mod tests {
         Action::DeleteRemote {
             remote: RemoteRef::from_wire_parts(
                 "seed".into(),
-                PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+                PathBuf::from("The.Matrix.(1999)/The.Matrix.(1999).mkv"),
             )
             .expect("ref"),
         }
@@ -288,7 +315,10 @@ mod tests {
                 title_id: None,
                 reason: SKIP_WATERMARK.into(),
             },
-            Action::Review,
+            Action::Review {
+                remote: None,
+                reason: REVIEW_UNPARSEABLE.into(),
+            },
             sample_unmonitor(),
             sample_delete_remote(),
             sample_encode(),
@@ -300,7 +330,7 @@ mod tests {
             let _ = match action {
                 Action::Copy { .. } => "copy",
                 Action::Skip { .. } => "skip",
-                Action::Review => "review",
+                Action::Review { .. } => "review",
                 Action::Unmonitor { .. } => "unmonitor",
                 Action::DeleteRemote { .. } => "delete_remote",
                 Action::Encode { .. } => "encode",
@@ -323,7 +353,13 @@ mod tests {
         let cases = [
             (sample_copy(), "copy"),
             (skip, "skip"),
-            (Action::Review, "review"),
+            (
+                Action::Review {
+                    remote: None,
+                    reason: REVIEW_NEEDS_YEAR.into(),
+                },
+                "review",
+            ),
             (sample_unmonitor(), "unmonitor"),
             (sample_delete_remote(), "delete_remote"),
             (sample_encode(), "encode"),
@@ -454,7 +490,7 @@ mod tests {
                     "type": "delete_remote",
                     "remote": {
                         "root_id": "seed",
-                        "rel_path": "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"
+                        "rel_path": "The.Matrix.(1999)/The.Matrix.(1999).mkv"
                     }
                 }
             ],
@@ -463,7 +499,17 @@ mod tests {
         let plan = serde_json::from_value::<Plan>(value).expect("archived plan still loads");
         assert_eq!(plan.desired_state_toml(), snapshot.as_bytes());
         assert_eq!(plan.desired_state_b3().as_str(), digest);
-        assert_eq!(plan.actions(), &[Action::Review, sample_delete_remote()]);
+        // A grammar-v1 unit `review` still loads with defaulted payload.
+        assert_eq!(
+            plan.actions(),
+            &[
+                Action::Review {
+                    remote: None,
+                    reason: String::new()
+                },
+                sample_delete_remote()
+            ]
+        );
         // Only interpreting the snapshot as the current schema fails, and it
         // fails where the caller asked for it.
         assert_eq!(

@@ -9,10 +9,10 @@ use std::path::{Component, Path};
 
 use serde::Serialize;
 
-use crate::pathschema::parse_placement;
-use crate::plan::Action;
+use crate::pathschema::{parse_placement, render_placement};
+use crate::plan::{Action, RootKinds, classify_remote};
 use crate::title_id::TitleId;
-use crate::title_index::TitleIndexEntry;
+use crate::title_index::{InstalledFile, TitleIndexEntry};
 use crate::walker::{RemoteEntry, RemoteRef};
 
 /// Private-tracker ratio below which a torrent is untouched.
@@ -155,33 +155,41 @@ fn is_strict_under(file: &Path, root: &Path) -> bool {
     file_comps.starts_with(&root_comps)
 }
 
-fn listing_is_installed_file(entry: &RemoteEntry, row: &TitleIndexEntry) -> bool {
-    row.path_missing() || Path::new(row.path()) == entry.r#ref().rel_path()
-}
-
-/// Proved surplus: this listing is the indexed schema path (not merely the TitleId)
-/// and that title is still on disk. nlink==1. No qBit filter.
+/// Proved surplus: the remote file's schema path has an install digest in the
+/// index **and** that exact file is still on disk. nlink==1. No qBit filter.
+///
+/// The remote is root-relative; its local twin is `render_placement` of what
+/// it parses to. A row whose path is missing (pre-v5) counts by TitleId only
+/// when the title is a single file (movie).
 pub fn reclaim_proved(
     listings: &[RemoteEntry],
+    root_kinds: &RootKinds,
     title_index: &[TitleIndexEntry],
-    on_disk: &[TitleId],
+    on_disk: &[InstalledFile],
 ) -> Vec<ReclaimCandidate> {
-    let on_disk: HashSet<&TitleId> = on_disk.iter().collect();
+    let on_disk_paths: HashSet<&str> = on_disk.iter().map(|f| f.path.as_str()).collect();
     let mut out = Vec::new();
     for entry in listings {
         if entry.nlink() > 1 {
             continue;
         }
-        let Ok((title_id, _)) = parse_placement(entry.r#ref().rel_path()) else {
+        let Ok((title_id, placement)) = classify_remote(root_kinds, entry) else {
             continue;
         };
-        if !on_disk.contains(&title_id) {
+        let Ok(local) = render_placement(&placement) else {
+            continue;
+        };
+        let local = local.to_string_lossy().into_owned();
+        if !on_disk_paths.contains(local.as_str()) {
             continue;
         }
-        let Some(row) = title_index.iter().find(|row| row.title_id() == &title_id) else {
-            continue;
-        };
-        if !listing_is_installed_file(entry, row) {
+        let indexed = title_index.iter().any(|row| {
+            row.path() == local
+                || (row.path_missing()
+                    && row.title_id() == &title_id
+                    && placement.file_key() == crate::pathschema::FileKey::Whole)
+        });
+        if !indexed {
             continue;
         }
         out.push(ReclaimCandidate {
@@ -200,12 +208,13 @@ pub fn reclaim_proved(
 /// not seeding. Ranked public / low-ratio / older first; usenet is age-only.
 pub fn reclaim_preview(
     listings: &[RemoteEntry],
+    root_kinds: &RootKinds,
     title_index: &[TitleIndexEntry],
-    on_disk: &[TitleId],
+    on_disk: &[InstalledFile],
     torrents: &[GuardPreviewItem],
 ) -> Vec<ReclaimCandidate> {
     let mut out = Vec::new();
-    for mut candidate in reclaim_proved(listings, title_index, on_disk) {
+    for mut candidate in reclaim_proved(listings, root_kinds, title_index, on_disk) {
         let covering: Vec<&GuardPreviewItem> = torrents
             .iter()
             .filter(|t| t.matches_remote(&candidate.remote))
@@ -230,11 +239,12 @@ pub fn reclaim_preview(
 /// `DeleteRemote { remote }` for each ranked candidate. Not used by `run`.
 pub fn reclaim_actions(
     listings: &[RemoteEntry],
+    root_kinds: &RootKinds,
     title_index: &[TitleIndexEntry],
-    on_disk: &[TitleId],
+    on_disk: &[InstalledFile],
     torrents: &[GuardPreviewItem],
 ) -> Vec<Action> {
-    reclaim_preview(listings, title_index, on_disk, torrents)
+    reclaim_preview(listings, root_kinds, title_index, on_disk, torrents)
         .into_iter()
         .map(|c| Action::DeleteRemote { remote: c.remote })
         .collect()
@@ -279,12 +289,33 @@ mod tests {
         RemoteEntry::from_wire_parts(remote, 10, mtime, nlink)
     }
 
-    fn movie(id: &str) -> TitleId {
-        TitleId::movie(id).expect("title")
+    fn kinds() -> RootKinds {
+        RootKinds::from([(
+            "seedbox".to_string(),
+            Some(crate::title_id::TitleKind::Movie),
+        )])
     }
 
-    fn index_row(id: &str, rel: &str) -> TitleIndexEntry {
-        TitleIndexEntry::new(movie(id), rel, digest(), digest())
+    fn movie(name: &str) -> TitleId {
+        TitleId::movie_key(name, 1999).expect("title")
+    }
+
+    /// Root-relative remote path for a movie named `name`.
+    fn remote(name: &str) -> String {
+        format!("{name}.(1999)/{name}.(1999).mkv")
+    }
+
+    /// Library-relative local path for the same movie.
+    fn local(name: &str) -> String {
+        format!("movies/{}", remote(name))
+    }
+
+    fn index_row(name: &str) -> TitleIndexEntry {
+        TitleIndexEntry::new(movie(name), local(name), digest(), digest())
+    }
+
+    fn on_disk_file(name: &str) -> InstalledFile {
+        InstalledFile::from_rel_path(Path::new(&local(name))).expect("installed")
     }
 
     fn torrent(rel: &str, state: &str, ratio: f64, is_private: bool) -> GuardPreviewItem {
@@ -299,84 +330,67 @@ mod tests {
         }
     }
 
-    fn schema(id: &str, name: &str) -> String {
-        format!("movies/{name}.(1999).{{tmdb-{id}}}/{name}.(1999).mkv")
-    }
-
     #[test]
     fn ranks_public_low_ratio_older_first_and_usenet_by_age() {
-        let pub_old = schema("1", "Public.Old");
-        let pub_new = schema("2", "Public.New");
-        let high = schema("3", "High.Ratio");
-        let priv_over = schema("4", "Private.Over");
-        let priv_under = schema("5", "Private.Under");
-        let usenet_old = schema("6", "Usenet.Old");
-        let usenet_new = schema("7", "Usenet.New");
-        let hard = schema("8", "Hardlink");
-        let no_digest = schema("9", "NoDigest");
-        let seeding = schema("10", "Seeding");
-
+        let names = [
+            "Public.Old",
+            "Public.New",
+            "High.Ratio",
+            "Private.Over",
+            "Private.Under",
+            "Usenet.Old",
+            "Usenet.New",
+            "Hardlink",
+            "NoDigest",
+            "Seeding",
+        ];
         let listings = vec![
-            entry(&pub_new, 200, 1),
-            entry(&high, 50, 1),
-            entry(&priv_over, 10, 1),
-            entry(&priv_under, 1, 1),
-            entry(&usenet_new, 300, 1),
-            entry(&usenet_old, 20, 1),
-            entry(&hard, 5, 2),
-            entry(&no_digest, 5, 1),
-            entry(&seeding, 5, 1),
-            entry(&pub_old, 100, 1),
+            entry(&remote("Public.New"), 200, 1),
+            entry(&remote("High.Ratio"), 50, 1),
+            entry(&remote("Private.Over"), 10, 1),
+            entry(&remote("Private.Under"), 1, 1),
+            entry(&remote("Usenet.New"), 300, 1),
+            entry(&remote("Usenet.Old"), 20, 1),
+            entry(&remote("Hardlink"), 5, 2),
+            entry(&remote("NoDigest"), 5, 1),
+            entry(&remote("Seeding"), 5, 1),
+            entry(&remote("Public.Old"), 100, 1),
         ];
-        let title_index: Vec<_> = ["1", "2", "3", "4", "5", "6", "7", "8", "10"]
-            .into_iter()
-            .map(|id| {
-                let rel = listings
-                    .iter()
-                    .find_map(|e| {
-                        parse_placement(e.r#ref().rel_path())
-                            .ok()
-                            .filter(|(t, _)| t == &movie(id))
-                            .map(|_| e.r#ref().rel_path().display().to_string())
-                    })
-                    .unwrap_or_else(|| schema(id, id));
-                index_row(id, &rel)
-            })
-            .collect();
-        let on_disk: Vec<_> = title_index
+        let title_index: Vec<_> = names
             .iter()
-            .map(|e| e.title_id().clone())
-            .chain(std::iter::once(movie("9")))
+            .filter(|n| **n != "NoDigest")
+            .map(|n| index_row(n))
             .collect();
+        let on_disk: Vec<_> = names.iter().map(|n| on_disk_file(n)).collect();
         let torrents = vec![
-            torrent(&pub_old, "pausedDL", 0.1, false),
-            torrent(&pub_new, "pausedDL", 0.1, false),
-            torrent(&high, "pausedDL", 2.0, false),
-            torrent(&priv_over, "pausedDL", 1.5, true),
-            torrent(&priv_under, "pausedDL", 0.2, true),
-            torrent(&seeding, "uploading", 2.0, false),
+            torrent(&remote("Public.Old"), "pausedDL", 0.1, false),
+            torrent(&remote("Public.New"), "pausedDL", 0.1, false),
+            torrent(&remote("High.Ratio"), "pausedDL", 2.0, false),
+            torrent(&remote("Private.Over"), "pausedDL", 1.5, true),
+            torrent(&remote("Private.Under"), "pausedDL", 0.2, true),
+            torrent(&remote("Seeding"), "uploading", 2.0, false),
         ];
 
-        let ranked = reclaim_preview(&listings, &title_index, &on_disk, &torrents);
+        let ranked = reclaim_preview(&listings, &kinds(), &title_index, &on_disk, &torrents);
         let ids: Vec<String> = ranked.iter().map(|c| c.title_id.render()).collect();
         // public/low-ratio/older first; usenet is age-only (ratio treated as 0).
         assert_eq!(
             ids,
             vec![
-                "movie:tmdb:6",
-                "movie:tmdb:7",
-                "movie:tmdb:1",
-                "movie:tmdb:2",
-                "movie:tmdb:3",
-                "movie:tmdb:4",
+                "movie:key:usenetold.1999",
+                "movie:key:usenetnew.1999",
+                "movie:key:publicold.1999",
+                "movie:key:publicnew.1999",
+                "movie:key:highratio.1999",
+                "movie:key:privateover.1999",
             ],
             "{ids:?}"
         );
         assert!(
-            !ids.iter().any(|id| id.ends_with(":5")
-                || id.ends_with(":8")
-                || id.ends_with(":9")
-                || id.ends_with(":10")),
+            !ids.iter().any(|id| id.contains("privateunder")
+                || id.contains("hardlink")
+                || id.contains("nodigest")
+                || id.contains("seeding")),
             "private-under-goal, hardlink, no-digest, seeding must be omitted: {ids:?}"
         );
         assert_eq!(ranked[0].ratio, None, "usenet is age-only");
@@ -391,29 +405,48 @@ mod tests {
 
     #[test]
     fn size_mtime_without_install_b3_is_not_proof() {
-        let rel = schema("99", "Only.Mtime");
-        let listings = vec![entry(&rel, 1, 1)];
-        let on_disk = vec![movie("99")];
-        let ranked = reclaim_preview(&listings, &[], &on_disk, &[]);
+        let listings = vec![entry(&remote("Only.Mtime"), 1, 1)];
+        let on_disk = vec![on_disk_file("Only.Mtime")];
+        let ranked = reclaim_preview(&listings, &kinds(), &[], &on_disk, &[]);
         assert!(ranked.is_empty(), "no title_index row means no delete");
     }
 
     #[test]
     fn install_b3_without_on_disk_is_not_proof() {
-        let rel = schema("99", "Index.Only");
-        let listings = vec![entry(&rel, 1, 1)];
-        let title_index = vec![index_row("99", &rel)];
-        let ranked = reclaim_preview(&listings, &title_index, &[], &[]);
+        let listings = vec![entry(&remote("Index.Only"), 1, 1)];
+        let title_index = vec![index_row("Index.Only")];
+        let ranked = reclaim_preview(&listings, &kinds(), &title_index, &[], &[]);
         assert!(ranked.is_empty());
     }
 
     #[test]
+    fn episodes_prove_per_file_not_per_show() {
+        let kinds = RootKinds::from([(
+            "seedbox".to_string(),
+            Some(crate::title_id::TitleKind::Series),
+        )]);
+        let e1 = "Silo.(2023)/Season.01/Silo.(2023).S01E01.mkv";
+        let e2 = "Silo.(2023)/Season.01/Silo.(2023).S01E02.mkv";
+        let listings = vec![entry(e1, 1, 1), entry(e2, 1, 1)];
+        let local_e1 = format!("series/{e1}");
+        let title_index = vec![TitleIndexEntry::new(
+            TitleId::series_key("Silo", 2023).expect("id"),
+            &local_e1,
+            digest(),
+            digest(),
+        )];
+        let on_disk = vec![InstalledFile::from_rel_path(Path::new(&local_e1)).expect("file")];
+        let ranked = reclaim_preview(&listings, &kinds, &title_index, &on_disk, &[]);
+        assert_eq!(ranked.len(), 1, "only the installed episode is surplus");
+        assert_eq!(ranked[0].remote.rel_path(), Path::new(e1));
+    }
+
+    #[test]
     fn actions_are_delete_remote_payloads_in_rank_order() {
-        let rel = schema("1", "Usenet");
-        let listings = vec![entry(&rel, 1, 1)];
-        let title_index = vec![index_row("1", &rel)];
-        let on_disk = vec![movie("1")];
-        let actions = reclaim_actions(&listings, &title_index, &on_disk, &[]);
+        let listings = vec![entry(&remote("Usenet"), 1, 1)];
+        let title_index = vec![index_row("Usenet")];
+        let on_disk = vec![on_disk_file("Usenet")];
+        let actions = reclaim_actions(&listings, &kinds(), &title_index, &on_disk, &[]);
         assert_eq!(
             actions,
             vec![Action::DeleteRemote {
@@ -439,24 +472,23 @@ mod tests {
 
     #[test]
     fn torrent_path_match_is_component_suffix_or_prefix() {
-        let file = Path::new("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let file = Path::new("movies/The.Matrix.(1999)/The.Matrix.(1999).mkv");
         assert!(torrent_covers_file(
-            "/data/media/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+            "/data/media/movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
             "/data/torrents",
             file
         ));
         assert!(torrent_covers_file(
-            "/data/media/movies/The.Matrix.(1999).{tmdb-603}",
+            "/data/media/movies/The.Matrix.(1999)",
             "",
-            Path::new("/data/media/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv")
+            Path::new("/data/media/movies/The.Matrix.(1999)/The.Matrix.(1999).mkv")
         ));
         assert!(!torrent_covers_file(
             "/data/torrents/other",
             "/data/torrents",
-            Path::new("/data/media/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv")
+            Path::new("/data/media/movies/The.Matrix.(1999)/The.Matrix.(1999).mkv")
         ));
-        let library =
-            Path::new("/data/media/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let library = Path::new("/data/media/movies/The.Matrix.(1999)/The.Matrix.(1999).mkv");
         assert!(
             !torrent_covers_file("", "/", library),
             "/ save_path must not cover library files"
@@ -466,10 +498,10 @@ mod tests {
 
     #[test]
     fn any_covering_seeding_or_private_under_goal_omits_the_file() {
-        let rel = schema("1", "Shared");
+        let rel = remote("Shared");
         let listings = vec![entry(&rel, 1, 1)];
-        let title_index = vec![index_row("1", &rel)];
-        let on_disk = vec![movie("1")];
+        let title_index = vec![index_row("Shared")];
+        let on_disk = vec![on_disk_file("Shared")];
         let paused = torrent(&rel, "pausedDL", 0.1, false);
         let seeding = GuardPreviewItem {
             hash: "seed".into(),
@@ -482,6 +514,7 @@ mod tests {
         };
         let ranked = reclaim_preview(
             &listings,
+            &kinds(),
             &title_index,
             &on_disk,
             &[paused.clone(), seeding],
@@ -499,28 +532,44 @@ mod tests {
             save_path: String::new(),
             remote: None,
         };
-        let ranked = reclaim_preview(&listings, &title_index, &on_disk, &[paused, private_under]);
+        let ranked = reclaim_preview(
+            &listings,
+            &kinds(),
+            &title_index,
+            &on_disk,
+            &[paused, private_under],
+        );
         assert!(ranked.is_empty(), "private-under-goal cover must omit");
     }
 
     #[test]
     fn extra_remote_of_a_proved_title_is_not_a_candidate() {
-        let installed = schema("1", "The.Matrix");
-        let extra = schema("1", "The.Matrix.Sample");
+        let installed = remote("The.Matrix");
+        // Same title folder, a second file that renders to a different local path.
+        let extra = "The.Matrix.(1999)/The.Matrix.(1999).Sample.mkv".to_string();
         let listings = vec![entry(&installed, 1, 1), entry(&extra, 1, 1)];
-        let title_index = vec![index_row("1", &installed)];
-        let on_disk = vec![movie("1")];
-        let ranked = reclaim_preview(&listings, &title_index, &on_disk, &[]);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].remote.rel_path().display().to_string(), installed);
+        let title_index = vec![index_row("The.Matrix")];
+        let on_disk = vec![on_disk_file("The.Matrix")];
+        let ranked = reclaim_preview(&listings, &kinds(), &title_index, &on_disk, &[]);
+        // Both remotes render to the one movie path, which is installed and indexed.
+        assert_eq!(ranked.len(), 2);
+        assert!(
+            ranked
+                .iter()
+                .any(|c| c.remote.rel_path().display().to_string() == installed)
+        );
+        // A remote for a title that is *not* on disk is never a candidate.
+        let listings = vec![entry(&remote("Not.Here"), 1, 1)];
+        let ranked = reclaim_preview(&listings, &kinds(), &title_index, &on_disk, &[]);
+        assert!(ranked.is_empty());
     }
 
     #[test]
     fn rank_fields_come_from_one_covering_torrent() {
-        let rel = schema("1", "Shared");
+        let rel = remote("Shared");
         let listings = vec![entry(&rel, 1, 1)];
-        let title_index = vec![index_row("1", &rel)];
-        let on_disk = vec![movie("1")];
+        let title_index = vec![index_row("Shared")];
+        let on_disk = vec![on_disk_file("Shared")];
         let low_public = torrent(&rel, "pausedDL", 0.1, false);
         let high_private = GuardPreviewItem {
             hash: "priv".into(),
@@ -533,6 +582,7 @@ mod tests {
         };
         let ranked = reclaim_preview(
             &listings,
+            &kinds(),
             &title_index,
             &on_disk,
             &[low_public, high_private],

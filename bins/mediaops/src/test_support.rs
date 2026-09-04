@@ -42,7 +42,7 @@ pub const DS_UNLOCKED: &str = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gi
 pub const DS_LOCKED: &str = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = true\n";
 pub const DS_MAX_COPY_ZERO: &str = "schema_version = 1\nmax_copy_gib = 0\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\n";
 
-pub const MOVIE_REL: &str = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+pub const MOVIE_REL: &str = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
 
 pub struct Loopback {
     pub sock: PathBuf,

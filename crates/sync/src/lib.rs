@@ -3,18 +3,20 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mediaops_core::{
-    Blake3Hex, Bytes, Placement, TitleId, TitleIndexRepo, free_bytes, parse_placement,
-};
+use mediaops_core::{Blake3Hex, Bytes, InstalledFile, TitleIndexRepo, free_bytes};
 
 mod apply;
 mod hold;
 mod plan;
 mod reclaim;
 
-pub use apply::{ApplyCtx, ApplyError, ApplyReport, InstalledCopy, UnmonitorFailure, apply};
+pub use apply::{
+    ApplyCtx, ApplyError, ApplyReport, CopyFailure, InstalledCopy, UnmonitorFailure, apply,
+};
 pub use hold::inbox;
-pub use plan::{PlanRequest, Planned, plan_actions};
+pub use plan::{
+    AUDIO_EXTENSIONS, PlanRequest, Planned, VIDEO_EXTENSIONS, is_media_file, plan_actions,
+};
 pub use reclaim::{
     ReclaimCandidate, ReclaimReport, apply_reclaim, preview_actions, reclaim_preview,
 };
@@ -61,14 +63,18 @@ pub fn refuse_below_watermark(root: &Path, min_free: Bytes) -> Result<u64, Libra
     Ok(free)
 }
 
+/// The run service. Niced and best-effort I/O like the `media-sync` unit it
+/// replaces: the library is a spinning disk shared with playback.
 pub fn run_service_unit(exec_start: &str) -> String {
     format!(
-        "[Unit]\nDescription=mediaops run\n\n[Service]\nType=oneshot\nTimeoutStartSec=infinity\nExecStart={exec_start}\n"
+        "[Unit]\nDescription=mediaops run (seedbox -> library)\nAfter=network-online.target mediaopsd-home.service\nWants=mediaopsd-home.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=infinity\nNice=10\nIOSchedulingClass=best-effort\nIOSchedulingPriority=6\nExecStart={exec_start}\n"
     )
 }
 
+/// Hourly after the previous run *finishes* (`OnUnitInactiveSec`), never a
+/// calendar that can overlap a long copy. Same cadence as the old timer.
 pub fn run_timer_unit() -> String {
-    "[Unit]\nDescription=mediaops run timer\n\n[Timer]\nOnBootSec=1min\nOnUnitInactiveSec=5min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n"
+    "[Unit]\nDescription=mediaops run timer\n\n[Timer]\nOnBootSec=5min\nOnUnitInactiveSec=1h\n\n[Install]\nWantedBy=timers.target\n"
         .to_string()
 }
 
@@ -126,13 +132,12 @@ where
     }
     let scanned = scan_schema_files(root)?;
     let mut indexed = 0;
-    for (title_id, rel, _) in scanned {
-        let abs = root.join(&rel);
-        let file = fs::File::open(&abs).map_err(|err| LibraryError::io(&abs, err))?;
-        let digest = Blake3Hex::of_reader(file).map_err(|err| LibraryError::io(&abs, err))?;
-        let path = rel.to_string_lossy();
+    for file in scanned {
+        let abs = root.join(&file.path);
+        let handle = fs::File::open(&abs).map_err(|err| LibraryError::io(&abs, err))?;
+        let digest = Blake3Hex::of_reader(handle).map_err(|err| LibraryError::io(&abs, err))?;
         titles
-            .record_install(&title_id, &digest, &path)
+            .record_install(&file.title_id, &digest, &file.path)
             .await
             .map_err(|err| ReindexError::TitleIndex(err.to_string()))?;
         indexed += 1;
@@ -140,44 +145,65 @@ where
     Ok(ReindexReport { indexed })
 }
 
-/// Walk `movies`/`series`/`music` for TitleId → schema path. Used when a v4
-/// title-index row has an empty path.
-pub fn scan_schema_files(root: &Path) -> Result<Vec<(TitleId, PathBuf, Placement)>, LibraryError> {
+/// Media extensions the library scan counts as a schema file.
+const LIBRARY_MEDIA: &[&str] = &[
+    "mkv", "mp4", "m4v", "avi", "ts", "mov", "webm", "wmv", "flac", "mp3", "m4a", "ogg", "opus",
+    "wav", "aac", "aiff",
+];
+
+/// Walk `movies`/`series`/`music` for every schema media file on disk.
+///
+/// Depth follows the grammar: `movies/T/*`, `series/T/[Season.NN/]*`,
+/// `music/Artist/Album/[Disc.NN/]*`. `music` may be a symlink to another
+/// disk (it is on this operator's library); `read_dir` follows it. Files the
+/// grammar cannot place (`.converting`, `.partial`, loose scene files) are
+/// skipped, never errors. An unreadable directory is an error naming it.
+pub fn scan_schema_files(root: &Path) -> Result<Vec<InstalledFile>, LibraryError> {
     let mut out = Vec::new();
     for kind in ["movies", "series", "music"] {
         let dir = root.join(kind);
         if !dir.is_dir() {
             continue;
         }
-        scan_kind_dir(root, &dir, &mut out)?;
+        let max_depth = if kind == "music" { 4 } else { 3 };
+        scan_tree(root, &dir, 1, max_depth, &mut out)?;
     }
     Ok(out)
 }
 
-fn scan_kind_dir(
+fn scan_tree(
     root: &Path,
     dir: &Path,
-    out: &mut Vec<(TitleId, PathBuf, Placement)>,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<InstalledFile>,
 ) -> Result<(), LibraryError> {
     let reader = fs::read_dir(dir).map_err(|err| LibraryError::io(dir, err))?;
     for entry in reader {
         let entry = entry.map_err(|err| LibraryError::io(dir, err))?;
         let path = entry.path();
         if path.is_dir() {
-            let inner = fs::read_dir(&path).map_err(|err| LibraryError::io(&path, err))?;
-            for file in inner {
-                let file = file.map_err(|err| LibraryError::io(&path, err))?;
-                let file_path = file.path();
-                if !file_path.is_file() {
-                    continue;
-                }
-                let Ok(rel) = file_path.strip_prefix(root) else {
-                    continue;
-                };
-                if let Ok((title_id, placement)) = parse_placement(rel) {
-                    out.push((title_id, rel.to_path_buf(), placement));
-                }
+            if depth < max_depth {
+                scan_tree(root, &path, depth + 1, max_depth, out)?;
             }
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !LIBRARY_MEDIA.contains(&ext.as_str()) {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        if let Ok(file) = InstalledFile::from_rel_path(rel) {
+            out.push(file);
         }
     }
     Ok(())
@@ -388,47 +414,85 @@ mod tests {
     }
 
     #[test]
-    fn scan_schema_files_finds_movie_series_album_and_skips_junk() {
+    fn scan_schema_files_finds_movie_episodes_tracks_and_skips_junk() {
         let root = scratch("scan");
         ensure_layout(&root).expect("layout");
-        let movie = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
-        let series =
-            PathBuf::from("series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.mkv");
-        let album = PathBuf::from(
-            "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.The.Gates.Of.Delirium.(2013).flac",
-        );
-        for rel in [&movie, &series, &album] {
+        let files = [
+            "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
+            "series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E01.The.Target.mkv",
+            "series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E02.mkv",
+            "music/Yes/Relayer.(1974)/Relayer.(1974).01.The.Gates.Of.Delirium.flac",
+            "music/Radiohead/OK.Computer.(1997)/Disc.02/OK.Computer.(1997).01.Airbag.flac",
+        ];
+        for rel in files {
             let path = root.join(rel);
             fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
             fs::write(&path, b"x").expect("write");
         }
         fs::write(root.join("movies/not-schema.mkv"), b"x").expect("loose file");
-        fs::create_dir_all(root.join("movies/The.Matrix.(1999).{tmdb-603}/extra")).expect("nested");
         fs::write(
-            root.join("movies/The.Matrix.(1999).{tmdb-603}/extra/note.txt"),
+            root.join("movies/The.Matrix.(1999)/The.Matrix.(1999).mkv.converting"),
             b"x",
         )
-        .expect("nested file");
+        .expect("converting");
+        fs::write(root.join("movies/The.Matrix.(1999)/poster.jpg"), b"x").expect("poster");
+        fs::create_dir_all(root.join("movies/The.Matrix.(1999)/extra")).expect("nested");
+        fs::write(root.join("movies/The.Matrix.(1999)/extra/note.txt"), b"x").expect("nested file");
         let scanned = scan_schema_files(&root).expect("scan");
-        let ids: Vec<String> = scanned.iter().map(|(id, _, _)| id.render()).collect();
-        assert!(ids.contains(&"movie:tmdb:603".to_string()), "{ids:?}");
-        assert!(ids.contains(&"series:tvdb:79126".to_string()), "{ids:?}");
+        let mut paths: Vec<&str> = scanned.iter().map(|f| f.path.as_str()).collect();
+        paths.sort_unstable();
+        let mut expected: Vec<&str> = files.to_vec();
+        expected.sort_unstable();
+        assert_eq!(paths, expected);
+        let ids: Vec<String> = scanned.iter().map(|f| f.title_id.render()).collect();
         assert!(
-            ids.contains(&"album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63".to_string()),
+            ids.contains(&"movie:key:thematrix.1999".to_string()),
             "{ids:?}"
         );
-        assert_eq!(scanned.len(), 3, "junk files must not parse as schema");
+        assert_eq!(
+            ids.iter()
+                .filter(|i| *i == "series:key:thewire.2002")
+                .count(),
+            2,
+            "two episodes, one show identity, two files"
+        );
+        assert!(
+            ids.contains(&"album:key:radiohead.okcomputer".to_string()),
+            "{ids:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scan_follows_a_music_symlink_like_this_library_has() {
+        let root = scratch("scan-symlink");
+        ensure_layout(&root).expect("layout");
+        fs::remove_dir(root.join("music")).expect("rm music");
+        let elsewhere = scratch("scan-symlink-target");
+        let track = elsewhere.join("Yes/Relayer.(1974)/Relayer.(1974).01.Gates.flac");
+        fs::create_dir_all(track.parent().expect("parent")).expect("mkdir");
+        fs::write(&track, b"x").expect("write");
+        std::os::unix::fs::symlink(&elsewhere, root.join("music")).expect("symlink");
+        let scanned = scan_schema_files(&root).expect("scan");
+        assert_eq!(scanned.len(), 1, "{scanned:?}");
+        assert_eq!(
+            scanned[0].path,
+            "music/Yes/Relayer.(1974)/Relayer.(1974).01.Gates.flac"
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(elsewhere);
+    }
+
+    /// Path-keyed in-memory index, mirroring the store contract.
     struct MemTitles {
-        rows: std::sync::Mutex<std::collections::HashMap<String, mediaops_core::TitleIndexEntry>>,
+        rows: std::sync::Mutex<Vec<mediaops_core::TitleIndexEntry>>,
     }
 
     impl MemTitles {
         fn new() -> Self {
             Self {
-                rows: std::sync::Mutex::new(std::collections::HashMap::new()),
+                rows: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -438,74 +502,84 @@ mod tests {
 
         async fn get(
             &self,
-            title_id: &TitleId,
+            title_id: &mediaops_core::TitleId,
+        ) -> Result<Vec<mediaops_core::TitleIndexEntry>, Self::Error> {
+            Ok(self
+                .rows
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|r| r.title_id() == title_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_path(
+            &self,
+            path: &str,
         ) -> Result<Option<mediaops_core::TitleIndexEntry>, Self::Error> {
             Ok(self
                 .rows
                 .lock()
                 .expect("lock")
-                .get(&title_id.render())
+                .iter()
+                .find(|r| r.path() == path)
                 .cloned())
         }
 
         async fn list(&self) -> Result<Vec<mediaops_core::TitleIndexEntry>, Self::Error> {
-            Ok(self.rows.lock().expect("lock").values().cloned().collect())
+            Ok(self.rows.lock().expect("lock").clone())
         }
 
         async fn record_install(
             &self,
-            title_id: &TitleId,
+            title_id: &mediaops_core::TitleId,
             digest: &Blake3Hex,
             path: &str,
         ) -> Result<(), Self::Error> {
             let mut rows = self.rows.lock().expect("lock");
-            let key = title_id.render();
-            if let Some(existing) = rows.get(&key) {
+            if let Some(existing) = rows.iter().find(|r| r.path() == path) {
                 if existing.install_b3() != digest {
                     return Err(mediaops_core::TitleIndexError::InstallDigestImmutable);
                 }
-                if existing.path_missing() && !path.is_empty() {
-                    let updated = mediaops_core::TitleIndexEntry::new(
-                        existing.title_id().clone(),
-                        path.to_string(),
-                        existing.install_b3().clone(),
-                        existing.current_b3().clone(),
-                    );
-                    rows.insert(key, updated);
-                }
                 return Ok(());
             }
-            rows.insert(
-                key,
-                mediaops_core::TitleIndexEntry::new(
-                    title_id.clone(),
+            if let Some(blank) = rows
+                .iter_mut()
+                .find(|r| r.title_id() == title_id && r.path_missing() && r.install_b3() == digest)
+            {
+                *blank = mediaops_core::TitleIndexEntry::new(
+                    blank.title_id().clone(),
                     path.to_string(),
-                    digest.clone(),
-                    digest.clone(),
-                ),
-            );
+                    blank.install_b3().clone(),
+                    blank.current_b3().clone(),
+                );
+                return Ok(());
+            }
+            rows.push(mediaops_core::TitleIndexEntry::new(
+                title_id.clone(),
+                path.to_string(),
+                digest.clone(),
+                digest.clone(),
+            ));
             Ok(())
         }
 
         async fn record_replace(
             &self,
-            title_id: &TitleId,
+            path: &str,
             current_b3: &Blake3Hex,
         ) -> Result<(), Self::Error> {
             let mut rows = self.rows.lock().expect("lock");
-            let key = title_id.render();
             let existing = rows
-                .get(&key)
-                .cloned()
+                .iter_mut()
+                .find(|r| r.path() == path)
                 .ok_or(mediaops_core::TitleIndexError::NotInstalled)?;
-            rows.insert(
-                key,
-                mediaops_core::TitleIndexEntry::new(
-                    existing.title_id().clone(),
-                    existing.path().to_string(),
-                    existing.install_b3().clone(),
-                    current_b3.clone(),
-                ),
+            *existing = mediaops_core::TitleIndexEntry::new(
+                existing.title_id().clone(),
+                existing.path().to_string(),
+                existing.install_b3().clone(),
+                current_b3.clone(),
             );
             Ok(())
         }
@@ -514,13 +588,11 @@ mod tests {
             &self,
             rows: &[mediaops_core::TitleIndexEntry],
         ) -> Result<(), Self::Error> {
-            let mut map = self.rows.lock().expect("lock");
-            if !map.is_empty() {
+            let mut vec = self.rows.lock().expect("lock");
+            if !vec.is_empty() {
                 return Err(mediaops_core::TitleIndexError::NotEmpty);
             }
-            for row in rows {
-                map.insert(row.title_id().render(), row.clone());
-            }
+            vec.extend(rows.iter().cloned());
             Ok(())
         }
 
@@ -529,9 +601,9 @@ mod tests {
             old_root: &str,
             new_root: &str,
         ) -> Result<u64, Self::Error> {
-            let mut map = self.rows.lock().expect("lock");
+            let mut rows = self.rows.lock().expect("lock");
             let mut rewritten = 0_u64;
-            for row in map.values_mut() {
+            for row in rows.iter_mut() {
                 let Some(new_path) =
                     mediaops_core::rewrite_absolute_under(row.path(), old_root, new_root)
                 else {
@@ -549,16 +621,18 @@ mod tests {
         }
     }
 
+    const MATRIX: &str = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
+
     #[tokio::test]
     async fn reindex_records_install_b3_and_backfills_path() {
         let root = scratch("reindex");
         ensure_layout(&root).expect("layout");
-        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let rel = PathBuf::from(MATRIX);
         let path = root.join(&rel);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, b"orig").expect("write");
         let titles = MemTitles::new();
-        let title = TitleId::movie("603").expect("title");
+        let title = mediaops_core::TitleId::movie_key("The.Matrix", 1999).expect("title");
         let digest = Blake3Hex::of_bytes(b"orig");
         titles
             .import_rows(&[mediaops_core::TitleIndexEntry::new(
@@ -571,9 +645,10 @@ mod tests {
             .expect("seed empty path");
         let report = reindex_schema(&root, &titles).await.expect("reindex");
         assert_eq!(report.indexed, 1);
-        let entry = titles.get(&title).await.expect("get").expect("row");
-        assert_eq!(entry.install_b3(), &digest);
-        assert_eq!(entry.path(), rel.to_str().expect("utf8"));
+        let rows = titles.get(&title).await.expect("get");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].install_b3(), &digest);
+        assert_eq!(rows[0].path(), MATRIX);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -581,21 +656,21 @@ mod tests {
     async fn reindex_digest_clash_does_not_overwrite_install_b3() {
         let root = scratch("reindex-clash");
         ensure_layout(&root).expect("layout");
-        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let rel = PathBuf::from(MATRIX);
         let path = root.join(&rel);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, b"new-bytes").expect("write");
         let titles = MemTitles::new();
-        let title = TitleId::movie("603").expect("title");
+        let title = mediaops_core::TitleId::movie_key("The.Matrix", 1999).expect("title");
         let old = Blake3Hex::of_bytes(b"old-bytes");
         titles
-            .record_install(&title, &old, rel.to_str().expect("utf8"))
+            .record_install(&title, &old, MATRIX)
             .await
             .expect("seed");
         let err = reindex_schema(&root, &titles).await.expect_err("clash");
         assert!(err.to_string().contains("immutable"), "{err}");
-        let entry = titles.get(&title).await.expect("get").expect("row");
-        assert_eq!(entry.install_b3(), &old);
+        let rows = titles.get(&title).await.expect("get");
+        assert_eq!(rows[0].install_b3(), &old);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -605,7 +680,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = scratch("reindex-io");
         ensure_layout(&root).expect("layout");
-        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let rel = PathBuf::from(MATRIX);
         let path = root.join(&rel);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, b"orig").expect("write");
@@ -647,22 +722,32 @@ mod tests {
     async fn reindex_after_empty_index_restores_reclaim_proof() {
         let root = scratch("reindex-proof");
         ensure_layout(&root).expect("layout");
-        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let rel = PathBuf::from(MATRIX);
         let path = root.join(&rel);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, b"orig").expect("write");
         let titles = MemTitles::new();
-        let title = TitleId::movie("603").expect("title");
+        let title = mediaops_core::TitleId::movie_key("The.Matrix", 1999).expect("title");
+        // The remote is root-relative under a `movies` root.
         let listing = mediaops_core::RemoteEntry::from_wire_parts(
-            mediaops_core::RemoteRef::from_wire_parts("seedbox".into(), rel.clone()).expect("ref"),
+            mediaops_core::RemoteRef::from_wire_parts(
+                "movies".into(),
+                PathBuf::from("The.Matrix.(1999)/The.Matrix.(1999).mkv"),
+            )
+            .expect("ref"),
             4,
             1,
             1,
         );
         let listings = [listing];
-        let on_disk = [title.clone()];
+        let kinds = mediaops_core::RootKinds::from([(
+            "movies".to_string(),
+            Some(mediaops_core::TitleKind::Movie),
+        )]);
+        let on_disk = scan_schema_files(&root).expect("scan");
+        assert_eq!(on_disk.len(), 1);
         assert!(
-            mediaops_core::reclaim_proved(&listings, &[], &on_disk).is_empty(),
+            mediaops_core::reclaim_proved(&listings, &kinds, &[], &on_disk).is_empty(),
             "empty title_index is not proof"
         );
         let report = reindex_schema(&root, &titles).await.expect("reindex");
@@ -672,7 +757,7 @@ mod tests {
         assert_eq!(rows[0].title_id(), &title);
         assert_eq!(rows[0].install_b3(), &Blake3Hex::of_bytes(b"orig"));
         assert_eq!(
-            mediaops_core::reclaim_proved(&listings, &rows, &on_disk).len(),
+            mediaops_core::reclaim_proved(&listings, &kinds, &rows, &on_disk).len(),
             1,
             "reindex row is reclaim proof"
         );

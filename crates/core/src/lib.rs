@@ -34,8 +34,9 @@ pub use control_port::{
 };
 pub use desired_state::{
     CustomFormatPack, DesiredState, DesiredStateError, DownloadClientKind, Edge, Grab,
-    GrabDownloadClient, GrabIndexer, GrabPolicy, Grabber, PathRoot, PinMatrixRow, Pins,
-    TlsIdentity, parse_semver, pin_matrix_refuse, pin_matrix_refuse_live, upsert_tls_table,
+    GrabDownloadClient, GrabIndexer, GrabPolicy, Grabber, MAX_RANGE_LEN_MIB, PathRoot,
+    PinMatrixRow, Pins, TlsIdentity, parse_semver, pin_matrix_refuse, pin_matrix_refuse_live,
+    upsert_seedbox_address, upsert_tls_table,
 };
 pub use diff::{nginx_host_ok, panel_fingerprint, unified_diff};
 pub use digest::{Blake3Hex, DigestError};
@@ -53,12 +54,14 @@ pub use jobs::{
     JobState, JobsRepo, PullEvent, PullState, WantEvent, WantState, advance, encode_ready,
 };
 pub use pathschema::{
-    GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, parse, parse_placement, render,
+    FileKey, GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, dotted, kind_dir,
+    normalize_placement, parse, parse_placement, parse_remote, render, render_placement,
     staging_path, strip_placement, strip_scene_tags,
 };
 pub use plan::{
-    Action, Plan, PlanError, SKIP_DUPLICATE_TITLE, SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER,
-    SKIP_WATERMARK,
+    Action, Plan, PlanError, REVIEW_NEEDS_SPLIT, REVIEW_NEEDS_YEAR, REVIEW_UNPARSEABLE, RootKinds,
+    SKIP_DUPLICATE_TITLE, SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK,
+    classify_remote,
 };
 pub use probe::{Probe, ProbeError, ProbeRepo, UnderlayMode, endpoint_fingerprint, plateau_n};
 pub use provider::{ProviderError, ProviderKind, already_there_install};
@@ -66,8 +69,10 @@ pub use reclaim::{
     GuardPreviewItem, ReclaimCandidate, ReclaimPolicy, reclaim_actions, reclaim_preview,
     reclaim_proved, torrent_covers_file,
 };
-pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource};
-pub use title_index::{TitleIndexEntry, TitleIndexError, TitleIndexRepo, rewrite_absolute_under};
+pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource, strip_trailing_year, title_key};
+pub use title_index::{
+    InstalledFile, TitleIndexEntry, TitleIndexError, TitleIndexRepo, rewrite_absolute_under,
+};
 pub use walker::{Allowlist, RemoteEntry, RemoteRef, WalkerError};
 
 use std::process::{ExitCode as ProcessExitCode, Termination};

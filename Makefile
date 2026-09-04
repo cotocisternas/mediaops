@@ -63,8 +63,23 @@ mediaops: ## cargo run -p mediaops -- $(ARGS)
 daemon: ## cargo run -p mediaopsd -- $(ARGS)
 	$(CARGO) run -p $(PKG_DAEMON) $(CARGO_FLAGS) -- $(if $(ARGS),$(ARGS),--help)
 
-musl: ## Link musl-static mediaopsd (needs musl-gcc from musl-tools + cmake). Not part of make test.
-	$(CARGO) build --release --target x86_64-unknown-linux-musl -p $(PKG_DAEMON) --bin $(PKG_DAEMON) $(CARGO_FLAGS)
+MUSL_TARGET := x86_64-unknown-linux-musl
+# musl C toolchain: musl-gcc when installed, else zig as a drop-in cross compiler.
+# zig rejects cc-rs's `--target=<rust-triple>` spelling, so a tiny wrapper strips it,
+# and rustc must not add its own self-contained CRT on top of zig's (`_start` twice).
+ZIG_WRAP := $(CURDIR)/scripts/zig-musl-cc
+ifeq ($(shell command -v musl-gcc 2>/dev/null),)
+  ifneq ($(shell command -v zig 2>/dev/null),)
+    MUSL_ENV := CC_x86_64_unknown_linux_musl=$(ZIG_WRAP) \
+      CXX_x86_64_unknown_linux_musl=$(ZIG_WRAP) \
+      AR_x86_64_unknown_linux_musl="$(CURDIR)/scripts/zig-musl-ar" \
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$(ZIG_WRAP) \
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no -C target-feature=+crt-static"
+  endif
+endif
+
+musl: ## Link musl-static mediaopsd (musl-gcc, or zig as the C toolchain). Not part of make test.
+	$(MUSL_ENV) $(CARGO) build --release --target $(MUSL_TARGET) -p $(PKG_DAEMON) --bin $(PKG_DAEMON) $(CARGO_FLAGS)
 
 ci: fetch ## Same sequence as .github/workflows/ci.yml
 	$(CARGO) test --locked --offline --workspace

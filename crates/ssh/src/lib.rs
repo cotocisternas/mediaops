@@ -114,22 +114,21 @@ pub fn systemd_user_unit(exec_start: &str) -> String {
     )
 }
 
+/// `make musl`: the Makefile picks `musl-gcc` when present and falls back to
+/// `zig cc` as the musl C toolchain, so a box without musl-tools still builds.
 pub fn musl_build_command() -> ExecCommand {
-    ExecCommand::new(
-        "cargo",
-        vec![
-            "build".into(),
-            "--release".into(),
-            "--target".into(),
-            "x86_64-unknown-linux-musl".into(),
-            "--bin".into(),
-            "mediaopsd".into(),
-        ],
-    )
+    ExecCommand::new("make", vec!["musl".into()])
 }
 
+/// Where `make musl` leaves the daemon. Honours `CARGO_TARGET_DIR`.
 pub fn musl_binary_path() -> PathBuf {
-    PathBuf::from("target/x86_64-unknown-linux-musl/release/mediaopsd")
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    target
+        .join("x86_64-unknown-linux-musl")
+        .join("release")
+        .join("mediaopsd")
 }
 
 pub fn scp_file_command(local: &Path, remote: &str, ssh_config: &Path) -> ExecCommand {
@@ -287,6 +286,37 @@ pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
     ExecCommand::new("ssh", args)
 }
 
+/// Copy the daemon binary next to its live name and rename over it. A running
+/// `mediaopsd` keeps its old inode mapped; writing *into* that inode is
+/// `ETXTBSY`, renaming a new one over it is not.
+async fn copy_binary_atomically(
+    exec: &impl ExecPort,
+    local_binary: &Path,
+    ssh_config: &Path,
+) -> Result<(), SshError> {
+    exec.run(&scp_file_command(
+        local_binary,
+        ".local/bin/mediaopsd.new",
+        ssh_config,
+    ))
+    .await?;
+    exec.run(&ssh_exec(
+        ssh_config,
+        &[
+            "chmod",
+            "755",
+            ".local/bin/mediaopsd.new",
+            "&&",
+            "mv",
+            "-f",
+            ".local/bin/mediaopsd.new",
+            ".local/bin/mediaopsd",
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
 /// Bootstrap/upgrade install step: musl `mediaopsd` copy + unit restart. Never apt/panel.
 pub async fn copy_binary_and_restart_unit(
     exec: &impl ExecPort,
@@ -296,12 +326,7 @@ pub async fn copy_binary_and_restart_unit(
     exec.run(&musl_build_command()).await?;
     exec.run(&ssh_exec(ssh_config, &["mkdir", "-p", ".local/bin"]))
         .await?;
-    exec.run(&scp_file_command(
-        local_binary,
-        ".local/bin/mediaopsd",
-        ssh_config,
-    ))
-    .await?;
+    copy_binary_atomically(exec, local_binary, ssh_config).await?;
     exec.run(&ssh_exec(
         ssh_config,
         &["systemctl", "--user", "daemon-reload"],
@@ -315,6 +340,7 @@ pub async fn copy_binary_and_restart_unit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn install_provider(
     exec: &impl ExecPort,
     kind: ProviderKind,
@@ -322,6 +348,7 @@ pub async fn install_provider(
     unit_text: &str,
     unit_local: &Path,
     tls_dir: &Path,
+    desired_state: &Path,
     ssh_config: &Path,
 ) -> Result<(), SshError> {
     kind.ensure_installable()?;
@@ -343,12 +370,7 @@ pub async fn install_provider(
                 ],
             ))
             .await?;
-            exec.run(&scp_file_command(
-                local_binary,
-                ".local/bin/mediaopsd",
-                ssh_config,
-            ))
-            .await?;
+            copy_binary_atomically(exec, local_binary, ssh_config).await?;
             for name in ["ca.pem", "server.pem", "server.key"] {
                 exec.run(&scp_file_command(
                     &tls_dir.join(name),
@@ -357,6 +379,14 @@ pub async fn install_provider(
                 ))
                 .await?;
             }
+            // The unit points the daemon at this file for its grabber mode
+            // and roots; without it the service crash-loops on start.
+            exec.run(&scp_file_command(
+                desired_state,
+                ".config/mediaops/desired-state.toml",
+                ssh_config,
+            ))
+            .await?;
             std::fs::write(unit_local, unit_text)
                 .map_err(|err| SshError::Other(err.to_string()))?;
             exec.run(&scp_file_command(
@@ -379,6 +409,13 @@ pub async fn install_provider(
                     "--now",
                     "mediaopsd.service",
                 ],
+            ))
+            .await?;
+            // `enable --now` is a no-op for a unit that is already running on
+            // the old binary or the old bind; a re-bootstrap must restart it.
+            exec.run(&ssh_exec(
+                ssh_config,
+                &["systemctl", "--user", "restart", "mediaopsd.service"],
             ))
             .await?;
             Ok(())
@@ -493,6 +530,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn calls_scp_to(exec: &TranscriptExec, remote: &str) -> bool {
+        exec.recorded().iter().any(|c| {
+            c.program_name() == "scp" && c.args.iter().any(|a| a == &format!("seedbox:{remote}"))
+        })
+    }
+
     #[tokio::test]
     async fn unimplemented_provider_never_ok() {
         let exec = TranscriptExec::new();
@@ -503,6 +546,7 @@ mod tests {
             "",
             Path::new("/tmp/unit"),
             Path::new("/tmp/tls"),
+            Path::new("/tmp/desired-state.toml"),
             Path::new("/tmp/ssh_config"),
         )
         .await
@@ -524,6 +568,7 @@ mod tests {
             "",
             Path::new("/tmp/unit"),
             Path::new("/tmp/tls"),
+            Path::new("/tmp/desired-state.toml"),
             Path::new("/tmp/ssh_config"),
         )
         .await
@@ -577,13 +622,10 @@ mod tests {
             "{calls:?}"
         );
         assert!(
-            calls.iter().any(|c| {
-                c.program_name() == "cargo"
-                    && c.args
-                        .iter()
-                        .any(|a| a.contains("x86_64-unknown-linux-musl"))
-            }),
-            "musl cargo argv missing: {calls:?}"
+            calls
+                .iter()
+                .any(|c| c.program_name() == "make" && c.args == ["musl"]),
+            "musl build step missing: {calls:?}"
         );
     }
 
@@ -663,6 +705,8 @@ mod tests {
         let unit_text = systemd_user_unit(
             "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls",
         );
+        let desired_state = tls.parent().expect("dir").join("desired-state.toml");
+        std::fs::write(&desired_state, "schema_version = 1\n").expect("ds");
         install_provider(
             &exec,
             ProviderKind::SwizzinBox,
@@ -670,18 +714,18 @@ mod tests {
             &unit_text,
             &unit,
             &tls,
+            &desired_state,
             &ssh_config,
         )
         .await
         .expect("install");
-        let calls = exec.recorded();
-        assert_eq!(calls[0].program_name(), "cargo");
         assert!(
-            calls[0]
-                .args
-                .iter()
-                .any(|a| a.contains("x86_64-unknown-linux-musl"))
+            calls_scp_to(&exec, ".config/mediaops/desired-state.toml"),
+            "desired-state must be shipped: the unit reads it on the box"
         );
+        let calls = exec.recorded();
+        assert_eq!(calls[0].program_name(), "make");
+        assert_eq!(calls[0].args, ["musl"]);
         assert!(
             calls
                 .iter()

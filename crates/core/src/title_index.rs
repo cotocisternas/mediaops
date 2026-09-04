@@ -12,9 +12,11 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 
 use crate::digest::Blake3Hex;
+use crate::pathschema::{FileKey, PathSchemaError, parse_placement};
 use crate::title_id::TitleId;
 
-/// One `title_index` row.
+/// One `title_index` row. Keyed by `path`: a show or an album is many rows,
+/// one per episode or track, all carrying the same `title_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TitleIndexEntry {
@@ -24,6 +26,32 @@ pub struct TitleIndexEntry {
     path: String,
     install_b3: Blake3Hex,
     current_b3: Blake3Hex,
+}
+
+/// A schema file that exists on the library disk: the planner's "already
+/// present" unit and reclaim's "still there" proof.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InstalledFile {
+    pub title_id: TitleId,
+    pub file_key: FileKey,
+    /// Library-relative schema path.
+    pub path: String,
+}
+
+impl InstalledFile {
+    /// Classify a library-relative path (`movies/...`, `series/...`, `music/...`).
+    pub fn from_rel_path(rel: &Path) -> Result<Self, PathSchemaError> {
+        let (title_id, placement) = parse_placement(rel)?;
+        Ok(Self {
+            title_id,
+            file_key: placement.file_key(),
+            path: rel.to_string_lossy().into_owned(),
+        })
+    }
+
+    pub fn identity(&self) -> (TitleId, FileKey) {
+        (self.title_id.clone(), self.file_key)
+    }
 }
 
 impl TitleIndexEntry {
@@ -59,6 +87,14 @@ impl TitleIndexEntry {
 
     pub fn current_b3(&self) -> &Blake3Hex {
         &self.current_b3
+    }
+
+    /// The on-disk identity this row proves, when its path parses.
+    pub fn installed_file(&self) -> Option<InstalledFile> {
+        if self.path.is_empty() {
+            return None;
+        }
+        InstalledFile::from_rel_path(Path::new(&self.path)).ok()
     }
 }
 
@@ -110,22 +146,21 @@ fn trim_trailing_slashes(s: &str) -> &str {
 pub trait TitleIndexRepo: Send + Sync {
     type Error;
 
-    async fn get(&self, title_id: &TitleId) -> Result<Option<TitleIndexEntry>, Self::Error>;
+    /// Every row for a title: one for a movie, one per episode or track.
+    async fn get(&self, title_id: &TitleId) -> Result<Vec<TitleIndexEntry>, Self::Error>;
+    /// The row for one schema path.
+    async fn get_path(&self, path: &str) -> Result<Option<TitleIndexEntry>, Self::Error>;
     async fn list(&self) -> Result<Vec<TitleIndexEntry>, Self::Error>;
-    /// First placement: writes `install_b3`, `current_b3`, and the schema path.
-    /// `install_b3` never changes.
+    /// First placement of `path`: writes `install_b3`, `current_b3`, and the
+    /// schema path. `install_b3` never changes for that path.
     async fn record_install(
         &self,
         title_id: &TitleId,
         digest: &Blake3Hex,
         path: &str,
     ) -> Result<(), Self::Error>;
-    /// Encode replace: updates `current_b3` only.
-    async fn record_replace(
-        &self,
-        title_id: &TitleId,
-        current_b3: &Blake3Hex,
-    ) -> Result<(), Self::Error>;
+    /// Encode replace of `path`: updates `current_b3` only.
+    async fn record_replace(&self, path: &str, current_b3: &Blake3Hex) -> Result<(), Self::Error>;
     /// New-machine import: insert full rows including distinct digests.
     /// Refuses when `title_index` is already non-empty.
     async fn import_rows(&self, rows: &[TitleIndexEntry]) -> Result<(), Self::Error>;
@@ -153,7 +188,7 @@ mod tests {
         let current = digest('b');
         let entry = TitleIndexEntry::new(
             title.clone(),
-            "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+            "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
             install.clone(),
             current.clone(),
         );
@@ -165,7 +200,7 @@ mod tests {
 
     #[test]
     fn rewrite_leaves_relative_and_foreign_absolute_paths() {
-        let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let rel = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         assert_eq!(rewrite_absolute_under(rel, "/data/old", "/data/new"), None);
         assert_eq!(
             rewrite_absolute_under("/other/movies/x.mkv", "/data/old", "/data/new"),
@@ -199,10 +234,10 @@ mod tests {
 
     #[test]
     fn rewrite_absolute_under_old_root_uses_new_prefix() {
-        let abs = "/data/old/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let abs = "/data/old/movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         assert_eq!(
             rewrite_absolute_under(abs, "/data/old", "/data/new").as_deref(),
-            Some("/data/new/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv")
+            Some("/data/new/movies/The.Matrix.(1999)/The.Matrix.(1999).mkv")
         );
         assert_eq!(
             rewrite_absolute_under("/data/old", "/data/old/", "/mnt/lib").as_deref(),
@@ -214,7 +249,7 @@ mod tests {
     fn json_round_trip_keeps_distinct_digests() {
         let entry = TitleIndexEntry::new(
             TitleId::movie("603").expect("title"),
-            "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+            "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
             digest('a'),
             digest('b'),
         );

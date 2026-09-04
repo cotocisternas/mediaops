@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    ControlPort, Envelope, ReclaimCandidate, TitleId, reclaim_preview, reclaim_proved,
+    ControlPort, DesiredState, Envelope, InstalledFile, ReclaimCandidate, RootKinds,
+    reclaim_preview, reclaim_proved,
 };
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
@@ -22,6 +23,8 @@ struct PreviewData {
 struct ApplyData {
     deleted: usize,
     skipped_seeding: usize,
+    /// qBittorrent is configured but did not answer; nothing was unlinked.
+    qbit_unavailable: usize,
     failed: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     errors: Vec<String>,
@@ -96,6 +99,7 @@ pub async fn apply(
     let data = ApplyData {
         deleted: report.deleted,
         skipped_seeding: report.skipped_seeding,
+        qbit_unavailable: report.qbit_unavailable,
         failed: report.failed,
         errors: report.errors,
     };
@@ -103,8 +107,8 @@ pub async fn apply(
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         let mut line = format!(
-            "reclaim apply deleted {} skipped_seeding {} failed {}",
-            data.deleted, data.skipped_seeding, data.failed
+            "reclaim apply deleted {} skipped_seeding {} qbit_unavailable {} failed {}",
+            data.deleted, data.skipped_seeding, data.qbit_unavailable, data.failed
         );
         for err in &data.errors {
             line.push('\n');
@@ -156,7 +160,8 @@ async fn snapshot(
         .list_titles()
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let on_disk = on_disk_titles(&library_root)?;
+    let on_disk = on_disk_files(&library_root)?;
+    let root_kinds = root_kinds_from(&bootstrap::default_desired_state(&config_dir));
     let channel = connect_home(&socket, &tls_dir)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
@@ -166,11 +171,11 @@ async fn snapshot(
     let control = ControlPortClient::new(ControlClient::new(channel.clone()));
     let torrents = control.guard_preview().await;
     let mut candidates = match (exclusive, torrents) {
-        (_, Ok(items)) => reclaim_preview(&listings, &title_index, &on_disk, &items),
+        (_, Ok(items)) => reclaim_preview(&listings, &root_kinds, &title_index, &on_disk, &items),
         (false, Err(err)) => return Err(map_control(err)),
         // Seedbox DeleteRemote re-queries qBit and fail-closes; do not
         // pretend we ranked an empty torrent list.
-        (true, Err(_)) => reclaim_proved(&listings, &title_index, &on_disk),
+        (true, Err(_)) => reclaim_proved(&listings, &root_kinds, &title_index, &on_disk),
     };
     if let Some(max) = max {
         candidates.truncate(max);
@@ -182,15 +187,20 @@ async fn snapshot(
     })
 }
 
-pub(crate) fn on_disk_titles(library_root: &Path) -> Result<Vec<TitleId>, AppError> {
+pub(crate) fn on_disk_files(library_root: &Path) -> Result<Vec<InstalledFile>, AppError> {
     if library_root.as_os_str().is_empty() || !library_root.exists() {
         return Ok(Vec::new());
     }
-    Ok(scan_schema_files(library_root)
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect())
+    scan_schema_files(library_root).map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))
+}
+
+/// Root kinds from the active desired-state; an unreadable file means "infer".
+pub(crate) fn root_kinds_from(desired_state: &Path) -> RootKinds {
+    std::fs::read_to_string(desired_state)
+        .ok()
+        .and_then(|text| DesiredState::from_toml(&text).ok())
+        .map(|ds| ds.root_kinds())
+        .unwrap_or_default()
 }
 
 fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
@@ -326,7 +336,7 @@ mod tests {
         let library = crate::test_support::library_root(&dir);
         let db = dir.join("state.db");
         let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         store
             .record_install(
                 &title,
@@ -359,7 +369,7 @@ mod tests {
         assert_eq!(value["ok"], true, "{json}");
         let cands = value["data"]["candidates"].as_array().expect("cands");
         assert_eq!(cands.len(), 1, "{json}");
-        assert_eq!(cands[0]["title_id"], "movie:tmdb:603");
+        assert_eq!(cands[0]["title_id"], "movie:key:thematrix.1999");
         assert!(
             lb.remote_root
                 .join(crate::test_support::MOVIE_REL)
@@ -376,7 +386,7 @@ mod tests {
         let library = crate::test_support::library_root(&dir);
         let db = dir.join("state.db");
         let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         store
             .record_install(
                 &title,
@@ -448,7 +458,7 @@ mod tests {
         let library = crate::test_support::library_root(dir);
         let db = dir.join("state.db");
         let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         store
             .record_install(
                 &title,
@@ -471,7 +481,7 @@ mod tests {
         let lb = crate::test_support::start_pair_with(
             Some(crate::test_support::MOVIE_REL),
             b"remote",
-            mediaops_core::Grabber::None,
+            mediaops_core::Grabber::Servarr,
             Some(Arc::new(qbit_down())),
         )
         .await;
@@ -488,7 +498,7 @@ mod tests {
         .expect("apply");
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["data"]["deleted"], 0, "{json}");
-        assert_eq!(value["data"]["skipped_seeding"], 1, "{json}");
+        assert_eq!(value["data"]["qbit_unavailable"], 1, "{json}");
         assert!(
             lb.remote_root
                 .join(crate::test_support::MOVIE_REL)
@@ -506,7 +516,7 @@ mod tests {
         let lb = crate::test_support::start_pair_with(
             Some(crate::test_support::MOVIE_REL),
             b"remote",
-            mediaops_core::Grabber::None,
+            mediaops_core::Grabber::Servarr,
             Some(Arc::new(qbit_down())),
         )
         .await;

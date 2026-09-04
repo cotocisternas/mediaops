@@ -8,6 +8,7 @@ pub use mediaops_core::{ReclaimCandidate, reclaim_actions as preview_actions, re
 pub struct ReclaimReport {
     pub deleted: usize,
     pub skipped_seeding: usize,
+    pub qbit_unavailable: usize,
     pub failed: usize,
     pub errors: Vec<String>,
 }
@@ -21,6 +22,7 @@ pub async fn apply_reclaim(
         match control.delete_remote(remote).await {
             Ok(DeleteRemoteOutcome::Deleted) => report.deleted += 1,
             Ok(DeleteRemoteOutcome::SkippedSeeding) => report.skipped_seeding += 1,
+            Ok(DeleteRemoteOutcome::QbitUnavailable) => report.qbit_unavailable += 1,
             Err(err) => {
                 report.failed += 1;
                 report.errors.push(err.to_string());
@@ -46,7 +48,7 @@ mod tests {
     }
 
     fn rel() -> &'static str {
-        "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"
+        "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"
     }
 
     struct FakeControl {
@@ -159,7 +161,7 @@ mod tests {
         let a = RemoteRef::from_wire_parts("seedbox".into(), PathBuf::from(rel())).expect("a");
         let b = RemoteRef::from_wire_parts(
             "seedbox".into(),
-            PathBuf::from("movies/Other.(2000).{tmdb-604}/Other.(2000).mkv"),
+            PathBuf::from("movies/Other.(2000)/Other.(2000).mkv"),
         )
         .expect("b");
         let control = FakeControl {
@@ -181,18 +183,28 @@ mod tests {
 
     #[test]
     fn preview_actions_are_delete_remote_not_reclaim_unit() {
-        let remote =
-            RemoteRef::from_wire_parts("seedbox".into(), PathBuf::from(rel())).expect("ref");
+        // Remote is root-relative under a movies root; local is library-relative.
+        let remote = RemoteRef::from_wire_parts(
+            "seedbox".into(),
+            PathBuf::from("The.Matrix.(1999)/The.Matrix.(1999).mkv"),
+        )
+        .expect("ref");
         let listings = vec![RemoteEntry::from_wire_parts(remote.clone(), 10, 1, 1)];
-        let title = TitleId::movie("603").expect("id");
+        let kinds = mediaops_core::RootKinds::from([(
+            "seedbox".to_string(),
+            Some(mediaops_core::TitleKind::Movie),
+        )]);
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let title_index = vec![TitleIndexEntry::new(
             title.clone(),
             rel(),
             digest(),
             digest(),
         )];
-        let on_disk = vec![title];
-        let actions = preview_actions(&listings, &title_index, &on_disk, &[]);
+        let on_disk = vec![
+            mediaops_core::InstalledFile::from_rel_path(std::path::Path::new(rel())).expect("file"),
+        ];
+        let actions = preview_actions(&listings, &kinds, &title_index, &on_disk, &[]);
         assert_eq!(actions, vec![Action::DeleteRemote { remote }]);
         assert!(!actions.iter().any(|a| matches!(a, Action::Reclaim)));
     }

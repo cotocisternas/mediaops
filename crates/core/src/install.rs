@@ -115,9 +115,7 @@ impl VerifiedStagingHandle {
         placement: &Placement,
     ) -> Result<Self, InstallError> {
         let dest_rel = pathschema::render(title_id, placement)?;
-        if pathschema::parse(&dest_rel)? != *title_id {
-            return Err(InstallError::TitleMismatch);
-        }
+        check_title(title_id, &dest_rel)?;
         let final_name = dest_rel
             .file_name()
             .and_then(|n| n.to_str())
@@ -152,9 +150,7 @@ impl VerifiedConvertingHandle {
             .and_then(|n| n.to_str())
             .ok_or_else(|| InstallError::NotConverting(source.display().to_string()))?;
         let dest_rel = pathschema::render(title_id, placement)?;
-        if pathschema::parse(&dest_rel)? != *title_id {
-            return Err(InstallError::TitleMismatch);
-        }
+        check_title(title_id, &dest_rel)?;
         // `<rendered file name>.converting`, not merely *some* `.converting`
         // file: otherwise an unrelated encode output can replace a live title.
         let expected = dest_rel
@@ -174,6 +170,23 @@ impl VerifiedConvertingHandle {
 
     pub fn dest_rel(&self) -> &Path {
         &self.dest_rel
+    }
+}
+
+/// The destination must belong to `title_id`. A path carries only its `key`
+/// identity, so a key TitleId must parse back exactly; an *arr authority id
+/// (tmdb/tvdb/mbid) can only be held to the kind the path encodes.
+fn check_title(title_id: &TitleId, dest_rel: &Path) -> Result<(), InstallError> {
+    let parsed = pathschema::parse(dest_rel)?;
+    let matches = if title_id.is_key() {
+        parsed == *title_id
+    } else {
+        parsed.kind() == title_id.kind()
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(InstallError::TitleMismatch)
     }
 }
 
@@ -259,9 +272,7 @@ pub fn install(
     handle: &VerifiedStagingHandle,
 ) -> Result<InstallOutcome, InstallError> {
     let dest = library_root.as_ref().join(&handle.dest_rel);
-    if pathschema::parse(&handle.dest_rel)? != *title_id {
-        return Err(InstallError::TitleMismatch);
-    }
+    check_title(title_id, &handle.dest_rel)?;
     // `exists()` follows symlinks, so a dangling symlink squatting the library
     // path would report `false`. `symlink_metadata` sees the entry itself.
     if fs::symlink_metadata(&dest).is_ok() {
@@ -274,11 +285,40 @@ pub fn install(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
     }
-    fs::rename(&handle.source, &dest).map_err(|err| InstallError::io(&handle.source, &err))?;
+    move_into_place(&handle.source, &dest)?;
     Ok(InstallOutcome {
         path: dest,
         whole_file_b3,
     })
+}
+
+/// `rename`, or when the destination is on another filesystem (a `music`
+/// symlink to a second disk), copy to a hidden temp name beside it, fsync,
+/// and rename that into place, so the schema path never shows a partial file.
+fn move_into_place(source: &Path, dest: &Path) -> Result<(), InstallError> {
+    match fs::rename(source, dest) {
+        Ok(()) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(err) => return Err(InstallError::io(source, &err)),
+    }
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("install");
+    let tmp = dest.with_file_name(format!(".{name}.mediaops-tmp"));
+    let copy = || -> std::io::Result<()> {
+        let mut from = fs::File::open(source)?;
+        let mut to = fs::File::create(&tmp)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.sync_all()?;
+        fs::rename(&tmp, dest)?;
+        fs::remove_file(source)
+    };
+    if let Err(err) = copy() {
+        let _ = fs::remove_file(&tmp);
+        return Err(InstallError::io(dest, &err));
+    }
+    Ok(())
 }
 
 /// Move the live schema file to `backup_destination`, then place the converting file.
@@ -293,9 +333,7 @@ pub fn replace(
 ) -> Result<PathBuf, InstallError> {
     let library_root = library_root.as_ref();
     let dest = library_root.join(&handle.dest_rel);
-    if pathschema::parse(&handle.dest_rel)? != *title_id {
-        return Err(InstallError::TitleMismatch);
-    }
+    check_title(title_id, &handle.dest_rel)?;
     let backup_destination = backup_destination.as_ref();
     // Schema dirs are the only library writers. `_ops/` (encode backups) is
     // under the library root but is not a schema library dir.
@@ -408,9 +446,10 @@ mod tests {
             crate::Blake3Hex::of_bytes(b"matrix-bytes")
         );
         assert!(!staged.exists());
+        // A path only carries its key identity; the tmdb id is metadata.
         assert_eq!(
             pathschema::parse(installed.path.strip_prefix(&lib).expect("strip")).expect("parse"),
-            title_id
+            TitleId::movie_key("The.Matrix", 1999).expect("key")
         );
     }
 
@@ -443,7 +482,7 @@ mod tests {
         assert!(!converting.exists());
         assert_eq!(
             pathschema::parse(replaced.strip_prefix(&lib).expect("strip")).expect("parse"),
-            title_id
+            TitleId::movie_key("The.Matrix", 1999).expect("key")
         );
     }
 
@@ -623,8 +662,18 @@ mod tests {
         let tmp = TempTree::new();
         let lib = tmp.path.join("library");
         let placement = Placement::movie("The.Matrix", 1999, "mkv");
-        let title_603 = TitleId::movie("603").expect("id");
-        let title_604 = TitleId::movie("604").expect("other");
+        // Key ids are what a path can verify; a different key is another title.
+        let title_603 = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        let title_604 = TitleId::movie_key("The.Matrix.Reloaded", 2003).expect("other");
+        // An authority id can only be held to its kind.
+        assert!(matches!(
+            install(
+                &lib,
+                &TitleId::series("79126").expect("series"),
+                &staged_handle(&lib, &TitleId::movie("603").expect("tmdb"), &placement)
+            ),
+            Err(InstallError::TitleMismatch)
+        ));
 
         let handle = staged_handle(&lib, &title_603, &placement);
         assert!(matches!(

@@ -266,10 +266,10 @@ mod tests {
         fs::write(tls.join("client.key"), b"key").expect("key");
         let db = src.join("state.db");
         let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie("603").expect("title");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
         let install = Blake3Hex::of_bytes(b"install");
         let current = Blake3Hex::of_bytes(b"current");
-        let path = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let path = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         store
             .import_rows(&[TitleIndexEntry::new(
                 title.clone(),
@@ -337,7 +337,13 @@ mod tests {
             "layout must exist before any media"
         );
         let store = Store::open(&dest_db).await.expect("dest store");
-        let entry = store.get_title(&title).await.expect("get").expect("row");
+        let entry = store
+            .get_title(&title)
+            .await
+            .expect("get")
+            .into_iter()
+            .next()
+            .expect("row");
         assert_eq!(entry.install_b3(), &install);
         assert_eq!(entry.current_b3(), &current);
         assert_ne!(entry.install_b3(), entry.current_b3());
@@ -387,10 +393,10 @@ mod tests {
     async fn import_non_empty_title_index_does_not_clobber() {
         let bundle = scratch("clobber-bundle");
         fs::write(bundle.join(BUNDLE_DS), DS).expect("ds");
-        let title = TitleId::movie("603").expect("title");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
         let incoming = TitleIndexEntry::new(
             title.clone(),
-            "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+            "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
             Blake3Hex::of_bytes(b"new"),
             Blake3Hex::of_bytes(b"new"),
         );
@@ -408,7 +414,7 @@ mod tests {
         store
             .import_rows(&[TitleIndexEntry::new(
                 title.clone(),
-                "movies/Keep.(1999).{tmdb-603}/Keep.(1999).mkv",
+                "movies/Keep.(1999)/Keep.(1999).mkv",
                 existing.clone(),
                 existing.clone(),
             )])
@@ -431,12 +437,15 @@ mod tests {
         assert!(!dest.join(BUNDLE_DS).exists(), "must not clobber dest DS");
         assert!(!dest.join(BUNDLE_TLS).join("ca.pem").exists());
         let store = Store::open(&dest_db).await.expect("reopen");
-        let entry = store.get_title(&title).await.expect("get").expect("row");
+        let entry = store
+            .get_title(&title)
+            .await
+            .expect("get")
+            .into_iter()
+            .next()
+            .expect("row");
         assert_eq!(entry.install_b3(), &existing);
-        assert_eq!(
-            entry.path(),
-            "movies/Keep.(1999).{tmdb-603}/Keep.(1999).mkv"
-        );
+        assert_eq!(entry.path(), "movies/Keep.(1999)/Keep.(1999).mkv");
         let _ = fs::remove_dir_all(bundle);
         let _ = fs::remove_dir_all(dest);
     }
@@ -445,9 +454,9 @@ mod tests {
     async fn import_retries_when_dest_layout_exists_and_index_is_empty() {
         let bundle = scratch("retry-bundle");
         fs::write(bundle.join(BUNDLE_DS), DS).expect("ds");
-        let title = TitleId::movie("603").expect("title");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
         let digest = Blake3Hex::of_bytes(b"orig");
-        let path = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let path = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         fs::write(
             bundle.join(BUNDLE_INDEX),
             serde_json::to_vec(&[TitleIndexEntry::new(
@@ -481,7 +490,13 @@ mod tests {
         .await
         .expect("retry import");
         let store = Store::open(&dest_db).await.expect("reopen");
-        let entry = store.get_title(&title).await.expect("get").expect("row");
+        let entry = store
+            .get_title(&title)
+            .await
+            .expect("get")
+            .into_iter()
+            .next()
+            .expect("row");
         assert_eq!(entry.install_b3(), &digest);
         assert_eq!(fs::read(dest.join(BUNDLE_DS)).expect("ds"), DS);
         let _ = fs::remove_dir_all(bundle);
@@ -524,13 +539,13 @@ mod tests {
     async fn import_absolute_title_index_path_is_usage_and_writes_no_row() {
         let bundle = scratch("abs-bundle");
         fs::write(bundle.join(BUNDLE_DS), DS).expect("ds");
-        let title = TitleId::movie("603").expect("title");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
         let digest = Blake3Hex::of_bytes(b"x");
         fs::write(
             bundle.join(BUNDLE_INDEX),
             serde_json::to_vec(&[TitleIndexEntry::new(
                 title.clone(),
-                "/data/old/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+                "/data/old/movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
                 digest.clone(),
                 digest,
             )])
@@ -555,7 +570,7 @@ mod tests {
         assert!(matches!(err, AppError::Usage(_)), "{err}");
         if dest_db.exists() {
             let store = Store::open(&dest_db).await.expect("open");
-            assert!(store.get_title(&title).await.expect("get").is_none());
+            assert!(store.get_title(&title).await.expect("get").is_empty());
             assert!(store.list_titles().await.expect("list").is_empty());
         }
         let _ = fs::remove_dir_all(bundle);
@@ -566,7 +581,7 @@ mod tests {
     async fn import_parent_dir_title_index_path_is_usage() {
         let bundle = scratch("dotdot-bundle");
         fs::write(bundle.join(BUNDLE_DS), DS).expect("ds");
-        let title = TitleId::movie("603").expect("title");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
         let digest = Blake3Hex::of_bytes(b"x");
         fs::write(
             bundle.join(BUNDLE_INDEX),

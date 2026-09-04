@@ -5,8 +5,10 @@ use std::collections::{BTreeMap, HashSet};
 use serde::Deserialize;
 
 use crate::bytes::Bytes;
+use crate::plan::RootKinds;
 use crate::probe::UnderlayMode;
 use crate::provider::ProviderKind;
+use crate::title_id::TitleKind;
 
 const SCHEMA_VERSION: u32 = 1;
 const SHA256_HEX_LEN: usize = 64;
@@ -18,6 +20,10 @@ struct SchemaVersionToml {
     schema_version: u32,
 }
 
+/// The seedbox serves at most this much per `GetRange`; a larger configured
+/// range would come back short on every fetch and fail the pull.
+pub const MAX_RANGE_LEN_MIB: u64 = 64;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DesiredStateToml {
@@ -25,6 +31,10 @@ struct DesiredStateToml {
     max_copy_gib: u64,
     min_free_gib: u64,
     range_len_mib: u64,
+    /// Parallel Range streams to the box. Set it and the probe is skipped;
+    /// leave it out and the first run probes and persists a value.
+    #[serde(default)]
+    range_concurrency: Option<u32>,
     max_nvenc: u32,
     lock: bool,
     #[serde(default)]
@@ -63,11 +73,15 @@ struct PathsToml {
     roots: Vec<PathRoot>,
 }
 
+/// One allowlisted remote root. `kind` says what the root holds so the planner
+/// does not have to guess from path shape; omit it for a mixed folder.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathRoot {
     pub id: String,
     pub path: String,
+    #[serde(default)]
+    pub kind: Option<TitleKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -291,6 +305,7 @@ pub struct DesiredState {
     max_copy: Bytes,
     min_free: Bytes,
     range_len: Bytes,
+    range_concurrency: Option<u32>,
     max_nvenc: u32,
     lock: bool,
     grabber: Grabber,
@@ -314,6 +329,12 @@ pub enum DesiredStateError {
     UnsupportedVersion(u32),
     #[error("{field} must be greater than zero")]
     MustBeNonZero { field: &'static str },
+    #[error("{field} = {value} is above the maximum {max}")]
+    AboveMaximum {
+        field: &'static str,
+        value: u64,
+        max: u64,
+    },
     #[error("{field} = {value} overflows Bytes")]
     SizeOverflow { field: &'static str, value: u64 },
     #[error("{field} must be 64 lowercase hex characters")]
@@ -347,6 +368,27 @@ impl DesiredState {
         if raw.max_nvenc == 0 {
             return Err(DesiredStateError::MustBeNonZero { field: "max_nvenc" });
         }
+        if raw.range_len_mib > MAX_RANGE_LEN_MIB {
+            return Err(DesiredStateError::AboveMaximum {
+                field: "range_len_mib",
+                value: raw.range_len_mib,
+                max: MAX_RANGE_LEN_MIB,
+            });
+        }
+        if let Some(n) = raw.range_concurrency {
+            if n == 0 {
+                return Err(DesiredStateError::MustBeNonZero {
+                    field: "range_concurrency",
+                });
+            }
+            if n > 64 {
+                return Err(DesiredStateError::AboveMaximum {
+                    field: "range_concurrency",
+                    value: u64::from(n),
+                    max: 64,
+                });
+            }
+        }
         if let Some(tls) = raw.tls.as_ref() {
             validate_tls(tls)?;
         }
@@ -379,6 +421,7 @@ impl DesiredState {
             max_copy: gib(raw.max_copy_gib, "max_copy_gib")?,
             min_free: gib(raw.min_free_gib, "min_free_gib")?,
             range_len: mib(raw.range_len_mib, "range_len_mib")?,
+            range_concurrency: raw.range_concurrency,
             max_nvenc: raw.max_nvenc,
             lock: raw.lock,
             grabber: raw.grabber,
@@ -422,6 +465,11 @@ impl DesiredState {
         self.range_len
     }
 
+    /// Operator-pinned Range concurrency, when set.
+    pub fn range_concurrency(&self) -> Option<u32> {
+        self.range_concurrency
+    }
+
     pub fn max_nvenc(&self) -> u32 {
         self.max_nvenc
     }
@@ -452,6 +500,19 @@ impl DesiredState {
 
     pub fn paths(&self) -> &[PathRoot] {
         &self.paths
+    }
+
+    /// `root_id → declared kind` for the planner and reclaim.
+    pub fn root_kinds(&self) -> RootKinds {
+        self.paths
+            .iter()
+            .map(|root| (root.id.clone(), root.kind))
+            .collect()
+    }
+
+    /// Whether desired-state describes an nginx/Forms edge to check at all.
+    pub fn has_edge(&self) -> bool {
+        self.edge.is_some()
     }
 
     pub fn grab(&self) -> &Grab {
@@ -555,6 +616,22 @@ pub fn upsert_tls_table(toml_text: &str, tls: &TlsIdentity) -> Result<String, De
         toml::Value::String(tls.client_sha256.clone()),
     );
     table.insert("tls".into(), toml::Value::Table(tls_table));
+    let encoded =
+        toml::to_string(&table).map_err(|err| DesiredStateError::Parse(err.to_string()))?;
+    DesiredState::from_toml(&encoded)?;
+    Ok(encoded)
+}
+
+/// Write `seedbox_address` (the gRPC `host:port` the home gateway dials) into
+/// the desired-state text. Bootstrap is the one explicit command that does
+/// this; the value comes from `Host seedbox` plus the gRPC port, never typed.
+pub fn upsert_seedbox_address(toml_text: &str, address: &str) -> Result<String, DesiredStateError> {
+    let mut table: toml::Table =
+        toml::from_str(toml_text).map_err(|err| DesiredStateError::Parse(err.to_string()))?;
+    table.insert(
+        "seedbox_address".into(),
+        toml::Value::String(address.to_string()),
+    );
     let encoded =
         toml::to_string(&table).map_err(|err| DesiredStateError::Parse(err.to_string()))?;
     DesiredState::from_toml(&encoded)?;
@@ -708,6 +785,72 @@ lock = false
                 field: "range_len_mib"
             })
         );
+    }
+
+    #[test]
+    fn range_len_above_the_seedbox_ceiling_is_refused() {
+        let toml = HAPPY_TOML.replace("range_len_mib = 8", "range_len_mib = 128");
+        assert_eq!(
+            DesiredState::from_toml(&toml),
+            Err(DesiredStateError::AboveMaximum {
+                field: "range_len_mib",
+                value: 128,
+                max: MAX_RANGE_LEN_MIB,
+            })
+        );
+        let toml = HAPPY_TOML.replace("range_len_mib = 8", "range_len_mib = 64");
+        assert!(DesiredState::from_toml(&toml).is_ok());
+    }
+
+    #[test]
+    fn range_concurrency_is_optional_and_bounded() {
+        let ds = DesiredState::from_toml(HAPPY_TOML).expect("happy");
+        assert_eq!(ds.range_concurrency(), None);
+        let pinned = DesiredState::from_toml(&format!("{HAPPY_TOML}\nrange_concurrency = 8\n"))
+            .expect("pinned");
+        assert_eq!(pinned.range_concurrency(), Some(8));
+        assert!(matches!(
+            DesiredState::from_toml(&format!("{HAPPY_TOML}\nrange_concurrency = 0\n")),
+            Err(DesiredStateError::MustBeNonZero { .. })
+        ));
+        assert!(matches!(
+            DesiredState::from_toml(&format!("{HAPPY_TOML}\nrange_concurrency = 65\n")),
+            Err(DesiredStateError::AboveMaximum { .. })
+        ));
+    }
+
+    #[test]
+    fn upsert_seedbox_address_writes_the_one_key_and_keeps_the_rest() {
+        let text = upsert_seedbox_address(HAPPY_TOML, "ftl28.seedit4.me:50051").expect("upsert");
+        let ds = DesiredState::from_toml(&text).expect("parse");
+        assert_eq!(ds.seedbox_address(), Some("ftl28.seedit4.me:50051"));
+        assert_eq!(
+            ds.max_copy(),
+            DesiredState::from_toml(HAPPY_TOML).expect("h").max_copy()
+        );
+        let again = upsert_seedbox_address(&text, "other:50051").expect("again");
+        assert_eq!(
+            DesiredState::from_toml(&again)
+                .expect("parse")
+                .seedbox_address(),
+            Some("other:50051")
+        );
+        assert_eq!(again.matches("seedbox_address").count(), 1);
+    }
+
+    #[test]
+    fn root_kinds_come_from_paths_roots() {
+        let toml = format!(
+            "{HAPPY_TOML}\n[[paths.roots]]\nid = \"movies\"\npath = \"/m\"\nkind = \"movie\"\n\
+             [[paths.roots]]\nid = \"tv\"\npath = \"/t\"\nkind = \"series\"\n\
+             [[paths.roots]]\nid = \"mixed\"\npath = \"/x\"\n"
+        );
+        let ds = DesiredState::from_toml(&toml).expect("parse");
+        let kinds = ds.root_kinds();
+        assert_eq!(kinds["movies"], Some(TitleKind::Movie));
+        assert_eq!(kinds["tv"], Some(TitleKind::Series));
+        assert_eq!(kinds["mixed"], None);
+        assert!(!ds.has_edge());
     }
 
     #[test]

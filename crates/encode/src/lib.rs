@@ -40,26 +40,41 @@ pub enum EncodeError {
     Refused,
 }
 
+/// Jellyfin's ffmpeg build carries the CUDA filters (`scale_cuda`) the encode
+/// command relies on; a distro ffmpeg may not. Prefer it when installed.
+pub const FFMPEG_CANDIDATES: &[&str] = &["/usr/lib/jellyfin-ffmpeg/ffmpeg", "ffmpeg"];
+
 /// Probe `ffmpeg -encoders` for `hevc_nvenc`. No GPU required for the fake exec port.
 pub async fn probe_nvenc(exec: &impl ExecPort) -> Result<NvencProbe, EncodeError> {
-    let cmd = ExecCommand::new("ffmpeg", vec!["-hide_banner".into(), "-encoders".into()]);
-    match exec.run(&cmd).await {
-        Ok(out) if out.status == 0 => {
+    probe_nvenc_with(exec, FFMPEG_CANDIDATES).await
+}
+
+/// Try each candidate binary in order; the first that answers `-encoders`
+/// is the one recorded as `ffmpeg_path`.
+pub async fn probe_nvenc_with(
+    exec: &impl ExecPort,
+    candidates: &[&str],
+) -> Result<NvencProbe, EncodeError> {
+    for program in candidates {
+        let cmd = ExecCommand::new(*program, vec!["-hide_banner".into(), "-encoders".into()]);
+        if let Ok(out) = exec.run(&cmd).await
+            && out.status == 0
+        {
             let text = String::from_utf8_lossy(&out.stdout).to_string()
                 + &String::from_utf8_lossy(&out.stderr);
             let hevc = text.contains("hevc_nvenc");
-            Ok(NvencProbe {
+            return Ok(NvencProbe {
                 cap: u32::from(hevc),
                 ffmpeg_path: cmd.program.clone(),
                 hevc,
-            })
+            });
         }
-        Ok(_) | Err(_) => Ok(NvencProbe {
-            cap: 0,
-            ffmpeg_path: String::new(),
-            hevc: false,
-        }),
     }
+    Ok(NvencProbe {
+        cap: 0,
+        ffmpeg_path: String::new(),
+        hevc: false,
+    })
 }
 
 #[cfg(test)]
@@ -75,6 +90,13 @@ mod tests {
 
     impl ExecPort for Fake {
         async fn run(&self, command: &ExecCommand) -> Result<ExecOutput, ExecError> {
+            // The jellyfin build is tried first; this fake box lacks it.
+            if command.program == "/usr/lib/jellyfin-ffmpeg/ffmpeg" {
+                return Err(ExecError::Failed {
+                    program: command.program.clone(),
+                    message: "not found".into(),
+                });
+            }
             assert_eq!(command.program, "ffmpeg");
             if self.fail {
                 return Err(ExecError::Failed {
@@ -101,6 +123,27 @@ mod tests {
         .expect("probe");
         assert_eq!(probe.cap, 1);
         assert!(probe.hevc);
+        assert_eq!(
+            probe.ffmpeg_path, "ffmpeg",
+            "falls back past the missing jellyfin build"
+        );
+    }
+
+    #[tokio::test]
+    async fn jellyfin_ffmpeg_is_preferred_when_it_answers() {
+        struct Both;
+        impl ExecPort for Both {
+            async fn run(&self, _command: &ExecCommand) -> Result<ExecOutput, ExecError> {
+                Ok(ExecOutput {
+                    status: 0,
+                    stdout: b" V..... hevc_nvenc  NVIDIA NVENC hevc encoder".to_vec(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+        let probe = probe_nvenc(&Both).await.expect("probe");
+        assert_eq!(probe.ffmpeg_path, "/usr/lib/jellyfin-ffmpeg/ffmpeg");
+        assert_eq!(probe.cap, 1);
     }
 
     #[tokio::test]

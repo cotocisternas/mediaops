@@ -157,6 +157,121 @@ pub fn discover_keys(paths: &KeyPaths) -> Result<DiscoveredKeys, KeyError> {
     })
 }
 
+/// Where each app listens, read from the same config files as the keys.
+///
+/// Swizzin boxes put SABnzbd and qBittorrent on per-user ports (this one:
+/// 65080 and 9148), so a hard-coded 8080 would talk to nothing. Missing files
+/// or fields fall back to the stock defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredEndpoints {
+    pub sonarr: Endpoint,
+    pub radarr: Endpoint,
+    pub lidarr: Endpoint,
+    pub prowlarr: Endpoint,
+    pub sab: Endpoint,
+    pub qbit: Endpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub port: u16,
+    /// Leading-slash URL base, or empty for none.
+    pub url_base: String,
+}
+
+impl Endpoint {
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}{}", self.port, self.url_base)
+    }
+}
+
+fn normalize_url_base(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn servarr_endpoint(
+    path: &Path,
+    default_port: u16,
+    default_base: &str,
+) -> Result<Endpoint, KeyError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Endpoint {
+                port: default_port,
+                url_base: normalize_url_base(default_base),
+            });
+        }
+        Err(err) => return Err(KeyError::Io(err.to_string())),
+    };
+    let port = xml_tag(&text, "Port")?
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default_port);
+    let url_base = xml_tag(&text, "UrlBase")?
+        .map(|b| normalize_url_base(&b))
+        .unwrap_or_else(|| normalize_url_base(default_base));
+    Ok(Endpoint { port, url_base })
+}
+
+fn sab_endpoint(path: &Path) -> Result<Endpoint, KeyError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Endpoint {
+                port: 8080,
+                url_base: "/sabnzbd".into(),
+            });
+        }
+        Err(err) => return Err(KeyError::Io(err.to_string())),
+    };
+    let port = ini_value(&text, "port")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8080);
+    let url_base = ini_value(&text, "url_base")
+        .map(|b| normalize_url_base(&b))
+        .unwrap_or_else(|| "/sabnzbd".into());
+    Ok(Endpoint { port, url_base })
+}
+
+fn qbit_endpoint(path: &Path) -> Result<Endpoint, KeyError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Endpoint {
+                port: 8080,
+                url_base: String::new(),
+            });
+        }
+        Err(err) => return Err(KeyError::Io(err.to_string())),
+    };
+    let port = text
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("WebUI\\Port="))
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap_or(8080);
+    Ok(Endpoint {
+        port,
+        url_base: String::new(),
+    })
+}
+
+pub fn discover_endpoints(paths: &KeyPaths) -> Result<DiscoveredEndpoints, KeyError> {
+    Ok(DiscoveredEndpoints {
+        sonarr: servarr_endpoint(&paths.sonarr, 8989, "/sonarr")?,
+        radarr: servarr_endpoint(&paths.radarr, 7878, "/radarr")?,
+        lidarr: servarr_endpoint(&paths.lidarr, 8686, "/lidarr")?,
+        prowlarr: servarr_endpoint(&paths.prowlarr, 9696, "/prowlarr")?,
+        sab: sab_endpoint(&paths.sab)?,
+        qbit: qbit_endpoint(&paths.qbit)?,
+    })
+}
+
 fn qbit_config_present(path: &Path) -> Result<bool, KeyError> {
     match std::fs::metadata(path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -238,6 +353,52 @@ mod tests {
         assert!(refuse_masked("real-key-not-stars").is_ok());
         assert_eq!(refuse_key(""), Err(KeyError::EmptyKey));
         assert_eq!(refuse_key("   "), Err(KeyError::EmptyKey));
+    }
+
+    #[test]
+    fn endpoints_come_from_the_config_files_not_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-endpoints-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let paths = KeyPaths::from_home(&dir);
+        for (path, body) in [
+            (
+                &paths.sonarr,
+                "<Config><Port>8989</Port><UrlBase>sonarr</UrlBase></Config>",
+            ),
+            (
+                &paths.radarr,
+                "<Config><Port>7878</Port><UrlBase>/radarr/</UrlBase></Config>",
+            ),
+            (
+                &paths.sab,
+                "[misc]\nhost = 127.0.0.1\nport = 65080\nurl_base = /sabnzbd\n[servers]\nport = 563\n",
+            ),
+            (
+                &paths.qbit,
+                "[Preferences]\nWebUI\\Address=*\nWebUI\\LocalHostAuth=false\nWebUI\\Port=9148\n",
+            ),
+        ] {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, body).expect("write");
+        }
+        let endpoints = discover_endpoints(&paths).expect("endpoints");
+        assert_eq!(endpoints.sonarr.base_url(), "http://127.0.0.1:8989/sonarr");
+        assert_eq!(endpoints.radarr.base_url(), "http://127.0.0.1:7878/radarr");
+        assert_eq!(endpoints.sab.base_url(), "http://127.0.0.1:65080/sabnzbd");
+        assert_eq!(endpoints.qbit.base_url(), "http://127.0.0.1:9148");
+        // Missing files fall back to stock defaults.
+        assert_eq!(endpoints.lidarr.base_url(), "http://127.0.0.1:8686/lidarr");
+        assert_eq!(
+            endpoints.prowlarr.base_url(),
+            "http://127.0.0.1:9696/prowlarr"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

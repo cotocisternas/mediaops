@@ -27,14 +27,27 @@ pub struct UnmonitorFailure {
     pub error: String,
 }
 
+/// One [`Action::Copy`] that did not install this run. The loop goes on to the
+/// next action: a bad remote, a dropped WAN mid-file, or a stuck job must not
+/// starve every file queued behind it. The `.partial` stays for next run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyFailure {
+    pub title_id: TitleId,
+    pub remote: RemoteRef,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApplyReport {
     pub copies: usize,
     pub skips: usize,
+    pub reviews: usize,
     pub installed: Vec<InstalledCopy>,
+    pub copy_failed: Vec<CopyFailure>,
     pub unmonitor_failed: Vec<UnmonitorFailure>,
     pub deleted: usize,
     pub skipped_seeding: usize,
+    pub qbit_unavailable: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -101,7 +114,7 @@ where
                     report.skips += 1;
                     continue;
                 }
-                let installed = apply_copy(
+                match apply_copy(
                     ctx.jobs,
                     ctx.titles,
                     ctx.source.clone(),
@@ -113,9 +126,29 @@ where
                     *file_len,
                     placement,
                 )
-                .await?;
-                report.copies += 1;
-                report.installed.push(installed);
+                .await
+                {
+                    Ok(installed) => {
+                        report.copies += 1;
+                        report.installed.push(installed);
+                    }
+                    // Snapshot drift is the one thing that invalidates the
+                    // whole artifact; everything else is per-file data.
+                    Err(err @ ApplyError::SnapshotMismatch) => return Err(err),
+                    Err(err) => {
+                        tracing::warn!(
+                            title = %title_id,
+                            remote = %remote.rel_path().display(),
+                            error = %err,
+                            "copy failed; continuing with the next action"
+                        );
+                        report.copy_failed.push(CopyFailure {
+                            title_id: title_id.clone(),
+                            remote: remote.clone(),
+                            error: err.to_string(),
+                        });
+                    }
+                }
             }
             Action::Skip {
                 title_id: Some(id),
@@ -125,6 +158,7 @@ where
                 report.skips += 1;
             }
             Action::Skip { .. } => report.skips += 1,
+            Action::Review { .. } => report.reviews += 1,
             Action::GrabApply => {
                 if let Some(control) = ctx.control {
                     let _report = control.grab_apply(plan.desired_state_toml()).await?;
@@ -158,10 +192,13 @@ where
                         mediaops_core::DeleteRemoteOutcome::SkippedSeeding => {
                             report.skipped_seeding += 1
                         }
+                        mediaops_core::DeleteRemoteOutcome::QbitUnavailable => {
+                            report.qbit_unavailable += 1
+                        }
                     }
                 }
             }
-            Action::Encode { .. } | Action::Review | Action::Reclaim => {}
+            Action::Encode { .. } | Action::Reclaim => {}
         }
     }
     Ok(report)
@@ -216,10 +253,17 @@ where
             job.clone()
         }
         Some(job) => {
-            return Err(ApplyError::Jobs(format!(
-                "in-flight pull {} does not match this Copy remote/len/placement",
-                job.id()
-            )));
+            // The remote this job was pulling is gone or changed (an *arr
+            // upgrade, a re-download). Its `.partial` can never complete;
+            // drop that staging and let the job carry on with the new remote
+            // rather than failing every run from here on.
+            tracing::warn!(
+                job = %job.id(),
+                title = %title_id,
+                "in-flight pull no longer matches its remote; discarding stale staging"
+            );
+            discard_stale_staging(library_root, title_id)?;
+            job.clone()
         }
         None => jobs
             .create(JobKind::Pull, title_id, want.as_ref().map(Job::id))
@@ -276,6 +320,10 @@ where
                 .await
                 .map_err(|err| ApplyError::Jobs(err.to_string()))?;
         }
+        // The intent file was the only thing keeping `_incoming/<token>/`
+        // alive; drop it so the empty-dir prune can reclaim the directory.
+        let _ = fs::remove_file(pull_intent_path(library_root, title_id));
+        let _ = mediaops_transfer::prune_empty_incoming(&library_root.join("_incoming"));
         return Ok(InstalledCopy {
             title_id: title_id.clone(),
             path: outcome.path,
@@ -316,6 +364,23 @@ fn pull_intent_path(library_root: &Path, title_id: &TitleId) -> PathBuf {
         .join("_incoming")
         .join(title_id.staging_token())
         .join("pull-intent.json")
+}
+
+/// Remove `_incoming/<token>/` for a title whose in-flight remote changed.
+/// The only thing this can hold is a `.partial`, its sidecar, a fully staged
+/// file for the old remote, and the intent file — none of which can complete.
+fn discard_stale_staging(library_root: &Path, title_id: &TitleId) -> Result<(), ApplyError> {
+    let dir = library_root
+        .join("_incoming")
+        .join(title_id.staging_token());
+    match fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ApplyError::Jobs(format!(
+            "discard stale staging {}: {err}",
+            dir.display()
+        ))),
+    }
 }
 
 fn write_pull_intent(
@@ -474,13 +539,19 @@ mod tests {
     impl TitleIndexRepo for MemTitles {
         type Error = TitleIndexError;
 
-        async fn get(&self, title_id: &TitleId) -> Result<Option<TitleIndexEntry>, Self::Error> {
+        async fn get(&self, title_id: &TitleId) -> Result<Vec<TitleIndexEntry>, Self::Error> {
             Ok(self
                 .rows
                 .lock()
                 .expect("lock")
-                .get(&title_id.render())
-                .cloned())
+                .values()
+                .filter(|r| r.title_id() == title_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_path(&self, path: &str) -> Result<Option<TitleIndexEntry>, Self::Error> {
+            Ok(self.rows.lock().expect("lock").get(path).cloned())
         }
 
         async fn list(&self) -> Result<Vec<TitleIndexEntry>, Self::Error> {
@@ -494,15 +565,14 @@ mod tests {
             path: &str,
         ) -> Result<(), Self::Error> {
             let mut rows = self.rows.lock().expect("lock");
-            let key = title_id.render();
-            if let Some(existing) = rows.get(&key) {
+            if let Some(existing) = rows.get(path) {
                 if existing.install_b3() != digest {
                     return Err(TitleIndexError::InstallDigestImmutable);
                 }
                 return Ok(());
             }
             rows.insert(
-                key,
+                path.to_string(),
                 TitleIndexEntry::new(
                     title_id.clone(),
                     path.to_string(),
@@ -515,17 +585,16 @@ mod tests {
 
         async fn record_replace(
             &self,
-            title_id: &TitleId,
+            path: &str,
             current_b3: &Blake3Hex,
         ) -> Result<(), Self::Error> {
             let mut rows = self.rows.lock().expect("lock");
-            let key = title_id.render();
             let existing = rows
-                .get(&key)
+                .get(path)
                 .cloned()
                 .ok_or(TitleIndexError::NotInstalled)?;
             rows.insert(
-                key,
+                path.to_string(),
                 TitleIndexEntry::new(
                     existing.title_id().clone(),
                     existing.path().to_string(),
@@ -542,7 +611,7 @@ mod tests {
                 return Err(TitleIndexError::NotEmpty);
             }
             for row in rows {
-                map.insert(row.title_id().render(), row.clone());
+                map.insert(row.path().to_string(), row.clone());
             }
             Ok(())
         }
@@ -609,7 +678,7 @@ mod tests {
     }
 
     fn movie_copy(body_len: u64) -> Action {
-        let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let rel = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         let (title_id, placement) = parse_placement(rel).expect("placement");
         Action::Copy {
             title_id,
@@ -653,10 +722,10 @@ mod tests {
     #[tokio::test]
     async fn install_goes_through_pathschema_spaces_and_scene_tags_fail() {
         let spaced = Action::Copy {
-            title_id: TitleId::movie("603").expect("id"),
+            title_id: TitleId::movie_key("The.Matrix", 1999).expect("id"),
             remote: RemoteRef::from_wire_parts(
                 "seed".into(),
-                PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+                PathBuf::from("movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"),
             )
             .expect("ref"),
             file_len: 4,
@@ -673,7 +742,7 @@ mod tests {
             hits: Mutex::new(Vec::new()),
         });
         let root = scratch("spaces");
-        let err = apply(
+        let report = apply(
             &plan,
             DS.as_bytes(),
             ApplyCtx {
@@ -686,21 +755,22 @@ mod tests {
             },
         )
         .await
-        .expect_err("spaces");
+        .expect("a bad copy is reported, not fatal");
+        assert_eq!(report.copies, 0);
+        assert_eq!(report.copy_failed.len(), 1);
         assert!(
-            matches!(
-                err,
-                ApplyError::PathSchema(PathSchemaError::SpaceRefused(_))
-            ),
-            "{err}"
+            report.copy_failed[0].error.contains("space refused"),
+            "{:?}",
+            report.copy_failed
         );
+        assert!(!root.join("movies").exists(), "nothing installed");
         let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn copy_from_scene_named_remote_installs_on_pathschema_not_scene_name() {
         let action = Action::Copy {
-            title_id: TitleId::movie("603").expect("id"),
+            title_id: TitleId::movie_key("The.Matrix", 1999).expect("id"),
             remote: RemoteRef::from_wire_parts(
                 "seed".into(),
                 PathBuf::from("The.Matrix.1999.REPACK.mkv"),
@@ -737,7 +807,7 @@ mod tests {
         assert_eq!(report.copies, 1);
         let installed = report.installed[0].path.to_str().expect("utf8");
         assert!(
-            installed.contains("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+            installed.contains("movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"),
             "install must use PathSchema, not the scene name: {installed}"
         );
         assert!(!installed.contains("REPACK"));
@@ -761,7 +831,7 @@ mod tests {
             fail_from: Some(MIB as u64),
             hits: Mutex::new(Vec::new()),
         });
-        let err = apply(
+        let report = apply(
             &plan,
             ds.as_bytes(),
             ApplyCtx {
@@ -774,8 +844,14 @@ mod tests {
             },
         )
         .await
-        .expect_err("killed");
-        assert!(err.to_string().contains("killed"), "{err}");
+        .expect("a dropped transfer is reported, not fatal");
+        assert_eq!(report.copies, 0);
+        assert_eq!(report.copy_failed.len(), 1);
+        assert!(
+            report.copy_failed[0].error.contains("killed"),
+            "{:?}",
+            report.copy_failed
+        );
 
         let src = Arc::new(MemSource {
             body: body.clone(),
@@ -801,7 +877,10 @@ mod tests {
         assert_eq!(fs::read(installed).expect("read"), body);
         let listed = titles.list().await.expect("list");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].title_id(), &TitleId::movie("603").expect("id"));
+        assert_eq!(
+            listed[0].title_id(),
+            &TitleId::movie_key("The.Matrix", 1999).expect("id")
+        );
         assert!(!listed[0].path_missing());
         let _ = fs::remove_dir_all(root);
     }
@@ -845,7 +924,7 @@ mod tests {
             .expect("plan")
             .with_actions(vec![movie_copy(4)]);
         let jobs = MemJobs::new();
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let want = jobs
             .create(JobKind::Want, &title, None)
             .await
@@ -885,7 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_never_skip_satisfies_open_want() {
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let plan = Plan::from_toml_bytes(DS.as_bytes())
             .expect("plan")
             .with_actions(vec![Action::Skip {
@@ -930,7 +1009,7 @@ mod tests {
             .expect("plan")
             .with_actions(vec![movie_copy(4)]);
         let jobs = MemJobs::new();
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let pull = jobs
             .create(JobKind::Pull, &title, None)
             .await
@@ -944,7 +1023,7 @@ mod tests {
             &title,
             &RemoteRef::from_wire_parts(
                 "seed".into(),
-                PathBuf::from("movies/Other.(2000).{tmdb-604}/Other.(2000).mkv"),
+                PathBuf::from("movies/Other.(2000)/Other.(2000).mkv"),
             )
             .expect("ref"),
             4,
@@ -957,7 +1036,13 @@ mod tests {
             fail_from: None,
             hits: Mutex::new(Vec::new()),
         });
-        let err = apply(
+        // Leave a stale partial from the old remote behind as well.
+        let stale = root
+            .join("_incoming")
+            .join(title.staging_token())
+            .join("The.Matrix.(1999).mkv.partial");
+        fs::write(&stale, b"old").expect("stale partial");
+        let report = apply(
             &plan,
             DS.as_bytes(),
             ApplyCtx {
@@ -970,8 +1055,14 @@ mod tests {
             },
         )
         .await
-        .expect_err("mismatch");
-        assert!(err.to_string().contains("does not match"), "{err}");
+        .expect("a changed remote restarts the pull, it does not wedge it");
+        assert_eq!(report.copies, 1, "{report:?}");
+        assert!(report.copy_failed.is_empty());
+        assert!(!stale.exists(), "stale staging is discarded");
+        assert_eq!(
+            fs::read(&report.installed[0].path).expect("installed"),
+            b"abcd"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1131,7 +1222,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_unmonitor_is_reported_and_does_not_abort_the_copy() {
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let plan = Plan::from_toml_bytes(DS.as_bytes())
             .expect("plan")
             .with_actions(vec![
@@ -1191,7 +1282,7 @@ mod tests {
 
     #[tokio::test]
     async fn unmonitor_dispatches_through_control_port() {
-        let title = TitleId::movie("603").expect("id");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let plan = Plan::from_toml_bytes(DS.as_bytes())
             .expect("plan")
             .with_actions(vec![Action::Unmonitor {
@@ -1263,7 +1354,7 @@ mod tests {
     async fn delete_remote_dispatches_and_records_skipped_seeding() {
         let remote = RemoteRef::from_wire_parts(
             "seed".into(),
-            PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+            PathBuf::from("movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"),
         )
         .expect("ref");
         let plan = Plan::from_toml_bytes(DS.as_bytes())

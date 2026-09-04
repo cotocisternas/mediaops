@@ -10,19 +10,54 @@ use mediaops_core::{
 
 use crate::EncodeError;
 
+/// The operator's proven Chrome fix (`AGENTS.md`): NVDEC in, first video and
+/// first audio only, `h264_nvenc` P5 quality-targeted VBR capped at 12 Mbit/s,
+/// 8-bit High@4.1 via `scale_cuda`, audio copied, `+faststart` so the MP4
+/// streams. Without `-cq`/`-maxrate` nvenc falls back to a fixed ~2 Mbit/s.
 pub fn ffmpeg_nvenc_args(input: &Path, converting: &Path) -> Vec<String> {
-    vec![
-        "-y".into(),
-        "-i".into(),
-        input.display().to_string(),
-        "-c:v".into(),
-        "h264_nvenc".into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-        "-c:a".into(),
-        "copy".into(),
-        converting.display().to_string(),
+    [
+        "-y",
+        "-hwaccel",
+        "cuda",
+        "-hwaccel_output_format",
+        "cuda",
+        "-i",
+        &input.display().to_string(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p5",
+        "-tune",
+        "hq",
+        "-rc",
+        "vbr",
+        "-cq",
+        "19",
+        "-b:v",
+        "0",
+        "-maxrate",
+        "12M",
+        "-bufsize",
+        "24M",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.1",
+        "-vf",
+        "scale_cuda=format=yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        &converting.display().to_string(),
     ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 pub fn converting_path(
@@ -35,9 +70,12 @@ pub fn converting_path(
         .join(staging_path(title_id, &name).map_err(|err| EncodeError::Path(err.to_string()))?))
 }
 
+/// Where the HEVC original goes after a successful replace. `_incoming/` is
+/// where this library already keeps them (`AGENTS.md`); it is never a Jellyfin
+/// library, and the install gate refuses any backup inside a schema dir.
 pub fn backup_path(library_root: &Path, title_id: &TitleId, filename: &str) -> PathBuf {
     library_root
-        .join("_ops")
+        .join("_incoming")
         .join("backup-hevc-originals")
         .join(title_id.staging_token())
         .join(filename)
@@ -227,16 +265,36 @@ mod tests {
         .expect("transcode");
         let calls = exec.calls.lock().expect("calls").clone();
         assert_eq!(calls[0].program, "ffmpeg");
-        assert_eq!(calls[0].args[0], "-y");
-        assert_eq!(calls[0].args[1], "-i");
-        assert_eq!(calls[0].args[2], live.display().to_string());
-        assert_eq!(calls[0].args[3], "-c:v");
-        assert_eq!(calls[0].args[4], "h264_nvenc");
-        assert_eq!(calls[0].args[5], "-pix_fmt");
-        assert_eq!(calls[0].args[6], "yuv420p");
-        assert_eq!(calls[0].args[7], "-c:a");
-        assert_eq!(calls[0].args[8], "copy");
-        assert!(calls[0].args[9].ends_with(".converting"));
+        let args = &calls[0].args;
+        let pair = |flag: &str| -> Option<&str> {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+        };
+        assert_eq!(args[0], "-y");
+        assert_eq!(pair("-hwaccel"), Some("cuda"));
+        assert_eq!(pair("-i"), Some(live.display().to_string().as_str()));
+        assert_eq!(pair("-c:v"), Some("h264_nvenc"));
+        assert_eq!(pair("-preset"), Some("p5"));
+        assert_eq!(pair("-cq"), Some("19"));
+        assert_eq!(pair("-maxrate"), Some("12M"));
+        assert_eq!(pair("-profile:v"), Some("high"));
+        assert_eq!(pair("-vf"), Some("scale_cuda=format=yuv420p"));
+        assert_eq!(pair("-c:a"), Some("copy"));
+        assert_eq!(pair("-movflags"), Some("+faststart"));
+        assert!(args.last().expect("output").ends_with(".converting"));
+        assert!(
+            !args.iter().any(|a| a == "-pix_fmt"),
+            "yuv420p comes from scale_cuda on the GPU, not a CPU pix_fmt"
+        );
+        let backup = backup_path(&lib, &title_id, "The.Matrix.(1999).mkv");
+        assert!(
+            backup.starts_with(lib.join("_incoming").join("backup-hevc-originals")),
+            "{}",
+            backup.display()
+        );
+        assert_eq!(fs::read(&backup).expect("backup"), b"original-hevc");
     }
 
     #[tokio::test]

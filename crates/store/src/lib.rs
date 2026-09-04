@@ -1,6 +1,7 @@
-//! sqlite adapter (AD-8). Schema `user_version` 6: `probes` (v1), `title_index` /
+//! sqlite adapter (AD-8). Schema `user_version` 7: `probes` (v1), `title_index` /
 //! `jobs` (v2) with `jobs.title_id` (v3), `machine` kv (v4), `title_index.path`
-//! (v5), `holds_decisions` (v6).
+//! (v5), `holds_decisions` (v6), `title_index` keyed by `path` (v7) so a show or
+//! an album is one row per episode or track.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,7 +18,7 @@ mod machine;
 mod probes;
 mod title_index;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const JOBS_DDL: &str = "CREATE TABLE jobs (
                 id INTEGER PRIMARY KEY NOT NULL,
@@ -99,12 +100,15 @@ impl Store {
             .await
     }
 
-    pub async fn get_title(
-        &self,
-        title_id: &TitleId,
-    ) -> Result<Option<TitleIndexEntry>, StoreError> {
+    pub async fn get_title(&self, title_id: &TitleId) -> Result<Vec<TitleIndexEntry>, StoreError> {
         let title_id = title_id.clone();
         self.with(move |conn| title_index::get_title(conn, &title_id))
+            .await
+    }
+
+    pub async fn get_path(&self, path: &str) -> Result<Option<TitleIndexEntry>, StoreError> {
+        let path = path.to_string();
+        self.with(move |conn| title_index::get_path(conn, &path))
             .await
     }
 
@@ -127,12 +131,12 @@ impl Store {
 
     pub async fn record_replace(
         &self,
-        title_id: &TitleId,
+        path: &str,
         current_b3: &Blake3Hex,
     ) -> Result<(), StoreError> {
-        let title_id = title_id.clone();
+        let path = path.to_string();
         let current_b3 = current_b3.clone();
-        self.with(move |conn| title_index::record_replace(conn, &title_id, &current_b3))
+        self.with(move |conn| title_index::record_replace(conn, &path, &current_b3))
             .await
     }
 
@@ -226,8 +230,12 @@ impl ProbeRepo for Store {
 impl TitleIndexRepo for Store {
     type Error = StoreError;
 
-    async fn get(&self, title_id: &TitleId) -> Result<Option<TitleIndexEntry>, StoreError> {
+    async fn get(&self, title_id: &TitleId) -> Result<Vec<TitleIndexEntry>, StoreError> {
         Store::get_title(self, title_id).await
+    }
+
+    async fn get_path(&self, path: &str) -> Result<Option<TitleIndexEntry>, StoreError> {
+        Store::get_path(self, path).await
     }
 
     async fn list(&self) -> Result<Vec<TitleIndexEntry>, StoreError> {
@@ -243,12 +251,8 @@ impl TitleIndexRepo for Store {
         Store::record_install(self, title_id, digest, path).await
     }
 
-    async fn record_replace(
-        &self,
-        title_id: &TitleId,
-        current_b3: &Blake3Hex,
-    ) -> Result<(), StoreError> {
-        Store::record_replace(self, title_id, current_b3).await
+    async fn record_replace(&self, path: &str, current_b3: &Blake3Hex) -> Result<(), StoreError> {
+        Store::record_replace(self, path, current_b3).await
     }
 
     async fn import_rows(&self, rows: &[TitleIndexEntry]) -> Result<(), StoreError> {
@@ -387,6 +391,28 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         )
         .map_err(sqlite)?;
     }
+    if version < 7 {
+        // One row per file: a show or an album is many rows sharing a title_id.
+        // Pre-v5 rows with an empty path survive (a partial unique index lets
+        // more than one of them exist) until `library reindex` fills them in.
+        conn.execute_batch(
+            "CREATE TABLE title_index_v7 (
+                id INTEGER PRIMARY KEY NOT NULL,
+                path TEXT NOT NULL,
+                title_id TEXT NOT NULL,
+                install_b3 TEXT NOT NULL,
+                current_b3 TEXT NOT NULL
+            );
+            INSERT INTO title_index_v7 (path, title_id, install_b3, current_b3)
+                SELECT path, title_id, install_b3, current_b3 FROM title_index;
+            DROP TABLE title_index;
+            ALTER TABLE title_index_v7 RENAME TO title_index;
+            CREATE UNIQUE INDEX title_index_path ON title_index (path) WHERE path <> '';
+            CREATE INDEX title_index_title_id ON title_index (title_id);
+            PRAGMA user_version = 7;",
+        )
+        .map_err(sqlite)?;
+    }
     Ok(())
 }
 
@@ -521,7 +547,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         conn.query_row("SELECT COUNT(*) FROM title_index", [], |row| {
             row.get::<_, i64>(0)
         })
@@ -572,7 +598,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -663,16 +689,18 @@ mod tests {
         write_v4_title_without_path(&path);
         let store = Store::open(&path).await.expect("open");
         let title = TitleId::movie("603").expect("title");
-        let entry = store.get_title(&title).await.expect("get").expect("row");
-        assert!(entry.path_missing(), "v4 row must migrate to empty path");
+        let rows = store.get_title(&title).await.expect("get");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].path_missing(), "v4 row must migrate to empty path");
         let digest = Blake3Hex::parse(&"a".repeat(64)).expect("d");
-        let schema = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let schema = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         store
             .record_install(&title, &digest, schema)
             .await
             .expect("backfill");
-        let entry = store.get_title(&title).await.expect("get").expect("row");
-        assert_eq!(entry.path(), schema);
+        let rows = store.get_title(&title).await.expect("get");
+        assert_eq!(rows.len(), 1, "backfilled in place");
+        assert_eq!(rows[0].path(), schema);
         let listed = store.list_titles().await.expect("list");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path(), schema);
@@ -719,7 +747,7 @@ mod tests {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let info: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='holds_decisions'",

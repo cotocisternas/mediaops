@@ -6,7 +6,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Library title kind. Paired with a single identity source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TitleKind {
     Movie,
     Series,
@@ -33,11 +34,19 @@ impl TitleKind {
 }
 
 /// Identity authority for a TitleId.
+///
+/// `Key` is the identity the library itself carries: the dotted
+/// `Title.(Year)` folder that Radarr/Sonarr/Lidarr and the operator's own
+/// naming rules produce, normalised by [`title_key`]. It is what the planner
+/// compares against the disk, because this library has no ID tokens in its
+/// paths. `Tmdb`/`Tvdb`/`Mbid` are the *arr authorities and still travel on the
+/// wire for holds, wants, and unmonitor; the daemon bridges them to keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TitleSource {
     Tmdb,
     Tvdb,
     Mbid,
+    Key,
 }
 
 impl TitleSource {
@@ -46,12 +55,8 @@ impl TitleSource {
             Self::Tmdb => "tmdb",
             Self::Tvdb => "tvdb",
             Self::Mbid => "mbid",
+            Self::Key => "key",
         }
-    }
-
-    /// Token used inside PathSchema folders: `{tmdb-603}`.
-    pub fn path_token(self) -> &'static str {
-        self.as_str()
     }
 
     fn parse(raw: &str) -> Result<Self, TitleIdError> {
@@ -59,9 +64,63 @@ impl TitleSource {
             "tmdb" => Ok(Self::Tmdb),
             "tvdb" => Ok(Self::Tvdb),
             "mbid" => Ok(Self::Mbid),
+            "key" => Ok(Self::Key),
             other => Err(TitleIdError::InvalidSource(other.to_string())),
         }
     }
+}
+
+/// Normalise a display title to its comparison key: NFKC-ish ASCII fold,
+/// lowercase, alphanumerics only. `The.Matrix`, `The Matrix`, and
+/// `the-matrix` all key to `thematrix`. Mirrors the operator's proven
+/// `normalize_key`, so a folder the old sync accepted as "already present"
+/// stays present.
+pub fn title_key(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            }
+        } else if let Some(folded) = fold_latin(c) {
+            out.push_str(folded);
+        } else if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Drop a trailing `.(YYYY)` / ` (YYYY)` / `(YYYY)` display year.
+pub fn strip_trailing_year(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    let Some(open) = trimmed.rfind('(') else {
+        return trimmed;
+    };
+    let tail = &trimmed[open..];
+    let is_year =
+        tail.len() == 6 && tail.ends_with(')') && tail[1..5].bytes().all(|b| b.is_ascii_digit());
+    if !is_year {
+        return trimmed;
+    }
+    trimmed[..open].trim_end_matches(['.', ' '])
+}
+
+/// Best-effort Latin fold for the accented letters that show up in titles.
+fn fold_latin(c: char) -> Option<&'static str> {
+    Some(match c {
+        'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' | 'À' | 'Á' | 'Â' | 'Ä' | 'Ã' | 'Å' => "a",
+        'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => "e",
+        'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => "i",
+        'ò' | 'ó' | 'ô' | 'ö' | 'õ' | 'ø' | 'Ò' | 'Ó' | 'Ô' | 'Ö' | 'Õ' | 'Ø' => "o",
+        'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => "u",
+        'ñ' | 'Ñ' => "n",
+        'ç' | 'Ç' => "c",
+        'ß' => "ss",
+        'æ' | 'Æ' => "ae",
+        'œ' | 'Œ' => "oe",
+        _ => return None,
+    })
 }
 
 /// Stable identity. Music remasters key by MBID, not folder year.
@@ -97,6 +156,46 @@ impl TitleId {
 
     pub fn album(mbid: impl Into<String>) -> Result<Self, TitleIdError> {
         Self::from_parts(TitleKind::Album, TitleSource::Mbid, mbid.into())
+    }
+
+    /// Path-derived movie identity: `movie:key:<title_key>.<year>`.
+    pub fn movie_key(title: &str, year: u16) -> Result<Self, TitleIdError> {
+        Self::from_parts(
+            TitleKind::Movie,
+            TitleSource::Key,
+            format!("{}.{year}", title_key(title)),
+        )
+    }
+
+    /// Path-derived series identity: `series:key:<title_key>.<year>`.
+    pub fn series_key(title: &str, year: u16) -> Result<Self, TitleIdError> {
+        Self::from_parts(
+            TitleKind::Series,
+            TitleSource::Key,
+            format!("{}.{year}", title_key(title)),
+        )
+    }
+
+    /// Path-derived album identity: `album:key:<artist_key>.<album_key>`.
+    ///
+    /// No year: a remaster (`Relayer.(1974)` vs `Relayer.(2013)`) is the same
+    /// album for "already present" purposes, exactly as the old sync treated it.
+    pub fn album_key(artist: &str, album: &str) -> Result<Self, TitleIdError> {
+        Self::from_parts(
+            TitleKind::Album,
+            TitleSource::Key,
+            format!(
+                "{}.{}",
+                title_key(artist),
+                title_key(strip_trailing_year(album))
+            ),
+        )
+    }
+
+    /// Whether this identity was derived from a library path rather than an
+    /// *arr authority.
+    pub fn is_key(&self) -> bool {
+        self.source == TitleSource::Key
     }
 
     pub fn kind(&self) -> TitleKind {
@@ -180,6 +279,7 @@ fn valid_pair(kind: TitleKind, source: TitleSource) -> bool {
         (TitleKind::Movie, TitleSource::Tmdb)
             | (TitleKind::Series, TitleSource::Tvdb)
             | (TitleKind::Album, TitleSource::Mbid)
+            | (_, TitleSource::Key)
     )
 }
 
@@ -194,7 +294,21 @@ fn valid_id(source: TitleSource, id: &str) -> bool {
             id.bytes().all(|b| b.is_ascii_digit()) && !(id.len() > 1 && id.starts_with('0'))
         }
         TitleSource::Mbid => is_mbid(id),
+        TitleSource::Key => is_key_id(id),
     }
+}
+
+/// `key` ids are `<segment>(.<segment>)*` where each segment is one or more
+/// lowercase alphanumerics — exactly what [`title_key`] emits joined by `.`.
+/// No whitespace, no path separators, so the id doubles as a staging token.
+fn is_key_id(id: &str) -> bool {
+    let mut segments = id.split('.');
+    segments.all(|segment| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_alphanumeric() && !c.is_uppercase())
+    })
 }
 
 fn is_mbid(id: &str) -> bool {
@@ -361,6 +475,68 @@ mod tests {
         // A bare zero is still a legal id; only *leading* zeros are refused.
         assert!(TitleId::movie("0").is_ok());
         assert!(TitleId::movie("603").is_ok());
+    }
+
+    #[test]
+    fn key_ids_normalise_title_and_carry_year_except_albums() {
+        let matrix = TitleId::movie_key("The.Matrix", 1999).expect("key");
+        assert_eq!(matrix.render(), "movie:key:thematrix.1999");
+        assert_eq!(
+            TitleId::movie_key("The Matrix", 1999).expect("spaces"),
+            matrix
+        );
+        assert_eq!(
+            TitleId::movie_key("the-matrix", 1999).expect("hyphen"),
+            matrix
+        );
+        assert_ne!(
+            TitleId::movie_key("The.Matrix", 2003).expect("year"),
+            matrix
+        );
+        assert!(matrix.is_key());
+        assert!(!TitleId::movie("603").expect("tmdb").is_key());
+
+        let wire = TitleId::series_key("The.Wire", 2002).expect("series");
+        assert_eq!(wire.render(), "series:key:thewire.2002");
+        assert_eq!(wire.staging_token(), "series-key-thewire.2002");
+
+        let relayer = TitleId::album_key("Yes", "Relayer").expect("album");
+        assert_eq!(relayer.render(), "album:key:yes.relayer");
+        // Remaster years never split an album identity.
+        assert_eq!(
+            TitleId::album_key("Yes", "Relayer.(2013)").expect("remaster"),
+            relayer
+        );
+        assert_eq!(
+            TitleId::album_key("Yes", "Relayer (1974)").expect("spaced"),
+            relayer
+        );
+        assert_eq!(strip_trailing_year("OK Computer.(1997)"), "OK Computer");
+        assert_eq!(strip_trailing_year("1917"), "1917");
+        assert_eq!(
+            strip_trailing_year("Blade.Runner.(2049).(2017)"),
+            "Blade.Runner.(2049)"
+        );
+        assert_eq!(
+            TitleId::parse("movie:key:thematrix.1999").expect("parse"),
+            matrix
+        );
+        assert!(TitleId::parse("movie:key:").is_err());
+        assert!(TitleId::parse("movie:key:The.Matrix").is_err());
+        assert!(TitleId::parse("movie:key:the matrix").is_err());
+        assert!(TitleId::movie_key("!!!", 1999).is_err());
+    }
+
+    #[test]
+    fn title_key_folds_accents_and_keeps_non_latin_letters() {
+        assert_eq!(title_key("Amélie"), "amelie");
+        assert_eq!(title_key("It's.Always.Sunny"), "itsalwayssunny");
+        assert_eq!(
+            title_key("Spider-Man: Brand New Day"),
+            "spidermanbrandnewday"
+        );
+        assert_eq!(title_key("日本語"), "日本語");
+        assert_eq!(title_key("Straße"), "strasse");
     }
 
     #[test]

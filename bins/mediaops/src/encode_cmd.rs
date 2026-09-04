@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use mediaops_core::{
     DesiredState, EncodeEvent, Envelope, ExecPort, Job, JobEvent, JobKind, JobState, TitleId,
-    encode_ready, parse_placement,
+    encode_ready, parse_placement, render_placement,
 };
 use mediaops_encode::{
     EncodeDecision, TranscodeSpec, classify, encode_to_converting, probe_media, replace_converting,
@@ -61,18 +61,18 @@ pub async fn scan(
     let movies = library_root.join("movies");
     let mut files = Vec::new();
     if movies.is_dir() {
-        for (title_id, rel, _) in scan_schema_files(&library_root).map_err(runtime_display)? {
-            if title_id.kind() != mediaops_core::TitleKind::Movie {
+        for file in scan_schema_files(&library_root).map_err(runtime_display)? {
+            if file.title_id.kind() != mediaops_core::TitleKind::Movie {
                 continue;
             }
-            let path = library_root.join(&rel);
+            let path = library_root.join(&file.path);
             let media = probe_media(exec, &path)
                 .await
                 .map_err(|err| AppError::Runtime(anyhow::anyhow!("probe_error: {err}")))?;
-            let decision = classify(title_id.kind(), &media);
+            let decision = classify(file.title_id.kind(), &media);
             files.push(ScanFile {
-                path: rel.display().to_string(),
-                title_id: title_id.render(),
+                path: file.path.clone(),
+                title_id: file.title_id.render(),
                 decision: decision.as_str().to_string(),
             });
         }
@@ -212,10 +212,10 @@ pub async fn run(
         let converting = encode_to_converting(exec, spec)
             .await
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        let (_dest, digest) = replace_converting(spec, converting)
+        let (dest, digest) = replace_converting(spec, converting)
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
         store
-            .record_replace(&title_id, &digest)
+            .record_replace(&library_rel(&library_root, &dest), &digest)
             .await
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
         let data = EncodeRunData {
@@ -264,11 +264,11 @@ pub async fn run(
                 .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?,
             None => None,
         };
-        let indexed = store
+        let indexed = !store
             .get_title(job.title_id())
             .await
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-            .is_some();
+            .is_empty();
         let retry = matches!(
             job.state(),
             JobState::Encode(mediaops_core::EncodeState::Encoding)
@@ -379,10 +379,10 @@ async fn encode_one(
         let filename = placement_filename(&placement)?;
         let converting = mediaops_encode::converting_path(library_root, job.title_id(), &filename)
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        let (_dest, digest) = replace_converting(spec, converting)
+        let (dest, digest) = replace_converting(spec, converting)
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
         store
-            .record_replace(job.title_id(), &digest)
+            .record_replace(&library_rel(library_root, &dest), &digest)
             .await
             .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
         store
@@ -393,32 +393,27 @@ async fn encode_one(
     Ok(())
 }
 
+/// The rendered file name of a placement: the one PathSchema produces.
 fn placement_filename(placement: &mediaops_core::Placement) -> Result<String, AppError> {
-    match placement {
-        mediaops_core::Placement::Movie {
-            title,
-            year,
-            extension,
-        } => Ok(format!("{title}.({year}).{extension}")),
-        mediaops_core::Placement::Episode {
-            title,
-            year,
-            season,
-            episode,
-            extension,
-        } => Ok(format!(
-            "{title}.({year}).S{season:02}E{episode:02}.{extension}"
-        )),
-        mediaops_core::Placement::Track {
-            track,
-            title,
-            year,
-            extension,
-            ..
-        } => Ok(format!("{track:02}.{title}.({year}).{extension}")),
-    }
+    let rendered = render_placement(placement).map_err(runtime_display)?;
+    rendered
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| AppError::Runtime(anyhow::anyhow!("placement renders no file name")))
 }
 
+/// Library-relative form of an absolute path under `library_root` (what the
+/// title index is keyed on).
+fn library_rel(library_root: &std::path::Path, abs: &std::path::Path) -> String {
+    abs.strip_prefix(library_root)
+        .unwrap_or(abs)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The library file for a title. Encode only ever targets movies, so a title
+/// is one file; the first indexed row wins, then the disk.
 async fn resolve_path(
     store: &Store,
     library_root: &std::path::Path,
@@ -428,16 +423,16 @@ async fn resolve_path(
         .get_title(title_id)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
+        .into_iter()
+        .find(|entry| !entry.path_missing())
     {
-        if !entry.path_missing() {
-            return Ok(library_root.join(entry.path()));
-        }
+        return Ok(library_root.join(entry.path()));
     }
     let found = scan_schema_files(library_root)
         .map_err(runtime_display)?
         .into_iter()
-        .find(|(id, _, _)| id == title_id)
-        .map(|(_, rel, _)| library_root.join(rel));
+        .find(|file| &file.title_id == title_id)
+        .map(|file| library_root.join(file.path));
     found.ok_or_else(|| AppError::Usage(format!("no library file for {}", title_id.render())))
 }
 
@@ -594,7 +589,7 @@ mod tests {
         write_schema(&library, crate::test_support::MOVIE_REL);
         write_schema(
             &library,
-            "series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.mkv",
+            "series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E01.mkv",
         );
         let scanned = scan(&probe(HEVC10), true, Some(library), Some(db))
             .await
@@ -602,7 +597,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&scanned).expect("json");
         let files = value["data"]["files"].as_array().expect("files");
         assert_eq!(files.len(), 1, "scan walks movies/ only: {files:?}");
-        assert_eq!(files[0]["title_id"], "movie:tmdb:603");
+        assert_eq!(files[0]["title_id"], "movie:key:thematrix.1999");
         assert_eq!(files[0]["decision"], "nvenc_h264");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -639,7 +634,7 @@ mod tests {
         let library = crate::test_support::library_root(&dir);
         write_schema(&library, crate::test_support::MOVIE_REL);
         let store = Store::open(dir.join("state.db")).await.expect("store");
-        let title_id = TitleId::movie("603").expect("id");
+        let title_id = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let pull = store
             .create_job(JobKind::Pull, &title_id, None)
             .await
@@ -696,7 +691,7 @@ mod tests {
         if paused {
             store.put_machine("encode_pause", "1").await.expect("pause");
         }
-        let title_id = TitleId::movie("603").expect("id");
+        let title_id = TitleId::movie_key("The.Matrix", 1999).expect("id");
         let rel = render(&title_id, &Placement::movie("The.Matrix", 1999, "mkv")).expect("rel");
         store
             .record_install(
@@ -732,20 +727,38 @@ mod tests {
     #[tokio::test]
     async fn run_title_keep_refuse_paused_and_missing() {
         let dir = crate::test_support::scratch("encode-title");
-        let keep = seeded_run(&dir, &probe(H264), Some("movie:tmdb:603"), "1", false)
-            .await
-            .expect("keep");
+        let keep = seeded_run(
+            &dir,
+            &probe(H264),
+            Some("movie:key:thematrix.1999"),
+            "1",
+            false,
+        )
+        .await
+        .expect("keep");
         let value: serde_json::Value = serde_json::from_str(&keep).expect("json");
         assert_eq!(value["data"]["skipped"], 1);
 
-        let err = seeded_run(&dir, &probe(HDR), Some("movie:tmdb:603"), "1", false)
-            .await
-            .expect_err("refuse");
+        let err = seeded_run(
+            &dir,
+            &probe(HDR),
+            Some("movie:key:thematrix.1999"),
+            "1",
+            false,
+        )
+        .await
+        .expect_err("refuse");
         assert!(matches!(err, AppError::Policy(_)), "{err}");
 
-        let paused = seeded_run(&dir, &probe(HEVC10), Some("movie:tmdb:603"), "1", true)
-            .await
-            .expect("paused");
+        let paused = seeded_run(
+            &dir,
+            &probe(HEVC10),
+            Some("movie:key:thematrix.1999"),
+            "1",
+            true,
+        )
+        .await
+        .expect("paused");
         let value: serde_json::Value = serde_json::from_str(&paused).expect("json");
         assert_eq!(value["data"]["paused"], true);
         assert_eq!(value["data"]["skipped"], 1);
@@ -771,16 +784,24 @@ mod tests {
     #[tokio::test]
     async fn run_title_nvenc_replaces_without_ffmpeg_binary() {
         let dir = crate::test_support::scratch("encode-nvenc");
-        let json = seeded_run(&dir, &ffmpeg(HEVC10), Some("movie:tmdb:603"), "1", false)
-            .await
-            .expect("nvenc");
+        let json = seeded_run(
+            &dir,
+            &ffmpeg(HEVC10),
+            Some("movie:key:thematrix.1999"),
+            "1",
+            false,
+        )
+        .await
+        .expect("nvenc");
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["data"]["ran"], 1);
         let store = Store::open(dir.join("state.db")).await.expect("store");
         let entry = store
-            .get_title(&TitleId::movie("603").expect("id"))
+            .get_title(&TitleId::movie_key("The.Matrix", 1999).expect("id"))
             .await
             .expect("title")
+            .into_iter()
+            .next()
             .expect("row");
         assert_ne!(
             entry.current_b3().as_str(),

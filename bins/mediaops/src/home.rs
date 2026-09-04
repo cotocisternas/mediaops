@@ -250,7 +250,12 @@ pub async fn pull(
         .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
 
     let mut installed = None;
-    let mut whole_file_b3 = outcome.whole_file_b3.clone();
+    let mut whole_file_b3 = {
+        let file = std::fs::File::open(&outcome.staged)
+            .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
+        mediaops_core::Blake3Hex::of_reader(file)
+            .map_err(|err| AppError::Runtime(anyhow_err(err)))?
+    };
     if do_install {
         let placement = placement.expect("validated before pull");
         let handle = VerifiedStagingHandle::verify(
@@ -315,8 +320,17 @@ fn placement_for(
     season: Option<u8>,
     episode: Option<u8>,
 ) -> Result<Placement, AppError> {
-    if let Ok((parsed_id, placement)) = parse_placement(remote_path) {
-        if parsed_id == *title_id {
+    // A schema-shaped remote path names its own placement. It must agree with
+    // `--title-id`: exactly for a key id, by kind for an *arr authority id.
+    if let Ok((parsed_id, placement)) = parse_placement(remote_path)
+        .or_else(|_| mediaops_core::parse_remote(Some(title_id.kind()), remote_path))
+    {
+        let agrees = if title_id.is_key() {
+            parsed_id == *title_id
+        } else {
+            parsed_id.kind() == title_id.kind()
+        };
+        if agrees {
             return Ok(placement);
         }
         return Err(AppError::Usage(
@@ -343,9 +357,9 @@ fn placement_for(
                     season.ok_or_else(|| {
                         AppError::Usage("--install of a series requires --season".into())
                     })?,
-                    episode.ok_or_else(|| {
+                    u16::from(episode.ok_or_else(|| {
                         AppError::Usage("--install of a series requires --episode".into())
-                    })?,
+                    })?),
                     ext,
                 )),
                 TitleKind::Album => unreachable!(),
@@ -375,13 +389,12 @@ mod tests {
     #[test]
     fn album_install_uses_parse_placement_without_title_year() {
         let title = TitleId::album("0f82b02e-c6cd-4242-b195-93d4bf3e0d63").expect("album");
-        let path = Path::new(
-            "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.The.Gates.Of.Delirium.(2013).flac",
-        );
+        let path =
+            Path::new("music/Yes/Relayer.(2013)/Relayer.(2013).01.The.Gates.Of.Delirium.flac");
         let placement = placement_for(
             &title,
             path,
-            "01.The.Gates.Of.Delirium.(2013).flac",
+            "Relayer.(2013).01.The.Gates.Of.Delirium.flac",
             None,
             None,
             None,
@@ -390,14 +403,22 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             placement,
-            Placement::track("Relayer", 2013, 1, "The.Gates.Of.Delirium", "flac")
+            Placement::track(
+                "Yes",
+                "Relayer",
+                2013,
+                None,
+                Some(1),
+                "The.Gates.Of.Delirium",
+                "flac"
+            )
         );
     }
 
     #[test]
     fn parse_placement_title_mismatch_is_usage() {
-        let title = TitleId::movie("603").expect("id");
-        let path = Path::new("movies/Other.(2000).{tmdb-604}/Other.(2000).mkv");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        let path = Path::new("movies/Other.(2000)/Other.(2000).mkv");
         let err = placement_for(
             &title,
             path,
@@ -457,7 +478,7 @@ mod tests {
             true,
             "seedbox".into(),
             PathBuf::from("a.bin"),
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             "The.Matrix.(1999).mkv".into(),
             Some(library.clone()),
             Some(lb.sock.clone()),
@@ -500,7 +521,7 @@ mod tests {
             true,
             "seedbox".into(),
             PathBuf::from(crate::test_support::MOVIE_REL),
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             "The.Matrix.(1999).mkv".into(),
             Some(library.clone()),
             Some(lb.sock.clone()),
@@ -522,9 +543,11 @@ mod tests {
         assert!(installed.contains("The.Matrix.(1999).mkv"), "{installed}");
         assert!(std::path::Path::new(installed).is_file());
         let title = store
-            .get_title(&TitleId::movie("603").expect("id"))
+            .get_title(&TitleId::movie_key("The.Matrix", 1999).expect("id"))
             .await
             .expect("title")
+            .into_iter()
+            .next()
             .expect("indexed");
         assert!(!title.path_missing());
         let _ = std::fs::remove_dir_all(dir);
@@ -540,7 +563,7 @@ mod tests {
             true,
             "seedbox".into(),
             PathBuf::from("a.bin"),
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             "The.Matrix.(1999).mkv".into(),
             Some(library),
             Some(dir.join("missing.sock")),
@@ -576,7 +599,7 @@ mod tests {
             true,
             "seedbox".into(),
             PathBuf::from("a.bin"),
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             "The.Matrix.(1999).mkv".into(),
             Some(library),
             Some(lb.sock.clone()),
@@ -608,7 +631,7 @@ mod tests {
             true,
             "seedbox".into(),
             PathBuf::from("a.bin"),
-            "movie:tmdb:603".into(),
+            "movie:key:thematrix.1999".into(),
             "The.Matrix.(1999).mkv".into(),
             None,
             Some(dir.join("missing.sock")),

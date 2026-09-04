@@ -370,10 +370,14 @@ fn library_bootstrap_creates_schema_dirs() {
     assert!(!timer.contains("OnCalendar"));
     let service = std::fs::read_to_string(units.join("mediaops-run.service")).expect("service");
     assert!(
-        service.contains("--state-db"),
-        "ExecStart must pin --state-db, got {service}"
+        service.contains(" run --state-db "),
+        "ExecStart must pin --state-db *after* the verb (clap scopes it to `run`), got {service}"
     );
     assert!(service.contains("TimeoutStartSec=infinity"));
+    assert!(
+        service.contains("Nice=10"),
+        "spinning-disk niceness: {service}"
+    );
     let value = stdout_json(&output);
     assert_eq!(value["ok"], true);
     let root = value["data"]["library_root"]
@@ -623,6 +627,9 @@ fn why_and_status_json_envelopes() {
     assert_eq!(why_v["data"]["hold"], Value::Null);
     assert_eq!(why_v["data"]["df"], Value::Null);
     assert_eq!(why_v["data"]["reclaim"], Value::Null);
+    // A dead socket: this machine may well have a live home gateway on the
+    // default one, and `df` must be judged against no daemon.
+    let dead_socket = dir.join("no-such.sock");
     let status = bin()
         .args([
             "--json",
@@ -631,6 +638,10 @@ fn why_and_status_json_envelopes() {
             db.to_str().unwrap(),
             "--plans-dir",
             dir.join("plans").to_str().unwrap(),
+            "--socket",
+            dead_socket.to_str().unwrap(),
+            "--tls-dir",
+            dir.to_str().unwrap(),
         ])
         .output()
         .expect("status");
@@ -1093,8 +1104,8 @@ fn library_relocate_rewrites_root_and_units_without_copying_media() {
     let neu = dir.join("new");
     let units = dir.join("units");
     let db = dir.join("state.db");
-    let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
-    std::fs::create_dir_all(old.join("movies/The.Matrix.(1999).{tmdb-603}")).expect("mkdir");
+    let rel = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
+    std::fs::create_dir_all(old.join("movies/The.Matrix.(1999)")).expect("mkdir");
     std::fs::write(old.join(rel), b"orig").expect("media");
     let boot = bin()
         .args([
@@ -1314,8 +1325,8 @@ fn new_machine_export_import_round_trip_on_empty_home() {
     std::fs::write(tls.join("ca.pem"), b"ca-bytes").expect("pem");
     std::fs::write(tls.join("client.key"), b"key-bytes").expect("key");
     let lib = src.join("library");
-    let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
-    std::fs::create_dir_all(lib.join("movies/The.Matrix.(1999).{tmdb-603}")).expect("mkdir");
+    let rel = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
+    std::fs::create_dir_all(lib.join("movies/The.Matrix.(1999)")).expect("mkdir");
     std::fs::write(lib.join(rel), b"orig").expect("media");
     let src_db = src.join("state.db");
     let reindex = bin()
@@ -1371,7 +1382,7 @@ fn new_machine_export_import_round_trip_on_empty_home() {
     let index: Value =
         serde_json::from_slice(&std::fs::read(bundle.join("title-index.json")).expect("index"))
             .expect("index json");
-    assert_eq!(index[0]["title_id"], "movie:tmdb:603");
+    assert_eq!(index[0]["title_id"], "movie:key:thematrix.1999");
     assert!(index[0]["install_b3"].as_str().is_some());
     assert!(index[0]["current_b3"].as_str().is_some());
 
@@ -1558,8 +1569,8 @@ fn new_machine_export_git_work_tree_is_exit_5() {
 fn library_reindex_after_loss_then_clash_is_error() {
     let dir = scratch("reindex-cli");
     let lib = dir.join("library");
-    let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
-    std::fs::create_dir_all(lib.join("movies/The.Matrix.(1999).{tmdb-603}")).expect("mkdir");
+    let rel = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
+    std::fs::create_dir_all(lib.join("movies/The.Matrix.(1999)")).expect("mkdir");
     std::fs::write(lib.join(rel), b"orig").expect("media");
     let db = dir.join("state.db");
     let first = bin()

@@ -1,29 +1,44 @@
-//! Pure grabber=None planner. No I/O.
+//! Pure planner. No I/O.
+//!
+//! Identity is per **file**: a movie is one file, a show is one file per
+//! episode, an album one per track (`FileKey`). "Already present" is checked
+//! at that grain, so a second episode of a show the disk already has one
+//! episode of still copies, and a half-copied album finishes.
 
 use std::collections::HashSet;
 
 use mediaops_core::{
-    Action, DesiredState, Grabber, HoldLiveItem, Job, JobState, RemoteEntry, SKIP_DUPLICATE_TITLE,
-    SKIP_LOCK, SKIP_MAX_COPY, SKIP_UPGRADE_NEVER, SKIP_WATERMARK, TitleId, TitleIndexEntry,
-    TitleKind, WantState, parse_placement, render, strip_placement,
+    Action, DesiredState, FileKey, Grabber, HoldLiveItem, InstalledFile, Job, JobState,
+    PathSchemaError, Placement, REVIEW_NEEDS_SPLIT, REVIEW_NEEDS_YEAR, REVIEW_UNPARSEABLE,
+    RejectBin, RemoteEntry, RemoteRef, RootKinds, SKIP_DUPLICATE_TITLE, SKIP_LOCK, SKIP_MAX_COPY,
+    SKIP_UPGRADE_NEVER, SKIP_WATERMARK, TitleId, TitleIndexEntry, TitleKind, WantState,
+    classify_remote, normalize_placement, render_placement,
 };
+
+/// Extensions the planner treats as library media. Everything else on the
+/// box (`.nfo`, `.srt`, `.jpg`, `.par2`, `.sfv`, …) is release furniture and
+/// is neither copied nor reported.
+pub const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "m4v", "avi", "ts", "mov", "webm", "wmv"];
+pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "m4a", "ogg", "opus", "wav", "aac", "aiff"];
 
 pub struct PlanRequest<'a> {
     pub listings: &'a [RemoteEntry],
+    /// Kind each allowlisted root holds (`None` = infer from shape).
+    pub root_kinds: &'a RootKinds,
     pub title_index: &'a [TitleIndexEntry],
-    /// Schema-valid files already on the library disk (TitleId only). Treated
-    /// as installed for `upgrade_never` even when sqlite has no row.
-    pub on_disk: &'a [TitleId],
+    /// Schema files already on the library disk.
+    pub on_disk: &'a [InstalledFile],
     pub open_wants: &'a [Job],
     pub desired: &'a DesiredState,
     pub free_bytes: u64,
     /// When doctor would freeze/drift, emit EdgeApply.
     pub edge_frozen: bool,
-    /// Approved holds with a live RemoteRef+placement become Copy (not Review).
+    /// Every live import-blocked item; their remotes are inbox, never Review.
+    pub holds: &'a [HoldLiveItem],
+    /// Approved holds with a live RemoteRef+placement become Copy.
     pub approved: &'a [HoldLiveItem],
-    /// *arr wanted/missing TitleIds. Unmonitor is `title_index` ∩ `on_disk` ∩
-    /// this set. A `title_index` row alone is not enough (see
-    /// [`unmonitor_actions`]), and `on_disk` alone is never enough.
+    /// *arr wanted/missing TitleIds (key form). Unmonitor is
+    /// `title_index` ∩ `on_disk` ∩ this set, movies and albums only.
     pub wanted_missing: &'a [TitleId],
 }
 
@@ -36,43 +51,84 @@ pub struct Planned {
 
 struct Candidate {
     title_id: TitleId,
-    remote: mediaops_core::RemoteRef,
+    remote: RemoteRef,
     file_len: u64,
-    placement: mediaops_core::Placement,
+    placement: Placement,
     listing_index: usize,
     kind: TitleKind,
     wanted: bool,
 }
 
-/// Build Copy/Skip actions. Upgrade class is the constant **never**.
+/// True for a file the planner would consider library media.
+pub fn is_media_file(remote: &RemoteRef) -> bool {
+    let name = remote
+        .rel_path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("sample") {
+        return false;
+    }
+    let Some((_, ext)) = lower.rsplit_once('.') else {
+        return false;
+    };
+    VIDEO_EXTENSIONS.contains(&ext) || AUDIO_EXTENSIONS.contains(&ext)
+}
+
+fn review_reason(err: &PathSchemaError) -> &'static str {
+    match err.reject_bin() {
+        Some(RejectBin::NeedsYear) => REVIEW_NEEDS_YEAR,
+        Some(RejectBin::NeedsSplit) => REVIEW_NEEDS_SPLIT,
+        None => REVIEW_UNPARSEABLE,
+    }
+}
+
+/// Build Copy/Skip/Review actions. Upgrade class is the constant **never**.
 pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
-    let mut installed: HashSet<TitleId> = req
-        .title_index
-        .iter()
-        .map(|e| e.title_id().clone())
-        .collect();
-    installed.extend(req.on_disk.iter().cloned());
+    let mut installed: HashSet<(TitleId, FileKey)> =
+        req.on_disk.iter().map(InstalledFile::identity).collect();
+    installed.extend(
+        req.title_index
+            .iter()
+            .filter_map(TitleIndexEntry::installed_file)
+            .map(|f| f.identity()),
+    );
     let wants: HashSet<TitleId> = req
         .open_wants
         .iter()
         .filter(|j| matches!(j.state(), JobState::Want(WantState::Open)))
         .map(|j| j.title_id().clone())
         .collect();
+    let held: HashSet<&RemoteRef> = req.holds.iter().filter_map(|h| h.remote.as_ref()).collect();
 
     let mut upgrade_never = Vec::new();
     let mut duplicates = Vec::new();
+    let mut reviews = Vec::new();
     let mut candidates = Vec::new();
-    let mut planned_titles = HashSet::new();
+    let mut planned_files: HashSet<(TitleId, FileKey)> = HashSet::new();
+    let mut skipped_files: HashSet<(TitleId, FileKey)> = HashSet::new();
 
     for (listing_index, entry) in req.listings.iter().enumerate() {
-        if entry.len() == 0 {
+        if entry.len() == 0 || !is_media_file(entry.r#ref()) {
             continue;
         }
-        let Ok((title_id, placement)) = parse_placement(entry.r#ref().rel_path()) else {
+        if held.contains(entry.r#ref()) {
             continue;
+        }
+        let (title_id, placement) = match classify_remote(req.root_kinds, entry) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                reviews.push(Action::Review {
+                    remote: Some(entry.r#ref().clone()),
+                    reason: review_reason(&err).to_string(),
+                });
+                continue;
+            }
         };
-        if installed.contains(&title_id) {
-            if planned_titles.insert(title_id.clone()) {
+        let identity = (title_id.clone(), placement.file_key());
+        if installed.contains(&identity) {
+            if skipped_files.insert(identity) {
                 upgrade_never.push(Action::Skip {
                     title_id: Some(title_id),
                     reason: SKIP_UPGRADE_NEVER.to_string(),
@@ -85,7 +141,7 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
             }
             continue;
         }
-        if !planned_titles.insert(title_id.clone()) {
+        if !planned_files.insert(identity) {
             duplicates.push(Action::Skip {
                 title_id: Some(title_id),
                 reason: SKIP_DUPLICATE_TITLE.to_string(),
@@ -108,14 +164,19 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         let (Some(remote), Some(placement)) = (&item.remote, &item.placement) else {
             continue;
         };
-        let placement = strip_placement(placement);
-        if render(&item.key.title_id, &placement).is_err() {
+        let placement = normalize_placement(placement);
+        if render_placement(&placement).is_err() {
             continue;
         }
-        let title_id = item.key.title_id.clone();
+        // The library identity is the key the placement names; the *arr id on
+        // the hold stays the inbox key for reject/approve.
+        let Ok(title_id) = placement.key_title_id() else {
+            continue;
+        };
         let listing_index = req.listings.len() + offset;
-        if installed.contains(&title_id) {
-            if planned_titles.insert(title_id.clone()) {
+        let identity = (title_id.clone(), placement.file_key());
+        if installed.contains(&identity) {
+            if skipped_files.insert(identity) {
                 upgrade_never.push(Action::Skip {
                     title_id: Some(title_id),
                     reason: SKIP_UPGRADE_NEVER.to_string(),
@@ -128,7 +189,7 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
             }
             continue;
         }
-        if !planned_titles.insert(title_id.clone()) {
+        if !planned_files.insert(identity) {
             duplicates.push(Action::Skip {
                 title_id: Some(title_id),
                 reason: SKIP_DUPLICATE_TITLE.to_string(),
@@ -139,14 +200,14 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
             .listings
             .iter()
             .find(|entry| entry.r#ref() == remote)
-            .map(mediaops_core::RemoteEntry::len)
+            .map(RemoteEntry::len)
             .unwrap_or(item.size);
         if file_len == 0 {
             continue;
         }
         let kind = title_id.kind();
         candidates.push(Candidate {
-            wanted: wants.contains(&title_id),
+            wanted: wants.contains(&title_id) || wants.contains(&item.key.title_id),
             title_id,
             remote: remote.clone(),
             file_len,
@@ -185,6 +246,7 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         }
         actions.extend(upgrade_never);
         actions.extend(duplicates);
+        actions.extend(reviews);
         actions.extend(unmonitor_actions(
             req.desired.grabber(),
             req.title_index,
@@ -247,6 +309,7 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
 
     actions.extend(upgrade_never);
     actions.extend(duplicates);
+    actions.extend(reviews);
     actions.extend(unmonitor_actions(
         req.desired.grabber(),
         req.title_index,
@@ -284,14 +347,14 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
 fn unmonitor_actions(
     grabber: Grabber,
     title_index: &[TitleIndexEntry],
-    on_disk: &[TitleId],
+    on_disk: &[InstalledFile],
     wanted_missing: &[TitleId],
 ) -> Vec<Action> {
     if grabber != Grabber::Servarr {
         return Vec::new();
     }
     let missing: HashSet<&TitleId> = wanted_missing.iter().collect();
-    let present: HashSet<&TitleId> = on_disk.iter().collect();
+    let present: HashSet<&TitleId> = on_disk.iter().map(|f| &f.title_id).collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for entry in title_index {
@@ -312,9 +375,10 @@ fn unmonitor_actions(
 mod tests {
     use super::*;
     use mediaops_core::{
-        Bytes, JobId, JobState, RemoteEntry, RemoteRef, TitleIndexEntry, WantState,
+        Bytes, HoldKey, JobId, JobState, ReleaseId, RemoteEntry, RemoteRef, TitleIndexEntry,
+        WantState,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     const DS: &str = r#"
 schema_version = 1
@@ -325,52 +389,75 @@ max_nvenc = 1
 lock = false
 "#;
 
-    fn ds() -> DesiredState {
-        DesiredState::from_toml(DS).expect("ds")
+    fn ds() -> &'static DesiredState {
+        static PARSED: std::sync::LazyLock<DesiredState> =
+            std::sync::LazyLock::new(|| DesiredState::from_toml(DS).expect("ds"));
+        &PARSED
     }
 
-    fn ds_servarr() -> DesiredState {
-        DesiredState::from_toml(&format!("{DS}\ngrabber = \"servarr\"\n")).expect("ds")
+    fn ds_servarr() -> &'static DesiredState {
+        static PARSED: std::sync::LazyLock<DesiredState> = std::sync::LazyLock::new(|| {
+            DesiredState::from_toml(&format!("{DS}\ngrabber = \"servarr\"\n")).expect("ds")
+        });
+        &PARSED
     }
 
-    fn ds_servarr_locked() -> DesiredState {
-        DesiredState::from_toml(
-            r#"
-schema_version = 1
-max_copy_gib = 1
-min_free_gib = 1
-range_len_mib = 8
-max_nvenc = 1
-lock = true
-grabber = "servarr"
-"#,
-        )
-        .expect("ds")
+    fn ds_locked() -> &'static DesiredState {
+        static PARSED: std::sync::LazyLock<DesiredState> = std::sync::LazyLock::new(|| {
+            DesiredState::from_toml(&DS.replace("lock = false", "lock = true")).expect("ds")
+        });
+        &PARSED
     }
 
     fn digest(fill: char) -> mediaops_core::Blake3Hex {
         mediaops_core::Blake3Hex::parse(&fill.to_string().repeat(64)).expect("d")
     }
 
-    fn entry(rel: &str, len: u64) -> RemoteEntry {
+    /// Roots as this operator's box has them: `movies`, `tv`, `music`.
+    fn kinds() -> RootKinds {
+        RootKinds::from([
+            ("movies".to_string(), Some(TitleKind::Movie)),
+            ("tv".to_string(), Some(TitleKind::Series)),
+            ("music".to_string(), Some(TitleKind::Album)),
+            ("usenet_movies".to_string(), Some(TitleKind::Movie)),
+        ])
+    }
+
+    fn entry_in(root: &str, rel: &str, len: u64) -> RemoteEntry {
         RemoteEntry::from_wire_parts(
-            RemoteRef::from_wire_parts("seed".into(), PathBuf::from(rel)).expect("ref"),
+            RemoteRef::from_wire_parts(root.into(), PathBuf::from(rel)).expect("ref"),
             len,
             0,
             1,
         )
     }
 
-    fn movie_rel(id: &str, year: u16) -> String {
-        format!("movies/Title.({year}).{{tmdb-{id}}}/Title.({year}).mkv")
+    fn movie(name: &str, year: u16, len: u64) -> RemoteEntry {
+        entry_in(
+            "movies",
+            &format!("{name}.({year})/{name}.({year}).mkv"),
+            len,
+        )
     }
 
-    fn album_rel() -> &'static str {
-        "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/01.The.Gates.Of.Delirium.(2013).flac"
+    fn episode(show: &str, year: u16, s: u8, e: u16, len: u64) -> RemoteEntry {
+        entry_in(
+            "tv",
+            &format!("{show}.({year})/Season.{s:02}/{show}.({year}).S{s:02}E{e:02}.mkv"),
+            len,
+        )
     }
 
-    fn series_rel() -> &'static str {
-        "series/The.Wire.(2002).{tvdb-79126}/The.Wire.(2002).S01E01.mkv"
+    fn track(artist: &str, album: &str, year: u16, n: u8, title: &str, len: u64) -> RemoteEntry {
+        entry_in(
+            "music",
+            &format!("{artist}/{album}.({year})/{album}.({year}).{n:02}.{title}.flac"),
+            len,
+        )
+    }
+
+    fn on_disk(rel: &str) -> InstalledFile {
+        InstalledFile::from_rel_path(Path::new(rel)).expect("on disk")
     }
 
     fn want(title: TitleId) -> Job {
@@ -383,837 +470,486 @@ grabber = "servarr"
         .expect("want")
     }
 
-    fn copies(actions: &[Action]) -> Vec<&TitleId> {
+    fn copies(actions: &[Action]) -> Vec<String> {
         actions
             .iter()
             .filter_map(|a| match a {
-                Action::Copy { title_id, .. } => Some(title_id),
+                Action::Copy {
+                    title_id,
+                    placement,
+                    ..
+                } => Some(format!("{} {}", title_id.render(), placement.label())),
                 _ => None,
             })
             .collect()
     }
 
+    fn skips(actions: &[Action], reason: &str) -> usize {
+        actions
+            .iter()
+            .filter(|a| matches!(a, Action::Skip { reason: r, .. } if r == reason))
+            .count()
+    }
+
+    fn request<'a>(
+        listings: &'a [RemoteEntry],
+        kinds: &'a RootKinds,
+        title_index: &'a [TitleIndexEntry],
+        on_disk: &'a [InstalledFile],
+        desired: &'a DesiredState,
+    ) -> PlanRequest<'a> {
+        PlanRequest {
+            listings,
+            root_kinds: kinds,
+            title_index,
+            on_disk,
+            open_wants: &[],
+            desired,
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            holds: &[],
+            approved: &[],
+            wanted_missing: &[],
+        }
+    }
+
     #[test]
     fn planner_music_first_then_movie_then_series() {
         let listings = [
-            entry(&movie_rel("603", 1999), 10),
-            entry(series_rel(), 10),
-            entry(album_rel(), 10),
+            movie("Coco", 2017, 10),
+            episode("Silo", 2023, 1, 1, 10),
+            track("Tool", "Lateralus", 2001, 1, "The.Grudge", 10),
         ];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        let ids: Vec<String> = copies(&planned.actions)
-            .into_iter()
-            .map(|t| t.render())
-            .collect();
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
         assert_eq!(
-            ids,
+            copies(&planned.actions),
             vec![
-                "album:mbid:0f82b02e-c6cd-4242-b195-93d4bf3e0d63".to_string(),
-                "movie:tmdb:603".to_string(),
-                "series:tvdb:79126".to_string(),
+                "album:key:tool.lateralus Tool/Lateralus.(2001) 01",
+                "movie:key:coco.2017 Coco.(2017)",
+                "series:key:silo.2023 Silo.(2023) S01E01",
             ]
         );
         assert!(!planned.first_candidate_breaches);
     }
 
     #[test]
-    fn installed_is_skip_upgrade_never_not_auto_upgrade_1080p_to_4k_remux_because_disk_is_bored() {
-        let title = TitleId::movie("603").expect("id");
+    fn every_episode_and_track_is_its_own_copy() {
         let listings = [
-            entry(&movie_rel("603", 1999), 10),
-            entry(&movie_rel("604", 2000), 10),
+            episode("Silo", 2023, 1, 1, 10),
+            episode("Silo", 2023, 1, 2, 10),
+            episode("Silo", 2023, 2, 1, 10),
+            track("Tool", "Lateralus", 2001, 1, "The.Grudge", 10),
+            track("Tool", "Lateralus", 2001, 2, "Eon.Blue.Apocalypse", 10),
         ];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
+        assert_eq!(copies(&planned.actions).len(), 5, "{:?}", planned.actions);
+        assert_eq!(skips(&planned.actions, SKIP_DUPLICATE_TITLE), 0);
+    }
+
+    #[test]
+    fn present_episode_is_skipped_but_missing_sibling_still_copies() {
+        let listings = [
+            episode("Silo", 2023, 1, 1, 10),
+            episode("Silo", 2023, 1, 2, 10),
+        ];
+        let disk = [on_disk(
+            "series/Silo.(2023)/Season.01/Silo.(2023).S01E01.mkv",
+        )];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &disk, ds()));
+        assert_eq!(
+            copies(&planned.actions),
+            vec!["series:key:silo.2023 Silo.(2023) S01E02"]
+        );
+        assert_eq!(skips(&planned.actions, SKIP_UPGRADE_NEVER), 1);
+    }
+
+    #[test]
+    fn half_copied_album_finishes_and_remaster_counts_as_present() {
+        let listings = [
+            track("Yes", "Relayer", 1974, 1, "The.Gates.Of.Delirium", 10),
+            track("Yes", "Relayer", 1974, 2, "Sound.Chaser", 10),
+        ];
+        // Local has the 2013 remaster's track 1 only.
+        let disk = [on_disk(
+            "music/Yes/Relayer.(2013)/Relayer.(2013).01.The.Gates.Of.Delirium.flac",
+        )];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &disk, ds()));
+        assert_eq!(
+            copies(&planned.actions),
+            vec!["album:key:yes.relayer Yes/Relayer.(1974) 02"]
+        );
+    }
+
+    #[test]
+    fn movie_present_on_disk_or_in_index_is_upgrade_never() {
+        let listings = [movie("Coco", 2017, 10), movie("Up", 2009, 10)];
         let index = [TitleIndexEntry::new(
-            title.clone(),
-            movie_rel("603", 1999),
+            TitleId::movie_key("Coco", 2017).expect("id"),
+            "movies/Coco.(2017)/Coco.(2017).mkv",
             digest('a'),
             digest('a'),
         )];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &index,
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Skip {
-                    title_id: Some(id),
-                    reason
-                } if *id == title && reason == SKIP_UPGRADE_NEVER
-            )),
-            "auto-upgrade 1080p → 4k remux because disk is bored must never happen: {:?}",
-            planned.actions
-        );
-        let copied = copies(&planned.actions);
-        assert_eq!(copied, vec![&TitleId::movie("604").expect("604")]);
-        assert!(
-            !planned
-                .actions
-                .iter()
-                .any(|a| matches!(a, Action::DeleteRemote { .. })),
-            "Copy/Skip must never emit DeleteRemote: {:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn watermark_skip_rest_of_class() {
-        let listings = [
-            entry(&movie_rel("603", 1999), 200),
-            entry(&movie_rel("604", 2000), 10),
-        ];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: Bytes::GIB + 100,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(
-            planned.actions.iter().all(|a| matches!(
-                a,
-                Action::Skip {
-                    reason,
-                    ..
-                } if reason == SKIP_WATERMARK
-            )),
-            "{:?}",
-            planned.actions
-        );
-        assert!(planned.first_candidate_breaches);
+        let disk = [on_disk("movies/Up.(2009)/Up.(2009).mkv")];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &index, &disk, ds()));
         assert!(copies(&planned.actions).is_empty());
+        assert_eq!(skips(&planned.actions, SKIP_UPGRADE_NEVER), 2);
     }
 
     #[test]
-    fn max_copy_skip() {
-        let listings = [entry(&movie_rel("603", 1999), Bytes::GIB + 1)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 4 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Skip {
+    fn spaced_arr_folders_still_match_the_dotted_local_library() {
+        // Radarr made the folder before dotted naming; the file is dotted.
+        let listings = [entry_in(
+            "movies",
+            "Spider-Man - Brand New Day (2026)/Spider-Man.Brand.New.Day.(2026).mkv",
+            10,
+        )];
+        let disk = [on_disk(
+            "movies/Spider-Man.Brand.New.Day.(2026)/Spider-Man.Brand.New.Day.(2026).mkv",
+        )];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &disk, ds()));
+        assert!(copies(&planned.actions).is_empty(), "{:?}", planned.actions);
+        assert_eq!(skips(&planned.actions, SKIP_UPGRADE_NEVER), 1);
+    }
+
+    #[test]
+    fn second_remote_for_the_same_file_is_duplicate_title() {
+        let listings = [
+            movie("Coco", 2017, 10),
+            entry_in("usenet_movies", "Coco.(2017)/Coco.(2017).mkv", 12),
+        ];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
+        assert_eq!(copies(&planned.actions).len(), 1);
+        assert_eq!(skips(&planned.actions, SKIP_DUPLICATE_TITLE), 1);
+        // The media root wins because listings are sorted by root id.
+        assert!(matches!(
+            &planned.actions[0],
+            Action::Copy { remote, .. } if remote.root_id() == "movies"
+        ));
+    }
+
+    #[test]
+    fn unplaceable_media_is_review_and_furniture_is_silent() {
+        let listings = [
+            entry_in(
+                "usenet_movies",
+                "Some.Movie.2024.1080p.WEB-DL-GROUP/Some.Movie.2024.1080p.WEB-DL-GROUP.mkv",
+                10,
+            ),
+            entry_in("movies", "No.Year/No.Year.mkv", 10),
+            entry_in("movies", "Coco.(2017)/Coco.(2017).nfo", 10),
+            entry_in("movies", "Coco.(2017)/Sample/Coco.(2017).sample.mkv", 10),
+            entry_in("usenet_movies", "Job/file.par2", 10),
+        ];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
+        let reviews: Vec<(String, String)> = planned
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Review {
+                    remote: Some(r),
                     reason,
-                    ..
-                } if reason == SKIP_MAX_COPY
-            )),
+                } => Some((r.rel_path().display().to_string(), reason.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reviews,
+            vec![
+                (
+                    "Some.Movie.2024.1080p.WEB-DL-GROUP/Some.Movie.2024.1080p.WEB-DL-GROUP.mkv"
+                        .to_string(),
+                    REVIEW_NEEDS_YEAR.to_string()
+                ),
+                (
+                    "No.Year/No.Year.mkv".to_string(),
+                    REVIEW_NEEDS_YEAR.to_string()
+                ),
+            ],
             "{:?}",
             planned.actions
         );
-        assert!(planned.first_candidate_breaches);
+        assert!(copies(&planned.actions).is_empty());
+        assert_eq!(planned.actions.len(), 2, "nfo/sample/par2 are silent");
     }
 
     #[test]
-    fn unparseable_remotes_are_omitted() {
-        let listings = [
-            entry("movies/Not.A.Schema.mkv", 10),
-            entry("needs-year/x.mkv", 10),
-            entry(&movie_rel("603", 1999), 10),
-        ];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert_eq!(planned.actions.len(), 1);
-        assert!(matches!(planned.actions[0], Action::Copy { .. }));
+    fn a_live_hold_remote_is_inbox_not_review() {
+        let rel = "Some.Movie.2024.1080p-GROUP/Some.Movie.2024.1080p-GROUP.mkv";
+        let listings = [entry_in("usenet_movies", rel, 10)];
+        let mut hold = HoldLiveItem::new(
+            HoldKey::new(
+                TitleId::movie("603").expect("tmdb"),
+                ReleaseId::parse("deadbeef").expect("release"),
+            ),
+            0,
+            10,
+            "importBlocked",
+        );
+        hold.remote = Some(listings[0].r#ref().clone());
+        let kinds = kinds();
+        let mut req = request(&listings, &kinds, &[], &[], ds());
+        let holds = [hold];
+        req.holds = &holds;
+        let planned = plan_actions(req);
+        assert!(planned.actions.is_empty(), "{:?}", planned.actions);
+    }
+
+    #[test]
+    fn approved_hold_copies_under_its_arr_title_as_a_key_identity() {
+        let rel = "Some.Movie.2024.1080p-GROUP/Some.Movie.2024.1080p-GROUP.mkv";
+        let listings = [entry_in("usenet_movies", rel, 10)];
+        let mut hold = HoldLiveItem::new(
+            HoldKey::new(
+                TitleId::movie("603").expect("tmdb"),
+                ReleaseId::parse("deadbeef").expect("release"),
+            ),
+            0,
+            10,
+            "importBlocked",
+        );
+        hold.remote = Some(listings[0].r#ref().clone());
+        hold.placement = Some(Placement::movie("Some Movie: Part II", 2024, "mkv"));
+        let kinds = kinds();
+        let holds = [hold.clone()];
+        let approved = [hold];
+        let mut req = request(&listings, &kinds, &[], &[], ds());
+        req.holds = &holds;
+        req.approved = &approved;
+        let planned = plan_actions(req);
+        assert_eq!(
+            copies(&planned.actions),
+            vec!["movie:key:somemoviepartii.2024 Some.Movie.Part.II.(2024)"]
+        );
+        match &planned.actions[0] {
+            Action::Copy { placement, .. } => {
+                assert_eq!(
+                    render_placement(placement)
+                        .expect("render")
+                        .to_str()
+                        .expect("utf8"),
+                    "movies/Some.Movie.Part.II.(2024)/Some.Movie.Part.II.(2024).mkv"
+                );
+            }
+            other => panic!("expected Copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approved_hold_already_on_disk_is_upgrade_never() {
+        let rel = "Coco.2017.1080p-GROUP/Coco.2017.1080p-GROUP.mkv";
+        let listings = [entry_in("usenet_movies", rel, 10)];
+        let mut hold = HoldLiveItem::new(
+            HoldKey::new(
+                TitleId::movie("354912").expect("tmdb"),
+                ReleaseId::parse("cafe").expect("release"),
+            ),
+            0,
+            10,
+            "importBlocked",
+        );
+        hold.remote = Some(listings[0].r#ref().clone());
+        hold.placement = Some(Placement::movie("Coco", 2017, "mkv"));
+        let disk = [on_disk("movies/Coco.(2017)/Coco.(2017).mkv")];
+        let kinds = kinds();
+        let holds = [hold.clone()];
+        let approved = [hold];
+        let mut req = request(&listings, &kinds, &[], &disk, ds());
+        req.holds = &holds;
+        req.approved = &approved;
+        let planned = plan_actions(req);
+        assert!(copies(&planned.actions).is_empty());
+        assert_eq!(skips(&planned.actions, SKIP_UPGRADE_NEVER), 1);
     }
 
     #[test]
     fn want_prioritizes_matching_title_within_kind() {
-        let listings = [
-            entry(&movie_rel("603", 1999), 10),
-            entry(&movie_rel("604", 2000), 10),
-        ];
-        let wanted = TitleId::movie("604").expect("604");
-        let wants = [want(wanted.clone())];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &wants,
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        let ids: Vec<String> = copies(&planned.actions)
-            .into_iter()
-            .map(|t| t.render())
-            .collect();
+        let listings = [movie("Alpha", 2001, 10), movie("Beta", 2002, 10)];
+        let wants = [want(TitleId::movie_key("Beta", 2002).expect("id"))];
+        let kinds = kinds();
+        let mut req = request(&listings, &kinds, &[], &[], ds());
+        req.open_wants = &wants;
+        let planned = plan_actions(req);
         assert_eq!(
-            ids,
-            vec!["movie:tmdb:604".to_string(), "movie:tmdb:603".to_string()]
+            copies(&planned.actions),
+            vec![
+                "movie:key:beta.2002 Beta.(2002)",
+                "movie:key:alpha.2001 Alpha.(2001)"
+            ]
         );
     }
 
-    fn extra_album_rel() -> &'static str {
-        "music/Relayer.(2013).{mbid-0f82b02e-c6cd-4242-b195-93d4bf3e0d63}/02.Sound.Chaser.(2013).flac"
-    }
-
     #[test]
-    fn extra_files_sharing_title_id_are_skip_duplicate_title() {
-        let listings = [entry(album_rel(), 10), entry(extra_album_rel(), 10)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
+    fn max_copy_blocks_the_rest_of_the_class_and_watermark_the_rest() {
+        // max_copy 1 GiB: first movie fits, second does not, third is skipped too.
+        let listings = [
+            movie("A", 2001, 600 * Bytes::MIB),
+            movie("B", 2002, 600 * Bytes::MIB),
+            movie("C", 2003, 10),
+            episode("S", 2020, 1, 1, 10),
+        ];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
+        assert_eq!(
+            copies(&planned.actions),
+            vec![
+                "movie:key:a.2001 A.(2001)",
+                "series:key:s.2020 S.(2020) S01E01"
+            ]
+        );
+        assert_eq!(skips(&planned.actions, SKIP_MAX_COPY), 2);
+
+        // Watermark: free 1.5 GiB, min_free 1 GiB → only 0.5 GiB of copies fit.
+        let listings = [
+            movie("A", 2001, 400 * Bytes::MIB),
+            movie("B", 2002, 400 * Bytes::MIB),
+        ];
+        let mut req = request(&listings, &kinds, &[], &[], ds());
+        req.free_bytes = Bytes::GIB + 512 * Bytes::MIB;
+        let planned = plan_actions(req);
         assert_eq!(copies(&planned.actions).len(), 1);
-        assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Skip {
-                    reason,
-                    ..
-                } if reason == SKIP_DUPLICATE_TITLE
-            )),
-            "{:?}",
-            planned.actions
-        );
-    }
+        assert_eq!(skips(&planned.actions, SKIP_WATERMARK), 1);
+        assert!(!planned.first_candidate_breaches);
 
-    #[test]
-    fn install_b3_and_wanted_missing_emits_unmonitor() {
-        let title = TitleId::movie("603").expect("id");
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            movie_rel("603", 1999),
-            digest('a'),
-            digest('a'),
-        )];
-        let missing = [title.clone()];
-        let disk = [title.clone()];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &disk,
-            open_wants: &[],
-            desired: &ds_servarr(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &missing,
-        });
-        assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Unmonitor { title_id } if *title_id == title
-            )),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn grabber_none_does_not_unmonitor_even_when_missing() {
-        let title = TitleId::movie("603").expect("id");
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            movie_rel("603", 1999),
-            digest('a'),
-            digest('a'),
-        )];
-        let missing = [title.clone()];
-        let disk = [title];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &disk,
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &missing,
-        });
-        assert!(
-            planned
-                .actions
-                .iter()
-                .all(|a| !matches!(a, Action::Unmonitor { .. })),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn lock_true_still_unmonitors_install_b3_intersect_missing() {
-        let title = TitleId::movie("603").expect("id");
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            movie_rel("603", 1999),
-            digest('a'),
-            digest('a'),
-        )];
-        let missing = [title.clone()];
-        let disk = [title.clone()];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &disk,
-            open_wants: &[],
-            desired: &ds_servarr_locked(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &missing,
-        });
-        assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Unmonitor { title_id } if *title_id == title
-            )),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn on_disk_without_title_index_row_does_not_unmonitor() {
-        let title = TitleId::movie("603").expect("id");
-        let missing = [title.clone()];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &[],
-            on_disk: std::slice::from_ref(&title),
-            open_wants: &[],
-            desired: &ds_servarr(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &missing,
-        });
-        assert!(
-            planned
-                .actions
-                .iter()
-                .all(|a| !matches!(a, Action::Unmonitor { .. })),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn title_index_without_wanted_missing_does_not_unmonitor() {
-        let title = TitleId::movie("603").expect("id");
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            movie_rel("603", 1999),
-            digest('a'),
-            digest('a'),
-        )];
-        let disk = [title];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &disk,
-            open_wants: &[],
-            desired: &ds_servarr(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(
-            planned
-                .actions
-                .iter()
-                .all(|a| !matches!(a, Action::Unmonitor { .. })),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn series_with_one_installed_episode_is_not_unmonitored() {
-        let title = TitleId::series("79126").expect("id");
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            series_rel(),
-            digest('a'),
-            digest('a'),
-        )];
-        // Sonarr collapses every still-missing episode onto the parent id, so a
-        // series in wanted/missing means episodes are outstanding, not that the
-        // grabber lost track of a complete show.
-        let missing = [title.clone()];
-        let disk = [title];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &disk,
-            open_wants: &[],
-            desired: &ds_servarr(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &missing,
-        });
-        assert!(
-            planned
-                .actions
-                .iter()
-                .all(|a| !matches!(a, Action::Unmonitor { .. })),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn album_install_still_unmonitors() {
-        let title = TitleId::album("0f82b02e-c6cd-4242-b195-93d4bf3e0d63").expect("id");
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            album_rel(),
-            digest('a'),
-            digest('a'),
-        )];
-        let missing = [title.clone()];
-        let disk = [title.clone()];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &disk,
-            open_wants: &[],
-            desired: &ds_servarr(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &missing,
-        });
-        assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Unmonitor { title_id } if *title_id == title
-            )),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn title_index_row_whose_file_is_gone_does_not_unmonitor() {
-        let title = TitleId::movie("603").expect("id");
-        // The operator deleted the file to reclaim space; nothing removes the
-        // row, so only the on-disk scan can tell us the library no longer has it.
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            movie_rel("603", 1999),
-            digest('a'),
-            digest('a'),
-        )];
-        let missing = [title];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds_servarr(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &missing,
-        });
-        assert!(
-            planned
-                .actions
-                .iter()
-                .all(|a| !matches!(a, Action::Unmonitor { .. })),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn on_disk_schema_files_are_upgrade_never() {
-        let title = TitleId::movie("603").expect("id");
-        let listings = [entry(&movie_rel("603", 1999), 10)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: std::slice::from_ref(&title),
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
+        let listings = [movie("Huge", 2001, 3 * Bytes::GIB)];
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
+        assert!(planned.first_candidate_breaches);
         assert!(copies(&planned.actions).is_empty());
-        assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Skip {
-                    title_id: Some(id),
-                    reason
-                } if *id == title && reason == SKIP_UPGRADE_NEVER
-            )),
-            "{:?}",
-            planned.actions
-        );
     }
 
     #[test]
-    fn lock_true_skips_every_candidate() {
-        let toml = r#"
-schema_version = 1
-max_copy_gib = 1
-min_free_gib = 1
-range_len_mib = 8
-max_nvenc = 1
-lock = true
-"#;
-        let desired = DesiredState::from_toml(toml).expect("ds");
-        let listings = [entry(&movie_rel("603", 1999), 10)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &desired,
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
+    fn lock_skips_every_candidate_with_lock_reason() {
+        let listings = [movie("A", 2001, 10), episode("S", 2020, 1, 1, 10)];
+        let kinds = kinds();
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds_locked()));
         assert!(copies(&planned.actions).is_empty());
-        assert!(
-            planned.actions.iter().all(|a| matches!(
-                a,
-                Action::Skip {
-                    reason,
-                    ..
-                } if reason == SKIP_LOCK
-            )),
-            "{:?}",
-            planned.actions
-        );
+        assert_eq!(skips(&planned.actions, SKIP_LOCK), 2);
         assert!(!planned.first_candidate_breaches);
     }
 
     #[test]
-    fn min_free_zero_does_not_copy_a_file_larger_than_free_disk() {
-        let toml = r#"
-schema_version = 1
-max_copy_gib = 1
-min_free_gib = 0
-range_len_mib = 8
-max_nvenc = 1
-lock = false
-"#;
-        let desired = DesiredState::from_toml(toml).expect("ds");
-        let listings = [entry(&movie_rel("603", 1999), 50)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &desired,
-            free_bytes: 10,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(copies(&planned.actions).is_empty());
+    fn servarr_inserts_grab_apply_first_and_frozen_edge_before_it() {
+        let listings = [movie("A", 2001, 10)];
+        let kinds = kinds();
+        let mut req = request(&listings, &kinds, &[], &[], ds_servarr());
+        req.edge_frozen = true;
+        let planned = plan_actions(req);
+        assert!(matches!(planned.actions[0], Action::EdgeApply));
+        assert!(matches!(planned.actions[1], Action::GrabApply));
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
         assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Skip {
-                    reason,
-                    ..
-                } if reason == SKIP_WATERMARK
-            )),
-            "{:?}",
-            planned.actions
-        );
-        assert!(planned.first_candidate_breaches);
-    }
-
-    #[test]
-    fn servarr_grabber_emits_grab_apply() {
-        let toml = r#"
-schema_version = 1
-max_copy_gib = 1
-min_free_gib = 1
-range_len_mib = 8
-max_nvenc = 1
-lock = false
-grabber = "servarr"
-"#;
-        let desired = DesiredState::from_toml(toml).expect("ds");
-        let listings = [entry(&movie_rel("603", 1999), 10)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &desired,
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(
-            matches!(planned.actions.first(), Some(Action::GrabApply)),
-            "{:?}",
-            planned.actions
+            !planned
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::GrabApply | Action::EdgeApply))
         );
     }
 
     #[test]
-    fn lock_true_servarr_still_emits_grab_apply() {
-        let toml = r#"
-schema_version = 1
-max_copy_gib = 1
-min_free_gib = 1
-range_len_mib = 8
-max_nvenc = 1
-lock = true
-grabber = "servarr"
-"#;
-        let desired = DesiredState::from_toml(toml).expect("ds");
-        let listings = [entry(&movie_rel("603", 1999), 10)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &desired,
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(
-            matches!(planned.actions.first(), Some(Action::GrabApply)),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn edge_frozen_emits_edge_apply_first() {
-        let desired = ds();
-        let listings = [entry(&movie_rel("603", 1999), 10)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &desired,
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: true,
-            approved: &[],
-            wanted_missing: &[],
-        });
-        assert!(
-            matches!(planned.actions.first(), Some(Action::EdgeApply)),
-            "{:?}",
-            planned.actions
-        );
-    }
-
-    #[test]
-    fn approved_hold_with_live_remote_is_copy_not_review_or_scene_name() {
-        let title = TitleId::movie("603").expect("id");
-        let remote =
-            RemoteRef::from_wire_parts("seed".into(), PathBuf::from("The.Matrix.1999.REPACK.mkv"))
-                .expect("ref");
-        let mut item = HoldLiveItem::new(
-            mediaops_core::HoldKey::new(
-                title.clone(),
-                mediaops_core::ReleaseId::parse("abc").expect("id"),
+    fn unmonitor_needs_index_and_disk_and_wanted_missing_and_never_series() {
+        let coco = TitleId::movie_key("Coco", 2017).expect("id");
+        let silo = TitleId::series_key("Silo", 2023).expect("id");
+        let index = [
+            TitleIndexEntry::new(
+                coco.clone(),
+                "movies/Coco.(2017)/Coco.(2017).mkv",
+                digest('a'),
+                digest('a'),
             ),
-            1,
-            10,
-            "blocked",
-        );
-        item.remote = Some(remote.clone());
-        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: std::slice::from_ref(&item),
-            wanted_missing: &[],
-        });
-        assert!(
-            planned.actions.iter().all(|a| !matches!(a, Action::Review)),
-            "do not use Action::Review: {:?}",
-            planned.actions
-        );
-        match &planned.actions[..] {
-            [
-                Action::Copy {
-                    title_id,
-                    remote: copy_remote,
-                    placement,
-                    ..
-                },
-            ] => {
-                assert_eq!(title_id, &title);
-                assert_eq!(copy_remote, &remote);
-                assert_eq!(
-                    *placement,
-                    mediaops_core::Placement::movie("The.Matrix", 1999, "mkv")
-                );
-                let dest = render(title_id, placement).expect("schema");
-                assert!(
-                    dest.to_str().expect("utf8").contains("The.Matrix.(1999)"),
-                    "Copy must land on PathSchema, not the scene name: {}",
-                    dest.display()
-                );
-                assert!(!dest.to_str().expect("utf8").contains("REPACK"));
-            }
-            other => panic!("expected one Copy, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn approved_hold_already_in_title_index_is_upgrade_never() {
-        let title = TitleId::movie("603").expect("id");
-        let mut item = HoldLiveItem::new(
-            mediaops_core::HoldKey::new(
-                title.clone(),
-                mediaops_core::ReleaseId::parse("abc").expect("id"),
+            TitleIndexEntry::new(
+                silo.clone(),
+                "series/Silo.(2023)/Season.01/Silo.(2023).S01E01.mkv",
+                digest('b'),
+                digest('b'),
             ),
-            1,
-            10,
-            "blocked",
-        );
-        item.remote = Some(
-            RemoteRef::from_wire_parts("seed".into(), PathBuf::from("The.Matrix.1999.mkv"))
-                .expect("ref"),
-        );
-        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
-        let index = [TitleIndexEntry::new(
-            title.clone(),
-            movie_rel("603", 1999),
-            digest('a'),
-            digest('a'),
-        )];
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &index,
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: std::slice::from_ref(&item),
-            wanted_missing: &[],
-        });
-        assert!(copies(&planned.actions).is_empty());
+        ];
+        let disk = [
+            on_disk("movies/Coco.(2017)/Coco.(2017).mkv"),
+            on_disk("series/Silo.(2023)/Season.01/Silo.(2023).S01E01.mkv"),
+        ];
+        let missing = [coco.clone(), silo.clone()];
+        let kinds = kinds();
+        let mut req = request(&[], &kinds, &index, &disk, ds_servarr());
+        req.wanted_missing = &missing;
+        let planned = plan_actions(req);
+        let unmonitors: Vec<&TitleId> = planned
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Unmonitor { title_id } => Some(title_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unmonitors, vec![&coco], "{:?}", planned.actions);
+
+        // Index without disk: nothing; disk without index: nothing.
+        let mut req = request(&[], &kinds, &index, &[], ds_servarr());
+        req.wanted_missing = &missing;
         assert!(
-            planned.actions.iter().any(|a| matches!(
-                a,
-                Action::Skip {
-                    title_id: Some(id),
-                    reason
-                } if *id == title && reason == SKIP_UPGRADE_NEVER
-            )),
-            "{:?}",
-            planned.actions
+            !plan_actions(req)
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Unmonitor { .. }))
+        );
+        let mut req = request(&[], &kinds, &[], &disk, ds_servarr());
+        req.wanted_missing = &missing;
+        assert!(
+            !plan_actions(req)
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Unmonitor { .. }))
+        );
+        // grabber=None never unmonitors.
+        let mut req = request(&[], &kinds, &index, &disk, ds());
+        req.wanted_missing = &missing;
+        assert!(plan_actions(req).actions.is_empty());
+        // Lock still unmonitors.
+        let locked = DesiredState::from_toml(&format!(
+            "{}\ngrabber = \"servarr\"\n",
+            DS.replace("lock = false", "lock = true")
+        ))
+        .expect("ds");
+        let mut req = request(&[], &kinds, &index, &disk, &locked);
+        req.wanted_missing = &missing;
+        assert!(
+            plan_actions(req)
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Unmonitor { .. }))
         );
     }
 
     #[test]
-    fn approved_hold_file_len_prefers_listing_and_skips_zero() {
-        let title = TitleId::movie("603").expect("id");
-        let remote =
-            RemoteRef::from_wire_parts("seed".into(), PathBuf::from("The.Matrix.1999.mkv"))
-                .expect("ref");
-        let mut item = HoldLiveItem::new(
-            mediaops_core::HoldKey::new(
-                title.clone(),
-                mediaops_core::ReleaseId::parse("abc").expect("id"),
+    fn kind_is_inferred_when_a_root_declares_none() {
+        let kinds = RootKinds::from([("box".to_string(), None)]);
+        let listings = [
+            entry_in("box", "Coco.(2017)/Coco.(2017).mkv", 10),
+            entry_in("box", "Silo.(2023)/Season.01/Silo.(2023).S01E01.mkv", 10),
+            entry_in(
+                "box",
+                "Tool/Lateralus.(2001)/Lateralus.(2001).01.The.Grudge.flac",
+                10,
             ),
-            1,
-            10,
-            "blocked",
-        );
-        item.remote = Some(remote.clone());
-        item.placement = Some(mediaops_core::Placement::movie("The.Matrix", 1999, "mkv"));
-        let listings = [entry("The.Matrix.1999.mkv", 99)];
-        let planned = plan_actions(PlanRequest {
-            listings: &listings,
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: std::slice::from_ref(&item),
-            wanted_missing: &[],
-        });
-        match &planned.actions[..] {
-            [Action::Copy { file_len, .. }] => assert_eq!(*file_len, 99),
-            other => panic!("expected Copy with listing len, got {other:?}"),
-        }
-        item.size = 0;
-        let planned = plan_actions(PlanRequest {
-            listings: &[],
-            title_index: &[],
-            on_disk: &[],
-            open_wants: &[],
-            desired: &ds(),
-            free_bytes: 2 * Bytes::GIB,
-            edge_frozen: false,
-            approved: std::slice::from_ref(&item),
-            wanted_missing: &[],
-        });
-        assert!(
-            copies(&planned.actions).is_empty(),
-            "zero-byte hold must not Copy: {:?}",
-            planned.actions
-        );
+        ];
+        let planned = plan_actions(request(&listings, &kinds, &[], &[], ds()));
+        assert_eq!(copies(&planned.actions).len(), 3, "{:?}", planned.actions);
+    }
+
+    #[test]
+    fn media_file_filter() {
+        let r = |p: &str| RemoteRef::from_wire_parts("x".into(), PathBuf::from(p)).expect("ref");
+        assert!(is_media_file(&r("a/b.mkv")));
+        assert!(is_media_file(&r("a/b.FLAC")));
+        assert!(!is_media_file(&r("a/b.nfo")));
+        assert!(!is_media_file(&r("a/b.sample.mkv")));
+        assert!(!is_media_file(&r("a/Sample.mkv")));
+        assert!(!is_media_file(&r("a/noext")));
     }
 }
