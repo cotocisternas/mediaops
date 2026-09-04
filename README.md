@@ -50,7 +50,7 @@ Do **not** put `seedbox bootstrap --yes`, a real pull, or NVENC in a Make target
 
 | Binary     | Role |
 | ---------- | ---- |
-| `mediaops` | Home CLI. Plan/apply, watch/why/status, hold inbox, pull, encode, bootstrap. |
+| `mediaops` | Home CLI. Plan/apply, watch/why/status, hold inbox, reclaim, pull, encode, bootstrap. |
 | `mediaopsd` | Daemon. Seedbox: gRPC + mTLS on TCP. Home: unix-socket gateway to the seedbox. |
 
 ```bash
@@ -71,6 +71,7 @@ make build
 | `watch TITLE` | Record a want (`kind:source:id`). Exits 0; does not wait for playable. |
 | `plan` / `run` | Exclusive lock. `run` is plan + apply in this process. Lock conflict is exit 3, never silent 0. Approved holds become Copy on this path. |
 | `why TITLE` / `status` | Lock-free peek. Local FS is truth. |
+| `reclaim preview\|apply` | Ranked surplus dry-run (lock-free); exclusive unlink after `install_b3` plus the library file. |
 | `hold list\|approve\|reject` | Lock-free import-blocked inbox. Approve records a decision (does not install). Reject is never-this-release. |
 | `doctor` / `repair edge` | Read-only EdgeInvariant vs confirmed nginx + API repair. |
 | `seedbox apply\|upgrade` | Grabber set-diff apply; re-copy musl `mediaopsd` and restart. |
@@ -142,4 +143,4 @@ crates/arch-tests dependency-graph law
 - [`_bmad-output/specs/spec-mediaops/SPEC.md`](_bmad-output/specs/spec-mediaops/SPEC.md) — capabilities and constraints
 - [`_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md`](_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md) — crate graph and ADs
 
-Not in this tree yet: reclaim, `library relocate` / `new-machine`, `docs render`, TUI.
+Not in this tree yet: `library relocate` / `new-machine`, `docs render`, TUI.
