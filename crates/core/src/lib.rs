@@ -67,7 +67,7 @@ pub use reclaim::{
     reclaim_proved, torrent_covers_file,
 };
 pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource};
-pub use title_index::{TitleIndexEntry, TitleIndexError, TitleIndexRepo};
+pub use title_index::{TitleIndexEntry, TitleIndexError, TitleIndexRepo, rewrite_absolute_under};
 pub use walker::{Allowlist, RemoteEntry, RemoteRef, WalkerError};
 
 use std::process::{ExitCode as ProcessExitCode, Termination};

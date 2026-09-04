@@ -117,7 +117,16 @@ fn help_exits_ok() {
         "help must mention seedbox: {stdout}"
     );
     for verb in [
-        "plan", "run", "watch", "why", "status", "encode", "hold", "reclaim", "doctor",
+        "plan",
+        "run",
+        "watch",
+        "why",
+        "status",
+        "encode",
+        "hold",
+        "reclaim",
+        "doctor",
+        "new-machine",
     ] {
         assert!(stdout.contains(verb), "help must mention {verb}: {stdout}");
     }
@@ -1066,4 +1075,535 @@ async fn start_hold_loopback() -> HoldLoopback {
         seed_task,
         uds_task,
     }
+}
+
+const DS_ZERO_FREE: &str = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n";
+
+fn write_ds(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    let ds = dir.join("desired-state.toml");
+    std::fs::write(&ds, body).expect("ds");
+    ds
+}
+
+#[test]
+fn library_relocate_rewrites_root_and_units_without_copying_media() {
+    let dir = scratch("relocate-happy");
+    let ds = write_ds(dir.as_path(), DS_ZERO_FREE);
+    let old = dir.join("old");
+    let neu = dir.join("new");
+    let units = dir.join("units");
+    let db = dir.join("state.db");
+    let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+    std::fs::create_dir_all(old.join("movies/The.Matrix.(1999).{tmdb-603}")).expect("mkdir");
+    std::fs::write(old.join(rel), b"orig").expect("media");
+    let boot = bin()
+        .args([
+            "--json",
+            "library",
+            "bootstrap",
+            "--library-root",
+            old.to_str().unwrap(),
+            "--desired-state",
+            ds.to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--state-db",
+            db.to_str().unwrap(),
+            "--unit-dir",
+            units.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bootstrap");
+    assert_eq!(
+        boot.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&boot.stderr)
+    );
+    let reindex = bin()
+        .args([
+            "--json",
+            "library",
+            "reindex",
+            "--library-root",
+            old.to_str().unwrap(),
+            "--state-db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("reindex");
+    assert_eq!(
+        reindex.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&reindex.stderr)
+    );
+    let output = bin()
+        .args([
+            "--json",
+            "library",
+            "relocate",
+            "--library-root",
+            neu.to_str().unwrap(),
+            "--desired-state",
+            ds.to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--state-db",
+            db.to_str().unwrap(),
+            "--unit-dir",
+            units.to_str().unwrap(),
+        ])
+        .output()
+        .expect("relocate");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "relocate failed: {stderr}");
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], true);
+    assert_eq!(
+        value["data"]["rewritten_absolute"], 0,
+        "relative title-index paths must stay relative"
+    );
+    let root = value["data"]["library_root"].as_str().expect("root");
+    assert!(std::path::Path::new(root).is_absolute(), "{root}");
+    for name in ["movies", "series", "music", "_ops", "_incoming"] {
+        assert!(neu.join(name).is_dir(), "{name}");
+    }
+    assert!(old.join(rel).is_file(), "must not move media");
+    assert!(!neu.join(rel).exists(), "must not copy media");
+    let timer = std::fs::read_to_string(units.join("mediaops-run.timer")).expect("timer");
+    assert!(timer.contains("OnUnitInactiveSec="));
+    assert!(!timer.contains("OnCalendar"));
+    assert!(units.join("mediaops-run.service").is_file());
+    assert!(units.join("mediaopsd-home.service").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn library_relocate_watermark_is_exit_5_without_store_or_units() {
+    let dir = scratch("relocate-water");
+    write_ds(
+        dir.as_path(),
+        "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 999999999\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
+    );
+    let units = dir.join("units");
+    let output = bin()
+        .args([
+            "--json",
+            "library",
+            "relocate",
+            "--library-root",
+            dir.join("new").to_str().unwrap(),
+            "--desired-state",
+            dir.join("desired-state.toml").to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+            "--unit-dir",
+            units.to_str().unwrap(),
+        ])
+        .output()
+        .expect("relocate water");
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    assert!(!dir.join("state.db").exists(), "no store write");
+    assert!(
+        !units.join("mediaops-run.service").exists(),
+        "no unit write"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn library_and_new_machine_are_exclusive_flock() {
+    let dir = scratch("relocate-lock");
+    write_ds(dir.as_path(), DS_ZERO_FREE);
+    let lock_path = dir.join("mediaops.lock");
+    let file = std::fs::File::create(&lock_path).expect("lock file");
+    fs4::FileExt::try_lock(&file).expect("hold lock");
+    let relocate = bin()
+        .args([
+            "--json",
+            "library",
+            "relocate",
+            "--library-root",
+            dir.join("new").to_str().unwrap(),
+            "--desired-state",
+            dir.join("desired-state.toml").to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+            "--unit-dir",
+            dir.join("units").to_str().unwrap(),
+        ])
+        .output()
+        .expect("relocate lock");
+    let reindex = bin()
+        .args([
+            "--json",
+            "library",
+            "reindex",
+            "--library-root",
+            dir.join("lib").to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("reindex lock");
+    let export = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "export",
+            "--out",
+            dir.join("bundle").to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("export lock");
+    let import = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "import",
+            "--from",
+            dir.join("bundle").to_str().unwrap(),
+            "--library-root",
+            dir.join("lib").to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("import lock");
+    drop(file);
+    let _ = std::fs::remove_dir_all(&dir);
+    for (name, output) in [
+        ("relocate", relocate),
+        ("reindex", reindex),
+        ("export", export),
+        ("import", import),
+    ] {
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "{name} must take exclusive flock: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value = stdout_json(&output);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "lock_conflict");
+    }
+}
+
+#[test]
+fn new_machine_export_import_round_trip_on_empty_home() {
+    let src = scratch("nm-src");
+    let ds = write_ds(src.as_path(), DS_ZERO_FREE);
+    let tls = src.join("tls");
+    std::fs::create_dir_all(&tls).expect("tls");
+    std::fs::write(tls.join("ca.pem"), b"ca-bytes").expect("pem");
+    std::fs::write(tls.join("client.key"), b"key-bytes").expect("key");
+    let lib = src.join("library");
+    let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+    std::fs::create_dir_all(lib.join("movies/The.Matrix.(1999).{tmdb-603}")).expect("mkdir");
+    std::fs::write(lib.join(rel), b"orig").expect("media");
+    let src_db = src.join("state.db");
+    let reindex = bin()
+        .args([
+            "--json",
+            "library",
+            "reindex",
+            "--library-root",
+            lib.to_str().unwrap(),
+            "--state-db",
+            src_db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("reindex");
+    assert_eq!(
+        reindex.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&reindex.stderr)
+    );
+    let reindex_v = stdout_json(&reindex);
+    assert_eq!(reindex_v["data"]["indexed"], 1);
+
+    let bundle = scratch("nm-bundle");
+    let export = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "export",
+            "--out",
+            bundle.to_str().unwrap(),
+            "--config-dir",
+            src.to_str().unwrap(),
+            "--desired-state",
+            ds.to_str().unwrap(),
+            "--tls-dir",
+            tls.to_str().unwrap(),
+            "--state-db",
+            src_db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("export");
+    assert_eq!(
+        export.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(bundle.join("desired-state.toml").is_file());
+    assert!(bundle.join("title-index.json").is_file());
+    assert!(bundle.join("tls/ca.pem").is_file());
+    assert!(bundle.join("tls/client.key").is_file());
+    let index: Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("title-index.json")).expect("index"))
+            .expect("index json");
+    assert_eq!(index[0]["title_id"], "movie:tmdb:603");
+    assert!(index[0]["install_b3"].as_str().is_some());
+    assert!(index[0]["current_b3"].as_str().is_some());
+
+    let dest = scratch("nm-dest");
+    let dest_lib = dest.join("library");
+    let import = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "import",
+            "--from",
+            bundle.to_str().unwrap(),
+            "--library-root",
+            dest_lib.to_str().unwrap(),
+            "--config-dir",
+            dest.to_str().unwrap(),
+            "--state-db",
+            dest.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("import");
+    assert_eq!(
+        import.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let import_v = stdout_json(&import);
+    assert_eq!(import_v["ok"], true);
+    assert_eq!(import_v["data"]["titles"], 1);
+    assert_eq!(
+        std::fs::read(dest.join("desired-state.toml")).expect("ds"),
+        DS_ZERO_FREE.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(dest.join("tls/ca.pem")).expect("pem"),
+        b"ca-bytes"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("tls/client.key")).expect("key"),
+        b"key-bytes"
+    );
+    let canon = std::fs::canonicalize(&dest_lib).expect("canon");
+    assert_eq!(
+        import_v["data"]["library_root"].as_str().expect("root"),
+        canon.to_str().expect("utf8")
+    );
+    for name in ["movies", "series", "music", "_ops", "_incoming"] {
+        assert!(dest_lib.join(name).is_dir(), "{name}");
+    }
+    assert!(
+        !dest_lib.join(rel).exists(),
+        "layout bootstraps with no media"
+    );
+
+    let again = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "import",
+            "--from",
+            bundle.to_str().unwrap(),
+            "--library-root",
+            dest_lib.to_str().unwrap(),
+            "--config-dir",
+            dest.to_str().unwrap(),
+            "--state-db",
+            dest.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("import again");
+    assert_eq!(again.status.code(), Some(2), "non-empty title-index");
+    let again_v = stdout_json(&again);
+    assert_eq!(again_v["error"]["code"], "usage");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&bundle);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn new_machine_import_git_work_tree_is_exit_5() {
+    let bundle = scratch("nm-git-bundle");
+    std::fs::write(bundle.join("desired-state.toml"), DS_ZERO_FREE).expect("ds");
+    std::fs::write(bundle.join("title-index.json"), b"[]").expect("index");
+    std::fs::create_dir_all(bundle.join("tls")).expect("tls");
+    std::fs::write(bundle.join("tls/ca.pem"), b"ca").expect("pem");
+    let dest = scratch("nm-git-dest");
+    std::fs::create_dir_all(dest.join(".git")).expect("git");
+    let output = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "import",
+            "--from",
+            bundle.to_str().unwrap(),
+            "--library-root",
+            dest.join("library").to_str().unwrap(),
+            "--config-dir",
+            dest.to_str().unwrap(),
+            "--state-db",
+            dest.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("import git");
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    assert!(!dest.join("desired-state.toml").exists());
+    assert!(!dest.join("tls/ca.pem").exists());
+    let _ = std::fs::remove_dir_all(&bundle);
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+#[test]
+fn new_machine_import_tls_dir_git_work_tree_is_exit_5() {
+    let bundle = scratch("nm-tls-git-bundle");
+    std::fs::write(bundle.join("desired-state.toml"), DS_ZERO_FREE).expect("ds");
+    std::fs::write(bundle.join("title-index.json"), b"[]").expect("index");
+    std::fs::create_dir_all(bundle.join("tls")).expect("tls");
+    std::fs::write(bundle.join("tls/ca.pem"), b"ca").expect("pem");
+    let dest = scratch("nm-tls-git-dest");
+    let git_root = scratch("nm-tls-git-tree");
+    std::fs::create_dir_all(git_root.join(".git")).expect("git");
+    let tls_dir = git_root.join("tls");
+    std::fs::create_dir_all(&tls_dir).expect("tls dest");
+    let output = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "import",
+            "--from",
+            bundle.to_str().unwrap(),
+            "--library-root",
+            dest.join("library").to_str().unwrap(),
+            "--config-dir",
+            dest.to_str().unwrap(),
+            "--tls-dir",
+            tls_dir.to_str().unwrap(),
+            "--state-db",
+            dest.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("import tls git");
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    assert!(!tls_dir.join("ca.pem").exists());
+    assert!(!dest.join("desired-state.toml").exists());
+    let _ = std::fs::remove_dir_all(&bundle);
+    let _ = std::fs::remove_dir_all(&dest);
+    let _ = std::fs::remove_dir_all(&git_root);
+}
+
+#[test]
+fn new_machine_export_git_work_tree_is_exit_5() {
+    let src = scratch("nm-export-src");
+    write_ds(src.as_path(), DS_ZERO_FREE);
+    let out = scratch("nm-export-git");
+    std::fs::create_dir_all(out.join(".git")).expect("git");
+    let output = bin()
+        .args([
+            "--json",
+            "new-machine",
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+            "--config-dir",
+            src.to_str().unwrap(),
+            "--state-db",
+            src.join("state.db").to_str().unwrap(),
+        ])
+        .output()
+        .expect("export git");
+    assert_eq!(output.status.code(), Some(5));
+    let value = stdout_json(&output);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    assert!(!out.join("desired-state.toml").exists());
+    assert!(!out.join("tls/ca.pem").exists());
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn library_reindex_after_loss_then_clash_is_error() {
+    let dir = scratch("reindex-cli");
+    let lib = dir.join("library");
+    let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+    std::fs::create_dir_all(lib.join("movies/The.Matrix.(1999).{tmdb-603}")).expect("mkdir");
+    std::fs::write(lib.join(rel), b"orig").expect("media");
+    let db = dir.join("state.db");
+    let first = bin()
+        .args([
+            "--json",
+            "library",
+            "reindex",
+            "--library-root",
+            lib.to_str().unwrap(),
+            "--state-db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("reindex");
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(stdout_json(&first)["data"]["indexed"], 1);
+    std::fs::write(lib.join(rel), b"changed").expect("change");
+    let clash = bin()
+        .args([
+            "--json",
+            "library",
+            "reindex",
+            "--library-root",
+            lib.to_str().unwrap(),
+            "--state-db",
+            db.to_str().unwrap(),
+        ])
+        .output()
+        .expect("clash");
+    assert_eq!(
+        clash.status.code(),
+        Some(1),
+        "digest clash must be runtime: {}",
+        String::from_utf8_lossy(&clash.stderr)
+    );
+    let value = stdout_json(&clash);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "runtime");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("immutable"), "{message}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

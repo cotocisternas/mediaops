@@ -143,4 +143,4 @@ crates/arch-tests dependency-graph law
 - [`_bmad-output/specs/spec-mediaops/SPEC.md`](_bmad-output/specs/spec-mediaops/SPEC.md) — capabilities and constraints
 - [`_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md`](_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md) — crate graph and ADs
 
-Not in this tree yet: `library relocate` / `new-machine`, `docs render`, TUI.
+Not in this tree yet: `docs render`, TUI.

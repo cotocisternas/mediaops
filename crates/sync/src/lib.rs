@@ -3,7 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use mediaops_core::{Bytes, Placement, TitleId, free_bytes, parse_placement};
+use mediaops_core::{
+    Blake3Hex, Bytes, Placement, TitleId, TitleIndexRepo, free_bytes, parse_placement,
+};
 
 mod apply;
 mod hold;
@@ -92,6 +94,50 @@ pub fn write_home_unit(unit_dir: &Path, exec_start: &str) -> Result<(), LibraryE
     fs::write(&service, home_service_unit(exec_start))
         .map_err(|err| LibraryError::io(&service, err))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReindexReport {
+    pub indexed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReindexError {
+    #[error(transparent)]
+    Library(#[from] LibraryError),
+    #[error("title-index: {0}")]
+    TitleIndex(String),
+}
+
+/// Hash on-disk schema files and [`TitleIndexRepo::record_install`].
+/// Matching digest may backfill path; clash never overwrites `install_b3`.
+pub async fn reindex_schema<T>(root: &Path, titles: &T) -> Result<ReindexReport, ReindexError>
+where
+    T: TitleIndexRepo,
+    T::Error: std::fmt::Display,
+{
+    if !root.is_dir() {
+        let err = if root.exists() {
+            std::io::Error::new(std::io::ErrorKind::NotADirectory, "not a directory")
+        } else {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "not a directory")
+        };
+        return Err(LibraryError::io(root, err).into());
+    }
+    let scanned = scan_schema_files(root)?;
+    let mut indexed = 0;
+    for (title_id, rel, _) in scanned {
+        let abs = root.join(&rel);
+        let file = fs::File::open(&abs).map_err(|err| LibraryError::io(&abs, err))?;
+        let digest = Blake3Hex::of_reader(file).map_err(|err| LibraryError::io(&abs, err))?;
+        let path = rel.to_string_lossy();
+        titles
+            .record_install(&title_id, &digest, &path)
+            .await
+            .map_err(|err| ReindexError::TitleIndex(err.to_string()))?;
+        indexed += 1;
+    }
+    Ok(ReindexReport { indexed })
 }
 
 /// Walk `movies`/`series`/`music` for TitleId → schema path. Used when a v4
@@ -372,6 +418,264 @@ mod tests {
             "{ids:?}"
         );
         assert_eq!(scanned.len(), 3, "junk files must not parse as schema");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    struct MemTitles {
+        rows: std::sync::Mutex<std::collections::HashMap<String, mediaops_core::TitleIndexEntry>>,
+    }
+
+    impl MemTitles {
+        fn new() -> Self {
+            Self {
+                rows: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl TitleIndexRepo for MemTitles {
+        type Error = mediaops_core::TitleIndexError;
+
+        async fn get(
+            &self,
+            title_id: &TitleId,
+        ) -> Result<Option<mediaops_core::TitleIndexEntry>, Self::Error> {
+            Ok(self
+                .rows
+                .lock()
+                .expect("lock")
+                .get(&title_id.render())
+                .cloned())
+        }
+
+        async fn list(&self) -> Result<Vec<mediaops_core::TitleIndexEntry>, Self::Error> {
+            Ok(self.rows.lock().expect("lock").values().cloned().collect())
+        }
+
+        async fn record_install(
+            &self,
+            title_id: &TitleId,
+            digest: &Blake3Hex,
+            path: &str,
+        ) -> Result<(), Self::Error> {
+            let mut rows = self.rows.lock().expect("lock");
+            let key = title_id.render();
+            if let Some(existing) = rows.get(&key) {
+                if existing.install_b3() != digest {
+                    return Err(mediaops_core::TitleIndexError::InstallDigestImmutable);
+                }
+                if existing.path_missing() && !path.is_empty() {
+                    let updated = mediaops_core::TitleIndexEntry::new(
+                        existing.title_id().clone(),
+                        path.to_string(),
+                        existing.install_b3().clone(),
+                        existing.current_b3().clone(),
+                    );
+                    rows.insert(key, updated);
+                }
+                return Ok(());
+            }
+            rows.insert(
+                key,
+                mediaops_core::TitleIndexEntry::new(
+                    title_id.clone(),
+                    path.to_string(),
+                    digest.clone(),
+                    digest.clone(),
+                ),
+            );
+            Ok(())
+        }
+
+        async fn record_replace(
+            &self,
+            title_id: &TitleId,
+            current_b3: &Blake3Hex,
+        ) -> Result<(), Self::Error> {
+            let mut rows = self.rows.lock().expect("lock");
+            let key = title_id.render();
+            let existing = rows
+                .get(&key)
+                .cloned()
+                .ok_or(mediaops_core::TitleIndexError::NotInstalled)?;
+            rows.insert(
+                key,
+                mediaops_core::TitleIndexEntry::new(
+                    existing.title_id().clone(),
+                    existing.path().to_string(),
+                    existing.install_b3().clone(),
+                    current_b3.clone(),
+                ),
+            );
+            Ok(())
+        }
+
+        async fn import_rows(
+            &self,
+            rows: &[mediaops_core::TitleIndexEntry],
+        ) -> Result<(), Self::Error> {
+            let mut map = self.rows.lock().expect("lock");
+            if !map.is_empty() {
+                return Err(mediaops_core::TitleIndexError::NotEmpty);
+            }
+            for row in rows {
+                map.insert(row.title_id().render(), row.clone());
+            }
+            Ok(())
+        }
+
+        async fn rewrite_absolute_prefix(
+            &self,
+            old_root: &str,
+            new_root: &str,
+        ) -> Result<u64, Self::Error> {
+            let mut map = self.rows.lock().expect("lock");
+            let mut rewritten = 0_u64;
+            for row in map.values_mut() {
+                let Some(new_path) =
+                    mediaops_core::rewrite_absolute_under(row.path(), old_root, new_root)
+                else {
+                    continue;
+                };
+                *row = mediaops_core::TitleIndexEntry::new(
+                    row.title_id().clone(),
+                    new_path,
+                    row.install_b3().clone(),
+                    row.current_b3().clone(),
+                );
+                rewritten += 1;
+            }
+            Ok(rewritten)
+        }
+    }
+
+    #[tokio::test]
+    async fn reindex_records_install_b3_and_backfills_path() {
+        let root = scratch("reindex");
+        ensure_layout(&root).expect("layout");
+        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let path = root.join(&rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"orig").expect("write");
+        let titles = MemTitles::new();
+        let title = TitleId::movie("603").expect("title");
+        let digest = Blake3Hex::of_bytes(b"orig");
+        titles
+            .import_rows(&[mediaops_core::TitleIndexEntry::new(
+                title.clone(),
+                "",
+                digest.clone(),
+                digest.clone(),
+            )])
+            .await
+            .expect("seed empty path");
+        let report = reindex_schema(&root, &titles).await.expect("reindex");
+        assert_eq!(report.indexed, 1);
+        let entry = titles.get(&title).await.expect("get").expect("row");
+        assert_eq!(entry.install_b3(), &digest);
+        assert_eq!(entry.path(), rel.to_str().expect("utf8"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reindex_digest_clash_does_not_overwrite_install_b3() {
+        let root = scratch("reindex-clash");
+        ensure_layout(&root).expect("layout");
+        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let path = root.join(&rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"new-bytes").expect("write");
+        let titles = MemTitles::new();
+        let title = TitleId::movie("603").expect("title");
+        let old = Blake3Hex::of_bytes(b"old-bytes");
+        titles
+            .record_install(&title, &old, rel.to_str().expect("utf8"))
+            .await
+            .expect("seed");
+        let err = reindex_schema(&root, &titles).await.expect_err("clash");
+        assert!(err.to_string().contains("immutable"), "{err}");
+        let entry = titles.get(&title).await.expect("get").expect("row");
+        assert_eq!(entry.install_b3(), &old);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reindex_unreadable_schema_file_is_io() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("reindex-io");
+        ensure_layout(&root).expect("layout");
+        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let path = root.join(&rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"orig").expect("write");
+        let movies = root.join("movies");
+        let restore = || {
+            let _ = fs::set_permissions(&movies, fs::Permissions::from_mode(0o755));
+        };
+        fs::set_permissions(&movies, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read_dir(&movies).is_ok() {
+            restore();
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        let titles = MemTitles::new();
+        let err = reindex_schema(&root, &titles).await.expect_err("io");
+        restore();
+        assert!(
+            matches!(err, ReindexError::Library(LibraryError::Io { .. })),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reindex_missing_root_is_io() {
+        let root = scratch("reindex-missing").join("no-such-library");
+        let titles = MemTitles::new();
+        let err = reindex_schema(&root, &titles)
+            .await
+            .expect_err("missing root");
+        assert!(
+            matches!(err, ReindexError::Library(LibraryError::Io { .. })),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(root.parent().expect("parent"));
+    }
+
+    #[tokio::test]
+    async fn reindex_after_empty_index_restores_reclaim_proof() {
+        let root = scratch("reindex-proof");
+        ensure_layout(&root).expect("layout");
+        let rel = PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv");
+        let path = root.join(&rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, b"orig").expect("write");
+        let titles = MemTitles::new();
+        let title = TitleId::movie("603").expect("title");
+        let listing = mediaops_core::RemoteEntry::from_wire_parts(
+            mediaops_core::RemoteRef::from_wire_parts("seedbox".into(), rel.clone()).expect("ref"),
+            4,
+            1,
+            1,
+        );
+        let listings = [listing];
+        let on_disk = [title.clone()];
+        assert!(
+            mediaops_core::reclaim_proved(&listings, &[], &on_disk).is_empty(),
+            "empty title_index is not proof"
+        );
+        let report = reindex_schema(&root, &titles).await.expect("reindex");
+        assert_eq!(report.indexed, 1);
+        let rows = titles.list().await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title_id(), &title);
+        assert_eq!(rows[0].install_b3(), &Blake3Hex::of_bytes(b"orig"));
+        assert_eq!(
+            mediaops_core::reclaim_proved(&listings, &rows, &on_disk).len(),
+            1,
+            "reindex row is reclaim proof"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

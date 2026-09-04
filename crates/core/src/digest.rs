@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// 64 lowercase hex characters. Produced by BLAKE3; never a free-form string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Blake3Hex(String);
@@ -51,6 +53,19 @@ impl Blake3Hex {
 impl fmt::Display for Blake3Hex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl Serialize for Blake3Hex {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Blake3Hex {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Blake3Hex::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 

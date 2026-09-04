@@ -14,6 +14,7 @@ mod encode_cmd;
 mod hold;
 mod home;
 mod library;
+mod new_machine;
 mod reclaim;
 mod repair;
 mod run;
@@ -159,6 +160,8 @@ enum Command {
     Reclaim(ReclaimArgs),
     /// Import-blocked inbox (lock-free).
     Hold(HoldArgs),
+    /// Export/import desired-state + tls/ + title-index into the active XDG dirs.
+    NewMachine(NewMachineArgs),
     /// Read-only EdgeInvariant + key presence + PEM-in-git scan.
     Doctor {
         #[arg(long)]
@@ -263,6 +266,44 @@ struct HoldArgs {
     command: HoldCommand,
 }
 
+#[derive(Args, Debug)]
+struct NewMachineArgs {
+    #[command(subcommand)]
+    command: NewMachineCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum NewMachineCommand {
+    /// Write desired-state.toml, tls/, and title-index.json into `--out`.
+    Export {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
+    /// Populate the active config dir and state.db from a directory bundle.
+    Import {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        library_root: PathBuf,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum HoldCommand {
     /// List undecided import-blocked releases (live ⊖ decided). Lock-free.
@@ -362,6 +403,28 @@ enum LibraryCommand {
         enable_timer: bool,
         #[arg(long)]
         unit_dir: Option<PathBuf>,
+    },
+    /// Retarget the one home library: layout, `library_root`, units. Does not copy media.
+    Relocate {
+        #[arg(long)]
+        library_root: PathBuf,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        enable_timer: bool,
+        #[arg(long)]
+        unit_dir: Option<PathBuf>,
+    },
+    /// Rebuild title-index proof by hashing on-disk schema files.
+    Reindex {
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
     },
 }
 
@@ -735,6 +798,39 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             .await?;
             write_stdout(&line)
         }
+        Some(Command::Library(LibraryArgs {
+            command:
+                LibraryCommand::Relocate {
+                    library_root,
+                    desired_state,
+                    config_dir,
+                    state_db,
+                    enable_timer,
+                    unit_dir,
+                },
+        })) => {
+            let line = library::relocate_library(
+                cli.json,
+                library_root,
+                desired_state,
+                config_dir,
+                state_db,
+                enable_timer,
+                unit_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Library(LibraryArgs {
+            command:
+                LibraryCommand::Reindex {
+                    library_root,
+                    state_db,
+                },
+        })) => {
+            let line = library::reindex_library(cli.json, library_root, state_db).await?;
+            write_stdout(&line)
+        }
         Some(Command::Plan {
             state_db,
             desired_state,
@@ -965,6 +1061,50 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 socket,
                 tls_dir,
                 config_dir,
+                state_db,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::NewMachine(NewMachineArgs {
+            command:
+                NewMachineCommand::Export {
+                    out,
+                    config_dir,
+                    desired_state,
+                    tls_dir,
+                    state_db,
+                },
+        })) => {
+            let line = new_machine::export_machine(
+                cli.json,
+                out,
+                config_dir,
+                desired_state,
+                tls_dir,
+                state_db,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::NewMachine(NewMachineArgs {
+            command:
+                NewMachineCommand::Import {
+                    from,
+                    library_root,
+                    config_dir,
+                    desired_state,
+                    tls_dir,
+                    state_db,
+                },
+        })) => {
+            let line = new_machine::import_machine(
+                cli.json,
+                from,
+                library_root,
+                config_dir,
+                desired_state,
+                tls_dir,
                 state_db,
             )
             .await?;

@@ -535,6 +535,41 @@ mod tests {
             );
             Ok(())
         }
+
+        async fn import_rows(&self, rows: &[TitleIndexEntry]) -> Result<(), Self::Error> {
+            let mut map = self.rows.lock().expect("lock");
+            if !map.is_empty() {
+                return Err(TitleIndexError::NotEmpty);
+            }
+            for row in rows {
+                map.insert(row.title_id().render(), row.clone());
+            }
+            Ok(())
+        }
+
+        async fn rewrite_absolute_prefix(
+            &self,
+            old_root: &str,
+            new_root: &str,
+        ) -> Result<u64, Self::Error> {
+            let mut map = self.rows.lock().expect("lock");
+            let mut rewritten = 0_u64;
+            for row in map.values_mut() {
+                let Some(new_path) =
+                    mediaops_core::rewrite_absolute_under(row.path(), old_root, new_root)
+                else {
+                    continue;
+                };
+                *row = TitleIndexEntry::new(
+                    row.title_id().clone(),
+                    new_path,
+                    row.install_b3().clone(),
+                    row.current_b3().clone(),
+                );
+                rewritten += 1;
+            }
+            Ok(rewritten)
+        }
     }
 
     struct MemSource {
