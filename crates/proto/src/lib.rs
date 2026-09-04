@@ -11,9 +11,9 @@ use std::path::PathBuf;
 
 use mediaops_core::{
     BoxFuture, Bytes, ControlError, ControlPort, DeleteRemoteOutcome, DfSnapshot, EdgeApiReport,
-    ExitCode, GrabApplyReport, HoldError, HoldKey, HoldLiveItem as CoreHoldLiveItem, KeyPresence,
-    Placement as CorePlacement, ReleaseId, RemoteEntry as CoreRemoteEntry,
-    RemoteRef as CoreRemoteRef, TitleId, TitleIdError, WalkerError,
+    ExitCode, GrabApplyReport, GuardPreviewItem as CoreGuardPreviewItem, HoldError, HoldKey,
+    HoldLiveItem as CoreHoldLiveItem, KeyPresence, Placement as CorePlacement, ReleaseId,
+    RemoteEntry as CoreRemoteEntry, RemoteRef as CoreRemoteRef, TitleId, TitleIdError, WalkerError,
 };
 use prost::Message;
 
@@ -473,6 +473,38 @@ impl From<EdgeCheckResponse> for EdgeApiReport {
     }
 }
 
+impl TryFrom<GuardPreviewItem> for CoreGuardPreviewItem {
+    type Error = ConvertError;
+
+    fn try_from(value: GuardPreviewItem) -> Result<Self, Self::Error> {
+        Ok(Self {
+            hash: value.hash,
+            state: value.state,
+            ratio: value.ratio,
+            is_private: value.is_private,
+            content_path: value.content_path,
+            save_path: value.save_path,
+            remote: value.r#ref.map(CoreRemoteRef::try_from).transpose()?,
+        })
+    }
+}
+
+impl TryFrom<&CoreGuardPreviewItem> for GuardPreviewItem {
+    type Error = ConvertError;
+
+    fn try_from(value: &CoreGuardPreviewItem) -> Result<Self, Self::Error> {
+        Ok(Self {
+            hash: value.hash.clone(),
+            state: value.state.clone(),
+            ratio: value.ratio,
+            is_private: value.is_private,
+            content_path: value.content_path.clone(),
+            save_path: value.save_path.clone(),
+            r#ref: value.remote.as_ref().map(RemoteRef::try_from).transpose()?,
+        })
+    }
+}
+
 impl From<KeyDiscoveryResponse> for KeyPresence {
     fn from(response: KeyDiscoveryResponse) -> Self {
         Self {
@@ -684,7 +716,7 @@ where
         })
     }
 
-    fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>> {
+    fn guard_preview(&self) -> BoxFuture<'_, Result<Vec<CoreGuardPreviewItem>, ControlError>> {
         let mut client = self.inner.clone();
         Box::pin(async move {
             let response = client
@@ -693,7 +725,12 @@ where
                 .map_err(control_error_from_status)?;
             let inner = response.into_inner();
             accept_handshake(&inner.proto_package, &inner.semver)?;
-            Ok(())
+            inner
+                .items
+                .into_iter()
+                .map(CoreGuardPreviewItem::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(convert_to_control)
         })
     }
 
@@ -938,6 +975,40 @@ mod tests {
         };
         let bytes = Bytes::from(response);
         assert_eq!(bytes.get(), 42);
+    }
+
+    #[test]
+    fn guard_preview_item_round_trip() {
+        let domain = CoreGuardPreviewItem {
+            hash: "abc".into(),
+            state: "uploading".into(),
+            ratio: 1.25,
+            is_private: true,
+            content_path: "/data/media/a.mkv".into(),
+            save_path: "/data/torrents".into(),
+            remote: Some(domain_ref("seedbox", "movies/a.mkv")),
+        };
+        let wire = GuardPreviewItem::try_from(&domain).expect("to wire");
+        assert_eq!(wire.hash, "abc");
+        assert_eq!(wire.state, "uploading");
+        assert!((wire.ratio - 1.25).abs() < f64::EPSILON);
+        assert!(wire.is_private);
+        assert_eq!(wire.content_path, "/data/media/a.mkv");
+        assert_eq!(wire.save_path, "/data/torrents");
+        let back = CoreGuardPreviewItem::try_from(wire).expect("from wire");
+        assert_eq!(back.hash, domain.hash);
+        assert_eq!(back.remote, domain.remote);
+        let empty = GuardPreviewItem {
+            hash: "h".into(),
+            state: "pausedDL".into(),
+            ratio: 0.0,
+            is_private: false,
+            content_path: String::new(),
+            save_path: String::new(),
+            r#ref: None,
+        };
+        let parsed = CoreGuardPreviewItem::try_from(empty).expect("optional ref");
+        assert!(parsed.remote.is_none());
     }
 
     #[test]

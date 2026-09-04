@@ -8,10 +8,14 @@ use mediaops_core::{Bytes, Placement, TitleId, free_bytes, parse_placement};
 mod apply;
 mod hold;
 mod plan;
+mod reclaim;
 
 pub use apply::{ApplyCtx, ApplyError, ApplyReport, InstalledCopy, UnmonitorFailure, apply};
 pub use hold::inbox;
 pub use plan::{PlanRequest, Planned, plan_actions};
+pub use reclaim::{
+    ReclaimCandidate, ReclaimReport, apply_reclaim, preview_actions, reclaim_preview,
+};
 
 pub const SCHEMA_DIRS: &[&str] = &["movies", "series", "music", "_ops", "_incoming"];
 
@@ -249,6 +253,20 @@ mod tests {
         assert!(text.contains("OnUnitInactiveSec="));
         assert!(text.contains("OnBootSec="));
         assert!(!text.contains("OnCalendar"));
+        assert!(
+            !text.contains("reclaim"),
+            "no leftover mediaops-reclaim.timer"
+        );
+    }
+
+    #[test]
+    fn no_reclaim_timer_unit_is_written() {
+        let dir = scratch("no-reclaim-timer");
+        write_user_units(&dir, "/opt/mediaops run").expect("units");
+        assert!(dir.join("mediaops-run.timer").is_file());
+        assert!(!dir.join("mediaops-reclaim.timer").exists());
+        assert!(!dir.join("mediaops-reclaim.service").exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

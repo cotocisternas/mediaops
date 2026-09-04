@@ -1,5 +1,6 @@
 //! qBittorrent WebAPI: torrents, pause/resume/delete, categories, preferences.
 
+use mediaops_core::GuardPreviewItem;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -120,6 +121,10 @@ impl<T: HttpTransport> QbitClient<T> {
         self.get("/api/v2/torrents/info").await
     }
 
+    pub async fn torrents_guard(&self) -> Result<Vec<GuardPreviewItem>, ArrError> {
+        parse_torrents_info(&self.torrents().await?)
+    }
+
     pub async fn torrent_properties(&self, hash: &str) -> Result<Value, ArrError> {
         self.get(&format!(
             "/api/v2/torrents/properties?hash={}",
@@ -189,6 +194,55 @@ impl<T: HttpTransport> QbitClient<T> {
     pub fn privacy_ok(prefs: &QbitPreferences) -> bool {
         !prefs.dht && !prefs.pex && !prefs.lsd
     }
+}
+
+/// Parse qBit `torrents/info` using only `hash`/`state`/`ratio`/`is_private`/`content_path`/`save_path`.
+pub fn parse_torrents_info(value: &Value) -> Result<Vec<GuardPreviewItem>, ArrError> {
+    let Some(rows) = value.as_array() else {
+        return Err(ArrError::Json("torrents/info is not an array".into()));
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let hash = row
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let state = row
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let ratio = row.get("ratio").and_then(Value::as_f64).unwrap_or(0.0);
+        // Missing private flag is fail-closed: treat as private.
+        let is_private = row
+            .get("is_private")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let content_path = row
+            .get("content_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let save_path = row
+            .get("save_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if hash.is_empty() || (content_path.is_empty() && save_path.is_empty()) {
+            continue;
+        }
+        out.push(GuardPreviewItem {
+            hash,
+            state,
+            ratio,
+            is_private,
+            content_path,
+            save_path,
+            remote: None,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -380,5 +434,57 @@ mod tests {
         let prefs = qbit.preferences().await.expect("prefs");
         assert!(!QbitClient::<CassetteTransport>::privacy_ok(&prefs));
         assert!(prefs.dht && prefs.pex && prefs.lsd);
+    }
+
+    #[test]
+    fn torrents_info_parses_named_fields_only() {
+        let value = serde_json::json!([{
+            "hash": "deadbeef",
+            "state": "uploading",
+            "ratio": 1.5,
+            "is_private": true,
+            "content_path": "/data/media/a.mkv",
+            "save_path": "/data/media",
+            "name": "ignored"
+        }]);
+        let items = parse_torrents_info(&value).expect("parse");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].hash, "deadbeef");
+        assert_eq!(items[0].state, "uploading");
+        assert!((items[0].ratio - 1.5).abs() < f64::EPSILON);
+        assert!(items[0].is_private);
+        assert_eq!(items[0].content_path, "/data/media/a.mkv");
+        assert_eq!(items[0].save_path, "/data/media");
+        assert!(items[0].remote.is_none());
+    }
+
+    #[test]
+    fn torrents_info_missing_private_is_fail_closed() {
+        let value = serde_json::json!([{
+            "hash": "x",
+            "state": "pausedDL",
+            "content_path": "/data/a.mkv"
+        }]);
+        let items = parse_torrents_info(&value).expect("parse");
+        assert!(items[0].is_private);
+        assert_eq!(items[0].ratio, 0.0);
+        assert_eq!(items[0].save_path, "");
+    }
+
+    #[test]
+    fn torrents_info_rejects_non_array() {
+        parse_torrents_info(&serde_json::json!({"hash": "x"})).expect_err("not array");
+    }
+
+    #[test]
+    fn torrents_info_skips_empty_hash_or_missing_paths() {
+        let value = serde_json::json!([
+            {"hash": "", "state": "uploading", "content_path": "/data/a.mkv"},
+            {"hash": "abc", "state": "uploading"},
+            {"hash": "def", "state": "pausedDL", "save_path": "/data/b.mkv"}
+        ]);
+        let items = parse_torrents_info(&value).expect("parse");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].hash, "def");
     }
 }

@@ -463,6 +463,14 @@ grabber = "servarr"
         );
         let copied = copies(&planned.actions);
         assert_eq!(copied, vec![&TitleId::movie("604").expect("604")]);
+        assert!(
+            !planned
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::DeleteRemote { .. })),
+            "Copy/Skip must never emit DeleteRemote: {:?}",
+            planned.actions
+        );
     }
 
     #[test]

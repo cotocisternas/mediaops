@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use mediaops_core::{
     BoxFuture, ControlError, DesiredState, EdgeApiReport, GrabApplyReport, GrabDownloadClient,
-    GrabIndexer, GrabOps, Grabber, HoldKey, HoldLiveItem, KeyPresence, Placement, ReleaseId,
-    TitleId, TitleKind, unified_diff,
+    GrabIndexer, GrabOps, Grabber, GuardPreviewItem, HoldKey, HoldLiveItem, KeyPresence, Placement,
+    ReleaseId, TitleId, TitleKind, unified_diff,
 };
 use serde_json::{Value, json};
 
@@ -29,6 +29,7 @@ pub struct LocalhostGrabOps<T> {
     bind: String,
     auth: String,
     url_bases: std::collections::BTreeMap<String, String>,
+    qbit_base: String,
 }
 
 impl<T> LocalhostGrabOps<T> {
@@ -67,8 +68,21 @@ impl<T> LocalhostGrabOps<T> {
                 .edge()
                 .map(|e| e.auth.clone())
                 .unwrap_or_else(|| "forms".into()),
+            qbit_base: qbit_localhost(
+                bases
+                    .get("qbittorrent")
+                    .or_else(|| bases.get("qbit"))
+                    .map(String::as_str),
+            ),
             url_bases: bases,
         }
+    }
+}
+
+fn qbit_localhost(url_base: Option<&str>) -> String {
+    match url_base {
+        Some(base) if !base.is_empty() && base != "/" => localhost(8080, base),
+        _ => "http://127.0.0.1:8080".into(),
     }
 }
 
@@ -354,6 +368,13 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
                 .map_err(arr_to_control)?;
             unmonitor_doc(&client, &doc, title_id).await?;
             Ok(())
+        })
+    }
+
+    fn qbit_snapshot(&self) -> BoxFuture<'_, Result<Vec<GuardPreviewItem>, ControlError>> {
+        Box::pin(async move {
+            let client = crate::QbitClient::new(self.transport.clone(), &self.qbit_base);
+            client.torrents_guard().await.map_err(arr_to_control)
         })
     }
 }
@@ -2768,6 +2789,67 @@ auth = "forms"
         );
         let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
         ops.wanted_missing().await.expect_err("every app failed");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn write_qbit_conf(home: &std::path::Path) {
+        let path = home.join(".config/qBittorrent/qBittorrent.conf");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, "[Preferences]\nWebUI\\LocalHostAuth=false\n").expect("qbit.conf");
+    }
+
+    #[tokio::test]
+    async fn grab_ops_qbit_snapshot_uses_torrents_info_cassette_without_login() {
+        let home = scratch("qbit-guard");
+        write_qbit_conf(&home);
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/qbit_torrents_info_seeding.json"
+        ))
+        .expect("seeding");
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        let items = ops.qbit_snapshot().await.expect("snapshot");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].state, "uploading");
+        assert_eq!(items[0].hash, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(!items[0].is_private);
+        assert_eq!(
+            t.hits("GET", "/api/v2/torrents/info"),
+            1,
+            "guard must query torrents/info"
+        );
+        assert_eq!(
+            t.hits("POST", "/api/v2/auth/login"),
+            0,
+            "no hardcoded login"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_qbit_snapshot_without_conf_is_fail_closed() {
+        let home = scratch("qbit-none");
+        let t = CassetteTransport::new();
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        ops.qbit_snapshot()
+            .await
+            .expect_err("missing conf is not an empty torrent list");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_qbit_snapshot_down_is_runtime_error() {
+        let home = scratch("qbit-down");
+        write_qbit_conf(&home);
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/qbit_torrents_info_down.json"
+        ))
+        .expect("down");
+        let ops = LocalhostGrabOps::new(t, KeyPaths::from_home(&home), &ds_servarr());
+        ops.qbit_snapshot()
+            .await
+            .expect_err("qBit down is fail-closed");
         let _ = fs::remove_dir_all(home);
     }
 }

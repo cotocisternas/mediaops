@@ -1,0 +1,20 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/torrents/info"
+  },
+  "response": {
+    "status": 200,
+    "headers": [["content-type", "application/json"]],
+    "body_json": [
+      {
+        "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "state": "pausedDL",
+        "ratio": 0.2,
+        "is_private": false,
+        "content_path": "/data/media/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+        "save_path": "/data/media/movies/The.Matrix.(1999).{tmdb-603}"
+      }
+    ]
+  }
+}

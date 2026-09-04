@@ -22,6 +22,7 @@ pub mod pathschema;
 pub mod plan;
 pub mod probe;
 pub mod provider;
+pub mod reclaim;
 pub mod title_id;
 pub mod title_index;
 pub mod walker;
@@ -61,6 +62,10 @@ pub use plan::{
 };
 pub use probe::{Probe, ProbeError, ProbeRepo, UnderlayMode, endpoint_fingerprint, plateau_n};
 pub use provider::{ProviderError, ProviderKind, already_there_install};
+pub use reclaim::{
+    GuardPreviewItem, ReclaimCandidate, ReclaimPolicy, reclaim_actions, reclaim_preview,
+    reclaim_proved, torrent_covers_file,
+};
 pub use title_id::{TitleId, TitleIdError, TitleKind, TitleSource};
 pub use title_index::{TitleIndexEntry, TitleIndexError, TitleIndexRepo};
 pub use walker::{Allowlist, RemoteEntry, RemoteRef, WalkerError};
