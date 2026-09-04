@@ -66,6 +66,35 @@ Add: `ControlPort`/`GrabOps::wanted_missing() -> Vec<TitleId>`; rpc `WantedMissi
 
 ## Spec Change Log
 
+**2026-09-03 -- PR #9 review.** Three narrowings of the Unmonitor rule, all
+tightening what the frozen section already asks for. None of them relax it.
+
+- **Series never unmonitor.** A series TitleId is the whole show and Sonarr's
+  wanted/missing is one record per missing *episode* collapsed onto the parent
+  id, so `title_index ∩ wanted/missing` reads a single installed episode as
+  "complete" and would PUT `monitored: false` on a series with 59 episodes still
+  outstanding. The frozen "PUT on the series/movie/album (not the episode)"
+  still holds at the grabber layer -- `GrabOps::unmonitor` and its cassettes are
+  unchanged -- but the planner only emits Movie and Album. Per-episode
+  completeness is not knowable from this snapshot; revisit if 7.x adds it.
+- **The file must still be on disk.** Nothing ever deletes a `title_index` row,
+  so an operator reclaiming space by hand leaves a row that says "installed"
+  forever. Unmonitor is now `title_index ∩ on_disk ∩ wanted/missing`. This does
+  not weaken "on-disk schema files without a row do not Unmonitor" -- the row is
+  still required, the file is now required too.
+- **A failed Unmonitor no longer aborts `run`.** It is ordered after Copy, so
+  propagating the error stranded already-installed copies before their
+  post-install encode, which the next run would skip upgrade-never. Failures
+  land in `ApplyReport.unmonitor_failed` and `run --json`; the action is
+  idempotent and re-emitted next run.
+
+Also from the same review, outside the Unmonitor rule: `unmonitor` queries only
+the *arr that owns the TitleKind (a healthy Sonarr no longer masks a failed
+Radarr, and the wanted/missing sweep stops at the matching page), and `why`'s
+`grab.queue` is `null` rather than `false` until a queue snapshot RPC exists,
+with `grab.error` separating a broken grabber from one that simply is not
+looking for the title.
+
 ## Design Notes
 
 Unmonitor PUT is the parent record (Sonarr series, not episode). `wanted_missing` is a snapshot RPC, not a field on HoldList. why `import` = TitleId in Transfer List; `grab` = TitleId in wanted/missing or queue; `hold` = `hold_list`. Do not add `reclaim` JSON.

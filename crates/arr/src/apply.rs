@@ -312,74 +312,47 @@ impl<T: HttpTransport + Clone + Send + Sync + 'static> GrabOps for LocalhostGrab
     fn unmonitor<'a>(&'a self, title_id: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>> {
         Box::pin(async move {
             let keys = discover_keys(&self.key_paths).map_err(key_to_control)?;
-            let mut apps = 0usize;
-            let mut docs_ok = 0usize;
-            let mut last_err = None;
-            if let Some(api_key) = keys.sonarr() {
-                apps += 1;
-                match ArrClient::new(
-                    self.transport.clone(),
+            // Only the *arr that owns this TitleKind can hold the parent record.
+            // Sweeping the other two re-paginates wanted/missing for nothing, and
+            // worse, lets one healthy app mask a failure in the app that actually
+            // owns the title -- reporting success without ever issuing the PUT.
+            let (api_key, base, api, extra) = match title_id.kind() {
+                TitleKind::Series => (
+                    keys.sonarr(),
                     &self.sonarr_base,
                     "/api/v3",
-                    api_key,
-                ) {
-                    Ok(client) => match fetch_wanted_missing(&client, "includeSeries=true").await {
-                        Ok(doc) => {
-                            docs_ok += 1;
-                            if unmonitor_doc(&client, &doc, title_id).await? {
-                                return Ok(());
-                            }
-                        }
-                        Err(err) => last_err = Some(arr_to_control(err)),
-                    },
-                    Err(err) => last_err = Some(arr_to_control(err)),
-                }
-            }
-            if let Some(api_key) = keys.radarr() {
-                apps += 1;
-                match ArrClient::new(
-                    self.transport.clone(),
+                    "includeSeries=true",
+                ),
+                TitleKind::Movie => (
+                    keys.radarr(),
                     &self.radarr_base,
                     "/api/v3",
-                    api_key,
-                ) {
-                    Ok(client) => match fetch_wanted_missing(&client, "includeMovie=true").await {
-                        Ok(doc) => {
-                            docs_ok += 1;
-                            if unmonitor_doc(&client, &doc, title_id).await? {
-                                return Ok(());
-                            }
-                        }
-                        Err(err) => last_err = Some(arr_to_control(err)),
-                    },
-                    Err(err) => last_err = Some(arr_to_control(err)),
-                }
-            }
-            if let Some(api_key) = keys.lidarr() {
-                apps += 1;
-                match ArrClient::new(
-                    self.transport.clone(),
+                    "includeMovie=true",
+                ),
+                TitleKind::Album => (
+                    keys.lidarr(),
                     &self.lidarr_base,
                     "/api/v1",
-                    api_key,
-                ) {
-                    Ok(client) => match fetch_wanted_missing(&client, "includeAlbum=true").await {
-                        Ok(doc) => {
-                            docs_ok += 1;
-                            if unmonitor_doc(&client, &doc, title_id).await? {
-                                return Ok(());
-                            }
-                        }
-                        Err(err) => last_err = Some(arr_to_control(err)),
-                    },
-                    Err(err) => last_err = Some(arr_to_control(err)),
-                }
-            }
-            if apps > 0 && docs_ok == 0 {
-                return Err(
-                    last_err.unwrap_or_else(|| ControlError::runtime("wanted/missing failed"))
-                );
-            }
+                    "includeAlbum=true",
+                ),
+            };
+            // No key for the owning app: nothing here monitors this title.
+            let Some(api_key) = api_key else {
+                return Ok(());
+            };
+            let client = ArrClient::new(self.transport.clone(), base, api, api_key)
+                .map_err(arr_to_control)?;
+            // Stop paging as soon as the parent shows up; a large library is
+            // otherwise a full 100-page walk per Unmonitor.
+            let doc = client
+                .paged_until("wanted/missing", extra, |batch| {
+                    batch.iter().any(|item| {
+                        unmonitor_parent(item).is_some_and(|(found, _, _)| found == *title_id)
+                    })
+                })
+                .await
+                .map_err(arr_to_control)?;
+            unmonitor_doc(&client, &doc, title_id).await?;
             Ok(())
         })
     }
@@ -2634,7 +2607,7 @@ auth = "forms"
         ))
         .expect("unused put");
         let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
-        ops.unmonitor(&TitleId::movie("603").expect("other"))
+        ops.unmonitor(&TitleId::series("999999").expect("other series"))
             .await
             .expect("no-op");
         assert_eq!(
@@ -2646,6 +2619,102 @@ auth = "forms"
             t.hits("PUT", "/sonarr/api/v3/series/5"),
             0,
             "no PUT when not missing"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_unmonitor_only_queries_the_app_owning_the_kind() {
+        let home = scratch("unmonitor-owning-app");
+        write_arr_key(&home, "Sonarr", "k");
+        write_arr_key(&home, "Radarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_radarr.json"
+        ))
+        .expect("radarr");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_get_movie.json"
+        ))
+        .expect("get parent");
+        t.push_json(include_str!(
+            "../../../fixtures/arr/unmonitor_put_movie.json"
+        ))
+        .expect("put");
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        ops.unmonitor(&TitleId::movie("603").expect("movie"))
+            .await
+            .expect("unmonitor");
+        assert!(
+            t.hits("PUT", "/radarr/api/v3/movie/10") >= 1,
+            "PUT required"
+        );
+        assert_eq!(
+            t.hits(
+                "GET",
+                "/sonarr/api/v3/wanted/missing?includeSeries=true&page=1&pageSize=200"
+            ),
+            0,
+            "a movie must not sweep Sonarr"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_unmonitor_fails_when_the_owning_app_fails() {
+        let home = scratch("unmonitor-owner-500");
+        write_arr_key(&home, "Sonarr", "k");
+        write_arr_key(&home, "Radarr", "k");
+        let mut t = CassetteTransport::new();
+        // Sonarr is healthy and must not be read as proof the movie is handled.
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_sonarr.json"
+        ))
+        .expect("sonarr");
+        t.push(
+            "GET",
+            "/radarr/api/v3/wanted/missing?includeMovie=true&page=1&pageSize=200",
+            None,
+            HttpResponse {
+                status: 500,
+                headers: Vec::new(),
+                body: b"err".to_vec(),
+            },
+        );
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        let err = ops
+            .unmonitor(&TitleId::movie("603").expect("movie"))
+            .await
+            .expect_err("Radarr failed; the movie is still monitored");
+        assert_eq!(
+            t.hits("PUT", "/radarr/api/v3/movie/10"),
+            0,
+            "no PUT was issued"
+        );
+        assert!(!err.message.is_empty(), "{err:?}");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn grab_ops_unmonitor_without_the_owning_key_is_a_no_op() {
+        let home = scratch("unmonitor-no-key");
+        write_arr_key(&home, "Sonarr", "k");
+        let mut t = CassetteTransport::new();
+        t.push_json(include_str!(
+            "../../../fixtures/arr/wanted_missing_sonarr.json"
+        ))
+        .expect("sonarr");
+        let ops = LocalhostGrabOps::new(t.clone(), KeyPaths::from_home(&home), &ds_servarr());
+        ops.unmonitor(&TitleId::movie("603").expect("movie"))
+            .await
+            .expect("no Radarr key, nothing to unmonitor");
+        assert_eq!(
+            t.hits(
+                "GET",
+                "/sonarr/api/v3/wanted/missing?includeSeries=true&page=1&pageSize=200"
+            ),
+            0,
+            "no sweep of an app that cannot own the title"
         );
         let _ = fs::remove_dir_all(home);
     }

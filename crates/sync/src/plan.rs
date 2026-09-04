@@ -21,7 +21,9 @@ pub struct PlanRequest<'a> {
     pub edge_frozen: bool,
     /// Approved holds with a live RemoteRef+placement become Copy (not Review).
     pub approved: &'a [HoldLiveItem],
-    /// *arr wanted/missing TitleIds. Unmonitor is `title_index` ∩ this set, not `on_disk`.
+    /// *arr wanted/missing TitleIds. Unmonitor is `title_index` ∩ `on_disk` ∩
+    /// this set. A `title_index` row alone is not enough (see
+    /// [`unmonitor_actions`]), and `on_disk` alone is never enough.
     pub wanted_missing: &'a [TitleId],
 }
 
@@ -186,6 +188,7 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
         actions.extend(unmonitor_actions(
             req.desired.grabber(),
             req.title_index,
+            req.on_disk,
             req.wanted_missing,
         ));
         if req.desired.grabber() == Grabber::Servarr {
@@ -247,6 +250,7 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
     actions.extend(unmonitor_actions(
         req.desired.grabber(),
         req.title_index,
+        req.on_disk,
         req.wanted_missing,
     ));
     if req.desired.grabber() == Grabber::Servarr {
@@ -261,21 +265,43 @@ pub fn plan_actions(req: PlanRequest<'_>) -> Planned {
     }
 }
 
+/// Unmonitor is `title_index` ∩ `on_disk` ∩ wanted/missing, movies and albums only.
+///
+/// The `title_index` row is the install proof: an on-disk file with no row never
+/// unmonitors. The `on_disk` check is the *still there* proof -- nothing ever
+/// deletes a `title_index` row, so an operator who reclaims space by hand would
+/// otherwise have *arr told to stop re-acquiring what they just deleted.
+///
+/// Series are excluded. A series TitleId is the whole show, and Sonarr's
+/// wanted/missing is one record per missing *episode* collapsed onto that parent
+/// id, so a single installed episode would read as "complete" and unmonitor every
+/// episode still outstanding. Per-episode completeness is not knowable from this
+/// snapshot; until it is, series stay monitored.
+///
+/// This survives `lock = true` deliberately: the lock freezes copies -- disk and
+/// bandwidth -- and unmonitoring only stops *arr chasing titles the library
+/// already holds, which is the state a freeze should settle into.
 fn unmonitor_actions(
     grabber: Grabber,
     title_index: &[TitleIndexEntry],
+    on_disk: &[TitleId],
     wanted_missing: &[TitleId],
 ) -> Vec<Action> {
     if grabber != Grabber::Servarr {
         return Vec::new();
     }
     let missing: HashSet<&TitleId> = wanted_missing.iter().collect();
+    let present: HashSet<&TitleId> = on_disk.iter().collect();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for entry in title_index {
-        if missing.contains(entry.title_id()) && seen.insert(entry.title_id()) {
+        let title_id = entry.title_id();
+        if title_id.kind() == TitleKind::Series {
+            continue;
+        }
+        if missing.contains(title_id) && present.contains(title_id) && seen.insert(title_id) {
             out.push(Action::Unmonitor {
-                title_id: entry.title_id().clone(),
+                title_id: title_id.clone(),
             });
         }
     }
@@ -592,10 +618,11 @@ grabber = "servarr"
             digest('a'),
         )];
         let missing = [title.clone()];
+        let disk = [title.clone()];
         let planned = plan_actions(PlanRequest {
             listings: &[],
             title_index: &index,
-            on_disk: &[],
+            on_disk: &disk,
             open_wants: &[],
             desired: &ds_servarr(),
             free_bytes: 2 * Bytes::GIB,
@@ -622,11 +649,12 @@ grabber = "servarr"
             digest('a'),
             digest('a'),
         )];
-        let missing = [title];
+        let missing = [title.clone()];
+        let disk = [title];
         let planned = plan_actions(PlanRequest {
             listings: &[],
             title_index: &index,
-            on_disk: &[],
+            on_disk: &disk,
             open_wants: &[],
             desired: &ds(),
             free_bytes: 2 * Bytes::GIB,
@@ -654,10 +682,11 @@ grabber = "servarr"
             digest('a'),
         )];
         let missing = [title.clone()];
+        let disk = [title.clone()];
         let planned = plan_actions(PlanRequest {
             listings: &[],
             title_index: &index,
-            on_disk: &[],
+            on_disk: &disk,
             open_wants: &[],
             desired: &ds_servarr_locked(),
             free_bytes: 2 * Bytes::GIB,
@@ -684,7 +713,7 @@ grabber = "servarr"
             title_index: &[],
             on_disk: std::slice::from_ref(&title),
             open_wants: &[],
-            desired: &ds(),
+            desired: &ds_servarr(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
@@ -704,21 +733,122 @@ grabber = "servarr"
     fn title_index_without_wanted_missing_does_not_unmonitor() {
         let title = TitleId::movie("603").expect("id");
         let index = [TitleIndexEntry::new(
-            title,
+            title.clone(),
             movie_rel("603", 1999),
             digest('a'),
             digest('a'),
         )];
+        let disk = [title];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &disk,
+            open_wants: &[],
+            desired: &ds_servarr(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &[],
+        });
+        assert!(
+            planned
+                .actions
+                .iter()
+                .all(|a| !matches!(a, Action::Unmonitor { .. })),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn series_with_one_installed_episode_is_not_unmonitored() {
+        let title = TitleId::series("79126").expect("id");
+        let index = [TitleIndexEntry::new(
+            title.clone(),
+            series_rel(),
+            digest('a'),
+            digest('a'),
+        )];
+        // Sonarr collapses every still-missing episode onto the parent id, so a
+        // series in wanted/missing means episodes are outstanding, not that the
+        // grabber lost track of a complete show.
+        let missing = [title.clone()];
+        let disk = [title];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &disk,
+            open_wants: &[],
+            desired: &ds_servarr(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &missing,
+        });
+        assert!(
+            planned
+                .actions
+                .iter()
+                .all(|a| !matches!(a, Action::Unmonitor { .. })),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn album_install_still_unmonitors() {
+        let title = TitleId::album("0f82b02e-c6cd-4242-b195-93d4bf3e0d63").expect("id");
+        let index = [TitleIndexEntry::new(
+            title.clone(),
+            album_rel(),
+            digest('a'),
+            digest('a'),
+        )];
+        let missing = [title.clone()];
+        let disk = [title.clone()];
+        let planned = plan_actions(PlanRequest {
+            listings: &[],
+            title_index: &index,
+            on_disk: &disk,
+            open_wants: &[],
+            desired: &ds_servarr(),
+            free_bytes: 2 * Bytes::GIB,
+            edge_frozen: false,
+            approved: &[],
+            wanted_missing: &missing,
+        });
+        assert!(
+            planned.actions.iter().any(|a| matches!(
+                a,
+                Action::Unmonitor { title_id } if *title_id == title
+            )),
+            "{:?}",
+            planned.actions
+        );
+    }
+
+    #[test]
+    fn title_index_row_whose_file_is_gone_does_not_unmonitor() {
+        let title = TitleId::movie("603").expect("id");
+        // The operator deleted the file to reclaim space; nothing removes the
+        // row, so only the on-disk scan can tell us the library no longer has it.
+        let index = [TitleIndexEntry::new(
+            title.clone(),
+            movie_rel("603", 1999),
+            digest('a'),
+            digest('a'),
+        )];
+        let missing = [title];
         let planned = plan_actions(PlanRequest {
             listings: &[],
             title_index: &index,
             on_disk: &[],
             open_wants: &[],
-            desired: &ds(),
+            desired: &ds_servarr(),
             free_bytes: 2 * Bytes::GIB,
             edge_frozen: false,
             approved: &[],
-            wanted_missing: &[],
+            wanted_missing: &missing,
         });
         assert!(
             planned

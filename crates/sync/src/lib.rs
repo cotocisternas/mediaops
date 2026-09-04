@@ -9,7 +9,7 @@ mod apply;
 mod hold;
 mod plan;
 
-pub use apply::{ApplyCtx, ApplyError, ApplyReport, InstalledCopy, apply};
+pub use apply::{ApplyCtx, ApplyError, ApplyReport, InstalledCopy, UnmonitorFailure, apply};
 pub use hold::inbox;
 pub use plan::{PlanRequest, Planned, plan_actions};
 

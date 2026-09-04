@@ -32,12 +32,21 @@ struct EncodeData {
 }
 
 #[derive(Debug, Serialize)]
+struct UnmonitorFailureView {
+    title_id: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
 struct RunData {
     path: String,
     copies: usize,
     skips: usize,
     installed: Vec<String>,
     encode: EncodeData,
+    /// Grabber refused these Unmonitors. The copies still landed and the next
+    /// run re-emits the action, so this is reported, not an exit code.
+    unmonitor_failed: Vec<UnmonitorFailureView>,
 }
 
 struct PreparedPlan {
@@ -224,15 +233,24 @@ pub async fn cmd_run(
             .map(|i| i.path.display().to_string())
             .collect(),
         encode,
+        unmonitor_failed: report
+            .unmonitor_failed
+            .iter()
+            .map(|f| UnmonitorFailureView {
+                title_id: f.title_id.render(),
+                error: f.error.clone(),
+            })
+            .collect(),
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         Ok(format!(
-            "run copies {} skips {} installed {}",
+            "run copies {} skips {} installed {} unmonitor_failed {}",
             data.copies,
             data.skips,
-            data.installed.len()
+            data.installed.len(),
+            data.unmonitor_failed.len()
         ))
     }
 }
@@ -552,6 +570,11 @@ mod tests {
         .await;
         let dir = crate::test_support::scratch("plan-unmonitor");
         let library = crate::test_support::library_root(&dir);
+        // The index row is the install proof, the file is the still-there proof:
+        // Unmonitor needs both.
+        let installed = library.join(crate::test_support::MOVIE_REL);
+        std::fs::create_dir_all(installed.parent().expect("parent")).expect("dirs");
+        std::fs::write(&installed, b"orig").expect("library file");
         let store = crate::test_support::open_store(&dir).await;
         store
             .record_install(

@@ -61,10 +61,18 @@ struct StatusData {
     df: Option<DfView>,
 }
 
+/// Present when there is something to say about the grabber. `grab: null` means
+/// the grabber answered and is not looking for this title.
 #[derive(Debug, Serialize)]
 struct GrabView {
-    wanted_missing: bool,
-    queue: bool,
+    /// `null` when the wanted/missing snapshot could not be read -- see `error`.
+    wanted_missing: Option<bool>,
+    /// Always `null` for now: the *arr download queue has no snapshot RPC, so
+    /// this is "unknown", never a claim that the title is not queued.
+    queue: Option<bool>,
+    /// Why the grabber could not answer. Distinguishes a broken grabber from a
+    /// healthy one that simply does not want this title.
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,7 +172,13 @@ pub async fn why(
         Ok(format!(
             "why {} grab {:?} import {:?} hold {:?} want {:?} pull {:?} encode {:?} free {:?} min_free {:?} df {:?}",
             data.title_id,
-            data.grab.as_ref().map(|g| g.wanted_missing),
+            data.grab
+                .as_ref()
+                .map(|g| match (g.wanted_missing, g.error.as_deref()) {
+                    (_, Some(err)) => format!("error {err}"),
+                    (Some(true), None) => "wanted_missing".into(),
+                    (_, None) => "unknown".to_string(),
+                }),
             data.import.as_ref().map(|i| i.path.as_str()),
             data.hold.as_ref().map(|h| h.release_id.as_str()),
             data.want.as_ref().map(|j| j.state.as_str()),
@@ -271,10 +285,16 @@ async fn load_remote_why(socket: &Path, tls_dir: &Path, title: &TitleId) -> Remo
     let listings = list_entries(channel).await.ok();
     let grab = match wanted {
         Ok(ids) if ids.iter().any(|id| id == title) => Some(GrabView {
-            wanted_missing: true,
-            queue: false,
+            wanted_missing: Some(true),
+            queue: None,
+            error: None,
         }),
-        Ok(_) | Err(_) => None,
+        Ok(_) => None,
+        Err(err) => Some(GrabView {
+            wanted_missing: None,
+            queue: None,
+            error: Some(err.message),
+        }),
     };
     let hold_item = holds
         .as_ref()
@@ -722,7 +742,10 @@ mod tests {
         .expect("why");
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["data"]["grab"]["wanted_missing"], true);
-        assert_eq!(value["data"]["grab"]["queue"], false);
+        // No queue snapshot RPC exists yet, so the field is "unknown", never a
+        // claim that the title is not downloading.
+        assert_eq!(value["data"]["grab"]["queue"], serde_json::Value::Null);
+        assert_eq!(value["data"]["grab"]["error"], serde_json::Value::Null);
         assert_eq!(
             value["data"]["import"]["path"],
             crate::test_support::MOVIE_REL
