@@ -380,6 +380,20 @@ impl Allowlist {
         ))
     }
 
+    /// Unlink an allowlisted file. Never follows a symlink. Unknown paths error.
+    pub fn unlink(&self, remote: &RemoteRef) -> Result<(), WalkerError> {
+        let path = self.absolute(remote)?;
+        if is_torrent_skip(&path) {
+            return Err(WalkerError::UnknownPath(path.display().to_string()));
+        }
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|_| WalkerError::UnknownPath(path.display().to_string()))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(WalkerError::UnknownPath(path.display().to_string()));
+        }
+        fs::remove_file(&path).map_err(|err| WalkerError::io(&path, &err))
+    }
+
     /// Open a file for a range read. Never follows a symlink.
     pub fn open(&self, remote: &RemoteRef) -> Result<std::fs::File, WalkerError> {
         let path = self.absolute(remote)?;
@@ -1020,6 +1034,62 @@ mod tests {
                 "{bad} must not survive the wire boundary"
             );
         }
+    }
+
+    #[test]
+    fn unlink_allowlisted_file_and_refuse_unknown_symlink_incomplete() {
+        let tmp = TempTree::new();
+        let allowed = tmp.path.join("allowed");
+        let outside = tmp.path.join("outside");
+        write_file(&allowed.join("keep.bin"), b"keep");
+        write_file(&allowed.join("gone.bin"), b"gone");
+        write_file(&outside.join("secret.bin"), b"secret");
+        std::os::unix::fs::symlink(outside.join("secret.bin"), allowed.join("link.bin"))
+            .expect("symlink");
+        write_file(
+            &allowed.join("torrents").join("incomplete").join("dl.bin"),
+            b"dl",
+        );
+
+        let mut allowlist = Allowlist::new();
+        allowlist.add_root("in", allowed.clone()).expect("root");
+        let gone = allowlist
+            .resolve(&allowed.join("gone.bin"))
+            .expect("resolve gone");
+        allowlist.unlink(&gone).expect("unlink");
+        assert!(!allowed.join("gone.bin").exists());
+        assert!(allowed.join("keep.bin").exists());
+
+        let crafted =
+            RemoteRef::from_wire_parts("in".into(), PathBuf::from("nope.bin")).expect("wire");
+        assert!(matches!(
+            allowlist.unlink(&crafted),
+            Err(WalkerError::UnknownPath(_))
+        ));
+        let link =
+            RemoteRef::from_wire_parts("in".into(), PathBuf::from("link.bin")).expect("link");
+        assert!(matches!(
+            allowlist.unlink(&link),
+            Err(WalkerError::UnknownPath(_))
+        ));
+        assert!(
+            outside.join("secret.bin").exists(),
+            "must not follow symlink"
+        );
+        let incomplete =
+            RemoteRef::from_wire_parts("in".into(), PathBuf::from("torrents/incomplete/dl.bin"))
+                .expect("incomplete");
+        assert!(matches!(
+            allowlist.unlink(&incomplete),
+            Err(WalkerError::UnknownPath(_))
+        ));
+        assert!(
+            allowed
+                .join("torrents")
+                .join("incomplete")
+                .join("dl.bin")
+                .exists()
+        );
     }
 
     #[test]

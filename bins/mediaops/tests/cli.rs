@@ -117,7 +117,7 @@ fn help_exits_ok() {
         "help must mention seedbox: {stdout}"
     );
     for verb in [
-        "plan", "run", "watch", "why", "status", "encode", "hold", "doctor",
+        "plan", "run", "watch", "why", "status", "encode", "hold", "reclaim", "doctor",
     ] {
         assert!(stdout.contains(verb), "help must mention {verb}: {stdout}");
     }
@@ -497,6 +497,58 @@ fn watch_is_lock_free_and_json_envelope() {
 }
 
 #[test]
+fn reclaim_preview_is_lock_free_and_apply_is_exclusive() {
+    let dir = scratch("reclaim-lock");
+    let lock_path = dir.join("mediaops.lock");
+    let file = std::fs::File::create(&lock_path).expect("lock file");
+    fs4::FileExt::try_lock(&file).expect("hold lock");
+    let preview = bin()
+        .args([
+            "--json",
+            "reclaim",
+            "preview",
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("preview");
+    let apply = bin()
+        .args([
+            "--json",
+            "reclaim",
+            "apply",
+            "--state-db",
+            dir.join("state.db").to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("apply");
+    drop(file);
+    let _ = std::fs::remove_dir_all(&dir);
+    // Preview is lock-free; UDS may be down (runtime) but must not be lock_conflict.
+    assert_ne!(
+        preview.status.code(),
+        Some(3),
+        "reclaim preview must be lock-free: stdout={} stderr={}",
+        String::from_utf8_lossy(&preview.stdout),
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert_eq!(
+        apply.status.code(),
+        Some(3),
+        "reclaim apply must take exclusive flock: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let value = stdout_json(&apply);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], "lock_conflict");
+}
+
+#[test]
 fn why_and_status_json_envelopes() {
     let dir = scratch("why-status");
     let db = dir.join("state.db");
@@ -538,6 +590,7 @@ fn why_and_status_json_envelopes() {
     assert_eq!(why_v["data"]["import"], Value::Null);
     assert_eq!(why_v["data"]["hold"], Value::Null);
     assert_eq!(why_v["data"]["df"], Value::Null);
+    assert_eq!(why_v["data"]["reclaim"], Value::Null);
     let status = bin()
         .args([
             "--json",
@@ -559,6 +612,7 @@ fn why_and_status_json_envelopes() {
     );
     assert!(status_v["data"]["watermark"].is_object());
     assert_eq!(status_v["data"]["df"], Value::Null);
+    assert_eq!(status_v["data"]["reclaim"], Value::Null);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

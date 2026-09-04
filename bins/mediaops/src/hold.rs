@@ -259,6 +259,11 @@ mod tests {
         fn unmonitor<'a>(&'a self, _: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn qbit_snapshot(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<mediaops_core::GuardPreviewItem>, ControlError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     fn live_item(

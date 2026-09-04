@@ -266,16 +266,13 @@ fn seedbox_grab_ops(
     };
     let text = std::fs::read_to_string(path).map_err(|err| AppError::Runtime(err.into()))?;
     let ds = DesiredState::from_toml(&text).map_err(|err| AppError::Runtime(anyhow!(err)))?;
-    if ds.grabber() != Grabber::Servarr {
-        return Ok((ds.grabber(), None));
-    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| AppError::Runtime(anyhow!("HOME unset")))?;
     let transport =
         ReqwestTransport::new().map_err(|err| AppError::Runtime(anyhow!(err.to_string())))?;
     let ops = LocalhostGrabOps::new(transport, KeyPaths::from_home(&home), &ds);
-    Ok((Grabber::Servarr, Some(Arc::new(ops))))
+    Ok((ds.grabber(), Some(Arc::new(ops))))
 }
 
 async fn serve_home(args: ServeArgs) -> Result<(), AppError> {

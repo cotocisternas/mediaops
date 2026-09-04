@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    ControlPort, DesiredState, Envelope, JobKind, JobState, TitleId, WantState, free_bytes,
-    parse_placement,
+    ControlPort, DesiredState, Envelope, JobKind, JobState, ReclaimCandidate, TitleId,
+    TitleIndexEntry, WantState, free_bytes, parse_placement, reclaim_preview,
 };
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
@@ -26,6 +26,7 @@ struct WhyData {
     encode: Option<JobView>,
     watermark: WatermarkView,
     df: Option<DfView>,
+    reclaim: Option<ReclaimView>,
     lock: Option<serde_json::Value>,
 }
 
@@ -59,6 +60,7 @@ struct StatusData {
     last_plan: Option<String>,
     watermark: WatermarkView,
     df: Option<DfView>,
+    reclaim: Option<ReclaimView>,
 }
 
 /// Present when there is something to say about the grabber. `grab: null` means
@@ -90,6 +92,11 @@ struct HoldView {
 #[derive(Debug, Serialize)]
 struct DfView {
     free: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ReclaimView {
+    candidates: Vec<ReclaimCandidate>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,7 +158,12 @@ pub async fn why(
     let watermark = watermark_view(library_root.as_deref(), &desired_state);
     let lock = bootstrap::lock_holder_if_contended(&bootstrap::lock_path(&state_db))
         .map_err(map_bootstrap)?;
-    let remote = load_remote_why(&socket, &tls_dir, &title_id).await;
+    let titles = store
+        .list_titles()
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let on_disk = crate::reclaim::on_disk_titles(library_root.as_deref().unwrap_or(Path::new("")))?;
+    let remote = load_remote_why(&socket, &tls_dir, &title_id, &titles, &on_disk).await;
 
     let data = WhyData {
         title_id: title_id.render(),
@@ -164,13 +176,14 @@ pub async fn why(
         encode,
         watermark,
         df: remote.df,
+        reclaim: remote.reclaim,
         lock,
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         Ok(format!(
-            "why {} grab {:?} import {:?} hold {:?} want {:?} pull {:?} encode {:?} free {:?} min_free {:?} df {:?}",
+            "why {} grab {:?} import {:?} hold {:?} want {:?} pull {:?} encode {:?} free {:?} min_free {:?} df {:?} reclaim {}",
             data.title_id,
             data.grab
                 .as_ref()
@@ -186,7 +199,11 @@ pub async fn why(
             data.encode.as_ref().map(|j| j.state.as_str()),
             data.watermark.free,
             data.watermark.min_free,
-            data.df.as_ref().map(|d| d.free)
+            data.df.as_ref().map(|d| d.free),
+            data.reclaim
+                .as_ref()
+                .map(|r| r.candidates.len())
+                .unwrap_or(0)
         ))
     }
 }
@@ -238,7 +255,12 @@ pub async fn status(
             .map(PathBuf::from),
     };
     let watermark = watermark_view(library_root.as_deref(), &desired_state);
-    let df = load_remote_df(&socket, &tls_dir).await;
+    let titles = store
+        .list_titles()
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let on_disk = crate::reclaim::on_disk_titles(library_root.as_deref().unwrap_or(Path::new("")))?;
+    let (df, reclaim) = load_remote_df_reclaim(&socket, &tls_dir, &titles, &on_disk).await;
     let data = StatusData {
         lock,
         open_wants,
@@ -246,16 +268,21 @@ pub async fn status(
         last_plan,
         watermark,
         df,
+        reclaim,
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         Ok(format!(
-            "status wants {} in_flight {} plan {:?} df {:?}",
+            "status wants {} in_flight {} plan {:?} df {:?} reclaim {}",
             data.open_wants.len(),
             data.in_flight.len(),
             data.last_plan,
-            data.df.as_ref().map(|d| d.free)
+            data.df.as_ref().map(|d| d.free),
+            data.reclaim
+                .as_ref()
+                .map(|r| r.candidates.len())
+                .unwrap_or(0)
         ))
     }
 }
@@ -265,15 +292,23 @@ struct RemoteWhy {
     import: Option<ImportView>,
     hold: Option<HoldView>,
     df: Option<DfView>,
+    reclaim: Option<ReclaimView>,
 }
 
-async fn load_remote_why(socket: &Path, tls_dir: &Path, title: &TitleId) -> RemoteWhy {
+async fn load_remote_why(
+    socket: &Path,
+    tls_dir: &Path,
+    title: &TitleId,
+    titles: &[TitleIndexEntry],
+    on_disk: &[TitleId],
+) -> RemoteWhy {
     let Ok(channel) = connect_home(socket, tls_dir).await else {
         return RemoteWhy {
             grab: None,
             import: None,
             hold: None,
             df: None,
+            reclaim: None,
         };
     };
     let control = ControlPortClient::new(ControlClient::new(channel.clone()));
@@ -283,6 +318,15 @@ async fn load_remote_why(socket: &Path, tls_dir: &Path, title: &TitleId) -> Remo
     let wanted = control.wanted_missing().await;
     let holds = control.hold_list().await.ok();
     let listings = list_entries(channel).await.ok();
+    let torrents = control.guard_preview().await.ok();
+    let reclaim = match (listings.as_ref(), torrents.as_ref()) {
+        (Some(entries), Some(items)) => {
+            let mut candidates = reclaim_preview(entries, titles, on_disk, items);
+            candidates.retain(|c| c.title_id == *title);
+            Some(ReclaimView { candidates })
+        }
+        _ => None,
+    };
     let grab = match wanted {
         Ok(ids) if ids.iter().any(|id| id == title) => Some(GrabView {
             wanted_missing: Some(true),
@@ -319,15 +363,32 @@ async fn load_remote_why(socket: &Path, tls_dir: &Path, title: &TitleId) -> Remo
         import,
         hold,
         df,
+        reclaim,
     }
 }
 
-async fn load_remote_df(socket: &Path, tls_dir: &Path) -> Option<DfView> {
-    let channel = connect_home(socket, tls_dir).await.ok()?;
-    let control = ControlPortClient::new(ControlClient::new(channel));
-    control.df().await.ok().map(|snap| DfView {
+async fn load_remote_df_reclaim(
+    socket: &Path,
+    tls_dir: &Path,
+    titles: &[TitleIndexEntry],
+    on_disk: &[TitleId],
+) -> (Option<DfView>, Option<ReclaimView>) {
+    let Ok(channel) = connect_home(socket, tls_dir).await else {
+        return (None, None);
+    };
+    let control = ControlPortClient::new(ControlClient::new(channel.clone()));
+    let df = control.df().await.ok().map(|snap| DfView {
         free: snap.free.get(),
-    })
+    });
+    let listings = list_entries(channel).await.ok();
+    let torrents = control.guard_preview().await.ok();
+    let reclaim = match (listings.as_ref(), torrents.as_ref()) {
+        (Some(entries), Some(items)) => Some(ReclaimView {
+            candidates: reclaim_preview(entries, titles, on_disk, items),
+        }),
+        _ => None,
+    };
+    (df, reclaim)
 }
 
 fn job_view(job: &mediaops_core::Job) -> JobView {
@@ -671,6 +732,14 @@ mod tests {
         ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn qbit_snapshot(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<Vec<mediaops_core::GuardPreviewItem>, mediaops_core::ControlError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[tokio::test]
@@ -756,6 +825,15 @@ mod tests {
         assert_eq!(value["data"]["library"]["present"], true);
         assert!(value["data"]["df"]["free"].as_u64().is_some());
         assert!(value["data"]["watermark"]["free"].as_u64().is_some());
+        assert!(
+            value["data"]["reclaim"].is_object(),
+            "reclaim sibling must be present when UDS is up: {json}"
+        );
+        let why_cands = value["data"]["reclaim"]["candidates"]
+            .as_array()
+            .expect("why reclaim candidates");
+        assert_eq!(why_cands.len(), 1, "{json}");
+        assert_eq!(why_cands[0]["title_id"], "movie:tmdb:603");
         let status_json = status(
             true,
             Some(db),
@@ -771,6 +849,7 @@ mod tests {
         let status_v: serde_json::Value = serde_json::from_str(&status_json).expect("json");
         assert!(status_v["data"]["df"]["free"].as_u64().is_some());
         assert!(status_v["data"]["watermark"]["free"].as_u64().is_some());
+        assert!(status_v["data"]["reclaim"].is_object());
         drop(lb);
         let _ = std::fs::remove_dir_all(dir);
     }

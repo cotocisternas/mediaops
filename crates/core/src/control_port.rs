@@ -7,6 +7,7 @@ use crate::ExitCode;
 use crate::bytes::Bytes;
 use crate::desired_state::DesiredState;
 use crate::hold::{HoldKey, HoldLiveItem};
+use crate::reclaim::GuardPreviewItem;
 use crate::title_id::TitleId;
 use crate::walker::RemoteRef;
 
@@ -31,7 +32,7 @@ pub trait ControlPort: Send + Sync {
         desired_state_toml: &'a [u8],
     ) -> BoxFuture<'a, Result<GrabApplyReport, ControlError>>;
     fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>>;
-    fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>>;
+    fn guard_preview(&self) -> BoxFuture<'_, Result<Vec<GuardPreviewItem>, ControlError>>;
     fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>>;
     fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>>;
     fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>>;
@@ -53,6 +54,7 @@ pub trait GrabOps: Send + Sync {
     fn hold_reject<'a>(&'a self, key: &'a HoldKey) -> BoxFuture<'a, Result<(), ControlError>>;
     fn wanted_missing(&self) -> BoxFuture<'_, Result<Vec<TitleId>, ControlError>>;
     fn unmonitor<'a>(&'a self, title_id: &'a TitleId) -> BoxFuture<'a, Result<(), ControlError>>;
+    fn qbit_snapshot(&self) -> BoxFuture<'_, Result<Vec<GuardPreviewItem>, ControlError>>;
 }
 
 /// `df` payload for handshake + free space. Wire still splits the fields.

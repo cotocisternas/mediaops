@@ -126,8 +126,10 @@ mod tests {
         fn key_discovery(&self) -> BoxFuture<'_, Result<KeyPresence, ControlError>> {
             Box::pin(async { Ok(KeyPresence::default()) })
         }
-        fn guard_preview(&self) -> BoxFuture<'_, Result<(), ControlError>> {
-            Box::pin(async { Ok(()) })
+        fn guard_preview(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<mediaops_core::GuardPreviewItem>, ControlError>> {
+            Box::pin(async { Ok(Vec::new()) })
         }
         fn hold_list(&self) -> BoxFuture<'_, Result<Vec<HoldLiveItem>, ControlError>> {
             Box::pin(async {

@@ -174,9 +174,20 @@ message KeyDiscoveryResponse {
 
 message GuardPreviewRequest {}
 
+message GuardPreviewItem {
+  string hash = 1;
+  string state = 2;
+  double ratio = 3;
+  bool is_private = 4;
+  string content_path = 5;
+  string save_path = 6;
+  RemoteRef ref = 7;
+}
+
 message GuardPreviewResponse {
   string semver = 1;
   string proto_package = 2;
+  repeated GuardPreviewItem items = 3;
 }
 
 message HoldListRequest {}

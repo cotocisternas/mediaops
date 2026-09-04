@@ -1025,5 +1025,13 @@ mod tests {
         ) -> mediaops_core::BoxFuture<'a, Result<(), mediaops_core::ControlError>> {
             Box::pin(async { Ok(()) })
         }
+        fn qbit_snapshot(
+            &self,
+        ) -> mediaops_core::BoxFuture<
+            '_,
+            Result<Vec<mediaops_core::GuardPreviewItem>, mediaops_core::ControlError>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 }

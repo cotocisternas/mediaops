@@ -37,7 +37,9 @@ pub enum Action {
     Unmonitor {
         title_id: TitleId,
     },
-    DeleteRemote,
+    DeleteRemote {
+        remote: RemoteRef,
+    },
     Encode {
         title_id: TitleId,
     },
@@ -206,6 +208,16 @@ mod tests {
         }
     }
 
+    fn sample_delete_remote() -> Action {
+        Action::DeleteRemote {
+            remote: RemoteRef::from_wire_parts(
+                "seed".into(),
+                PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+            )
+            .expect("ref"),
+        }
+    }
+
     #[test]
     fn plan_round_trip_preserves_bytes_and_digest() {
         let bytes = HAPPY_TOML.as_bytes().to_vec();
@@ -278,7 +290,7 @@ mod tests {
             },
             Action::Review,
             sample_unmonitor(),
-            Action::DeleteRemote,
+            sample_delete_remote(),
             sample_encode(),
             Action::Reclaim,
             Action::EdgeApply,
@@ -290,7 +302,7 @@ mod tests {
                 Action::Skip { .. } => "skip",
                 Action::Review => "review",
                 Action::Unmonitor { .. } => "unmonitor",
-                Action::DeleteRemote => "delete_remote",
+                Action::DeleteRemote { .. } => "delete_remote",
                 Action::Encode { .. } => "encode",
                 Action::Reclaim => "reclaim",
                 Action::EdgeApply => "edge_apply",
@@ -313,7 +325,7 @@ mod tests {
             (skip, "skip"),
             (Action::Review, "review"),
             (sample_unmonitor(), "unmonitor"),
-            (Action::DeleteRemote, "delete_remote"),
+            (sample_delete_remote(), "delete_remote"),
             (sample_encode(), "encode"),
             (Action::Reclaim, "reclaim"),
             (Action::EdgeApply, "edge_apply"),
@@ -438,14 +450,20 @@ mod tests {
             "desired_state_b3": digest,
             "actions": [
                 {"type": "review"},
-                {"type": "delete_remote"}
+                {
+                    "type": "delete_remote",
+                    "remote": {
+                        "root_id": "seed",
+                        "rel_path": "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"
+                    }
+                }
             ],
         });
 
         let plan = serde_json::from_value::<Plan>(value).expect("archived plan still loads");
         assert_eq!(plan.desired_state_toml(), snapshot.as_bytes());
         assert_eq!(plan.desired_state_b3().as_str(), digest);
-        assert_eq!(plan.actions(), &[Action::Review, Action::DeleteRemote]);
+        assert_eq!(plan.actions(), &[Action::Review, sample_delete_remote()]);
         // Only interpreting the snapshot as the current schema fails, and it
         // fails where the caller asked for it.
         assert_eq!(

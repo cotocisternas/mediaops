@@ -14,6 +14,7 @@ mod encode_cmd;
 mod hold;
 mod home;
 mod library;
+mod reclaim;
 mod repair;
 mod run;
 mod status;
@@ -154,6 +155,8 @@ enum Command {
         tls_dir: Option<PathBuf>,
     },
     Encode(EncodeArgs),
+    /// Ranked dry-run / exclusive unlink of surplus remotes after install_b3 proof.
+    Reclaim(ReclaimArgs),
     /// Import-blocked inbox (lock-free).
     Hold(HoldArgs),
     /// Read-only EdgeInvariant + key presence + PEM-in-git scan.
@@ -213,6 +216,46 @@ enum RepairCommand {
 struct EncodeArgs {
     #[command(subcommand)]
     command: EncodeCommand,
+}
+
+#[derive(Args, Debug)]
+struct ReclaimArgs {
+    #[command(subcommand)]
+    command: ReclaimCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReclaimCommand {
+    /// Ranked dry-run of surplus remotes. Lock-free.
+    Preview {
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
+    /// Unlink ranked surplus remotes. Exclusive flock.
+    Apply {
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        desired_state: Option<PathBuf>,
+        #[arg(long)]
+        library_root: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        #[arg(long)]
+        config_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -822,6 +865,52 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             command: EncodeCommand::Pause { off, state_db },
         })) => {
             let line = encode_cmd::pause(cli.json, off, state_db).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Reclaim(ReclaimArgs {
+            command:
+                ReclaimCommand::Preview {
+                    state_db,
+                    desired_state,
+                    library_root,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                },
+        })) => {
+            let line = reclaim::preview(
+                cli.json,
+                state_db,
+                desired_state,
+                library_root,
+                socket,
+                tls_dir,
+                config_dir,
+            )
+            .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Reclaim(ReclaimArgs {
+            command:
+                ReclaimCommand::Apply {
+                    state_db,
+                    desired_state,
+                    library_root,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                },
+        })) => {
+            let line = reclaim::apply(
+                cli.json,
+                state_db,
+                desired_state,
+                library_root,
+                socket,
+                tls_dir,
+                config_dir,
+            )
+            .await?;
             write_stdout(&line)
         }
         Some(Command::Hold(HoldArgs {

@@ -33,6 +33,8 @@ pub struct ApplyReport {
     pub skips: usize,
     pub installed: Vec<InstalledCopy>,
     pub unmonitor_failed: Vec<UnmonitorFailure>,
+    pub deleted: usize,
+    pub skipped_seeding: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -149,7 +151,17 @@ where
                     }
                 }
             }
-            Action::Encode { .. } | Action::Review | Action::DeleteRemote | Action::Reclaim => {}
+            Action::DeleteRemote { remote } => {
+                if let Some(control) = ctx.control {
+                    match control.delete_remote(remote).await? {
+                        mediaops_core::DeleteRemoteOutcome::Deleted => report.deleted += 1,
+                        mediaops_core::DeleteRemoteOutcome::SkippedSeeding => {
+                            report.skipped_seeding += 1
+                        }
+                    }
+                }
+            }
+            Action::Encode { .. } | Action::Review | Action::Reclaim => {}
         }
     }
     Ok(report)
@@ -932,6 +944,20 @@ mod tests {
         calls: Mutex<usize>,
         unmonitors: Mutex<Vec<TitleId>>,
         unmonitor_err: bool,
+        deletes: Mutex<Vec<RemoteRef>>,
+        delete_outcome: mediaops_core::DeleteRemoteOutcome,
+    }
+
+    impl FakeControl {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(0),
+                unmonitors: Mutex::new(Vec::new()),
+                unmonitor_err: false,
+                deletes: Mutex::new(Vec::new()),
+                delete_outcome: mediaops_core::DeleteRemoteOutcome::Deleted,
+            }
+        }
     }
 
     impl ControlPort for FakeControl {
@@ -961,10 +987,12 @@ mod tests {
         }
         fn delete_remote<'a>(
             &'a self,
-            _: &'a RemoteRef,
+            remote: &'a RemoteRef,
         ) -> mediaops_core::BoxFuture<'a, Result<mediaops_core::DeleteRemoteOutcome, ControlError>>
         {
-            Box::pin(async { Ok(mediaops_core::DeleteRemoteOutcome::Deleted) })
+            self.deletes.lock().expect("lock").push(remote.clone());
+            let outcome = self.delete_outcome;
+            Box::pin(async move { Ok(outcome) })
         }
         fn grab_apply<'a>(
             &'a self,
@@ -1009,8 +1037,11 @@ mod tests {
         {
             Box::pin(async { Ok(mediaops_core::KeyPresence::default()) })
         }
-        fn guard_preview(&self) -> mediaops_core::BoxFuture<'_, Result<(), ControlError>> {
-            Box::pin(async { Ok(()) })
+        fn guard_preview(
+            &self,
+        ) -> mediaops_core::BoxFuture<'_, Result<Vec<mediaops_core::GuardPreviewItem>, ControlError>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
         }
         fn hold_list(
             &self,
@@ -1044,11 +1075,7 @@ mod tests {
             hits: Mutex::new(Vec::new()),
         });
         let root = scratch("grab-apply");
-        let control = FakeControl {
-            calls: Mutex::new(0),
-            unmonitors: Mutex::new(Vec::new()),
-            unmonitor_err: false,
-        };
+        let control = FakeControl::new();
         apply(
             &plan,
             DS.as_bytes(),
@@ -1096,9 +1123,8 @@ mod tests {
         });
         let root = scratch("unmonitor-fails");
         let control = FakeControl {
-            calls: Mutex::new(0),
-            unmonitors: Mutex::new(Vec::new()),
             unmonitor_err: true,
+            ..FakeControl::new()
         };
         // The caller still needs `installed` back: those copies owe a
         // post-install encode that no later run will hand them.
@@ -1144,11 +1170,7 @@ mod tests {
             hits: Mutex::new(Vec::new()),
         });
         let root = scratch("unmonitor-apply");
-        let control = FakeControl {
-            calls: Mutex::new(0),
-            unmonitors: Mutex::new(Vec::new()),
-            unmonitor_err: false,
-        };
+        let control = FakeControl::new();
         apply(
             &plan,
             DS.as_bytes(),
@@ -1164,6 +1186,85 @@ mod tests {
         .await
         .expect("apply");
         assert_eq!(*control.unmonitors.lock().expect("lock"), vec![title]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn copy_does_not_call_delete_remote() {
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![movie_copy(4)]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("copy-no-delete");
+        let control = FakeControl::new();
+        apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+                control: Some(&control),
+            },
+        )
+        .await
+        .expect("copy");
+        assert!(
+            control.deletes.lock().expect("lock").is_empty(),
+            "Copy must not imply DeleteRemote"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn delete_remote_dispatches_and_records_skipped_seeding() {
+        let remote = RemoteRef::from_wire_parts(
+            "seed".into(),
+            PathBuf::from("movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv"),
+        )
+        .expect("ref");
+        let plan = Plan::from_toml_bytes(DS.as_bytes())
+            .expect("plan")
+            .with_actions(vec![Action::DeleteRemote {
+                remote: remote.clone(),
+            }]);
+        let jobs = MemJobs::new();
+        let titles = MemTitles::new();
+        let src = Arc::new(MemSource {
+            body: b"abcd".to_vec(),
+            fail_from: None,
+            hits: Mutex::new(Vec::new()),
+        });
+        let root = scratch("delete-remote-apply");
+        let control = FakeControl {
+            delete_outcome: mediaops_core::DeleteRemoteOutcome::SkippedSeeding,
+            ..FakeControl::new()
+        };
+        let report = apply(
+            &plan,
+            DS.as_bytes(),
+            ApplyCtx {
+                jobs: &jobs,
+                titles: &titles,
+                source: src,
+                library_root: &root,
+                concurrency: 1,
+                control: Some(&control),
+            },
+        )
+        .await
+        .expect("apply");
+        assert_eq!(report.skipped_seeding, 1);
+        assert_eq!(report.deleted, 0);
+        assert_eq!(control.deletes.lock().expect("lock").as_slice(), &[remote]);
         let _ = fs::remove_dir_all(root);
     }
 }

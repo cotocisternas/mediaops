@@ -21,7 +21,7 @@ pub use keys::{
 };
 pub use lidarr::Lidarr;
 pub use prowlarr::Prowlarr;
-pub use qbit::{QbitClient, QbitPreferences};
+pub use qbit::{QbitClient, QbitPreferences, parse_torrents_info};
 pub use radarr::Radarr;
 pub use reqwest_impl::ReqwestTransport;
 pub use sab::{SAB_CATEGORIES, SabClient};
