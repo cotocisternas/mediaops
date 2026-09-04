@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::AppError;
 use crate::bootstrap;
 
-const BUNDLE_DS: &str = "desired-state.toml";
+const BUNDLE_DS: &str = "config.toml";
 const BUNDLE_INDEX: &str = "title-index.json";
 const BUNDLE_TLS: &str = "tls";
 

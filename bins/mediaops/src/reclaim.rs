@@ -194,7 +194,7 @@ pub(crate) fn on_disk_files(library_root: &Path) -> Result<Vec<InstalledFile>, A
     scan_schema_files(library_root).map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))
 }
 
-/// Root kinds from the active desired-state; an unreadable file means "infer".
+/// Root kinds from the active config.toml; an unreadable file means "infer".
 pub(crate) fn root_kinds_from(desired_state: &Path) -> RootKinds {
     std::fs::read_to_string(desired_state)
         .ok()

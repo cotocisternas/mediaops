@@ -188,7 +188,7 @@ fn seedbox_bootstrap_without_yes_is_policy_refusal() {
     std::fs::create_dir_all(&dir).expect("mkdir");
     let ssh = dir.join("ssh_config");
     std::fs::write(&ssh, "Host seedbox\n  HostName 127.0.0.1\n  User x\n").expect("ssh");
-    let ds = dir.join("desired-state.toml");
+    let ds = dir.join("config.toml");
     std::fs::write(
         &ds,
         "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 1\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
@@ -203,7 +203,7 @@ fn seedbox_bootstrap_without_yes_is_policy_refusal() {
             "already-there",
             "--config-dir",
             dir.to_str().unwrap(),
-            "--desired-state",
+            "--config",
             ds.to_str().unwrap(),
             "--ssh-config",
             ssh.to_str().unwrap(),
@@ -266,7 +266,7 @@ fn seedbox_bootstrap_git_work_tree_is_policy_refusal() {
     std::fs::create_dir_all(dir.join(".git")).expect("mkdir");
     let ssh = dir.join("ssh_config");
     std::fs::write(&ssh, "Host seedbox\n  HostName 127.0.0.1\n  User x\n").expect("ssh");
-    let ds = dir.join("desired-state.toml");
+    let ds = dir.join("config.toml");
     std::fs::write(
         &ds,
         "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 1\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
@@ -282,7 +282,7 @@ fn seedbox_bootstrap_git_work_tree_is_policy_refusal() {
             "--yes",
             "--config-dir",
             dir.to_str().unwrap(),
-            "--desired-state",
+            "--config",
             ds.to_str().unwrap(),
             "--ssh-config",
             ssh.to_str().unwrap(),
@@ -316,7 +316,7 @@ fn library_bootstrap_creates_schema_dirs() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let ds = dir.join("desired-state.toml");
+    let ds = dir.join("config.toml");
     std::fs::write(
         &ds,
         "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
@@ -331,7 +331,7 @@ fn library_bootstrap_creates_schema_dirs() {
             "bootstrap",
             "--library-root",
             lib.to_str().unwrap(),
-            "--desired-state",
+            "--config",
             ds.to_str().unwrap(),
             "--config-dir",
             dir.to_str().unwrap(),
@@ -565,7 +565,7 @@ fn reclaim_preview_is_lock_free_and_apply_is_exclusive() {
 
 #[test]
 fn reclaim_preview_rejects_max_and_desired_state() {
-    for extra in [["--max", "1"], ["--desired-state", "/tmp/x"]] {
+    for extra in [["--max", "1"], ["--config", "/tmp/x"]] {
         let output = bin()
             .args(["--json", "reclaim", "preview"])
             .args(extra)
@@ -1091,7 +1091,7 @@ async fn start_hold_loopback() -> HoldLoopback {
 const DS_ZERO_FREE: &str = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n";
 
 fn write_ds(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
-    let ds = dir.join("desired-state.toml");
+    let ds = dir.join("config.toml");
     std::fs::write(&ds, body).expect("ds");
     ds
 }
@@ -1114,7 +1114,7 @@ fn library_relocate_rewrites_root_and_units_without_copying_media() {
             "bootstrap",
             "--library-root",
             old.to_str().unwrap(),
-            "--desired-state",
+            "--config",
             ds.to_str().unwrap(),
             "--config-dir",
             dir.to_str().unwrap(),
@@ -1156,7 +1156,7 @@ fn library_relocate_rewrites_root_and_units_without_copying_media() {
             "relocate",
             "--library-root",
             neu.to_str().unwrap(),
-            "--desired-state",
+            "--config",
             ds.to_str().unwrap(),
             "--config-dir",
             dir.to_str().unwrap(),
@@ -1205,8 +1205,8 @@ fn library_relocate_watermark_is_exit_5_without_store_or_units() {
             "relocate",
             "--library-root",
             dir.join("new").to_str().unwrap(),
-            "--desired-state",
-            dir.join("desired-state.toml").to_str().unwrap(),
+            "--config",
+            dir.join("config.toml").to_str().unwrap(),
             "--config-dir",
             dir.to_str().unwrap(),
             "--state-db",
@@ -1242,8 +1242,8 @@ fn library_and_new_machine_are_exclusive_flock() {
             "relocate",
             "--library-root",
             dir.join("new").to_str().unwrap(),
-            "--desired-state",
-            dir.join("desired-state.toml").to_str().unwrap(),
+            "--config",
+            dir.join("config.toml").to_str().unwrap(),
             "--config-dir",
             dir.to_str().unwrap(),
             "--state-db",
@@ -1360,7 +1360,7 @@ fn new_machine_export_import_round_trip_on_empty_home() {
             bundle.to_str().unwrap(),
             "--config-dir",
             src.to_str().unwrap(),
-            "--desired-state",
+            "--config",
             ds.to_str().unwrap(),
             "--tls-dir",
             tls.to_str().unwrap(),
@@ -1375,7 +1375,7 @@ fn new_machine_export_import_round_trip_on_empty_home() {
         "{}",
         String::from_utf8_lossy(&export.stderr)
     );
-    assert!(bundle.join("desired-state.toml").is_file());
+    assert!(bundle.join("config.toml").is_file());
     assert!(bundle.join("title-index.json").is_file());
     assert!(bundle.join("tls/ca.pem").is_file());
     assert!(bundle.join("tls/client.key").is_file());
@@ -1414,7 +1414,7 @@ fn new_machine_export_import_round_trip_on_empty_home() {
     assert_eq!(import_v["ok"], true);
     assert_eq!(import_v["data"]["titles"], 1);
     assert_eq!(
-        std::fs::read(dest.join("desired-state.toml")).expect("ds"),
+        std::fs::read(dest.join("config.toml")).expect("ds"),
         DS_ZERO_FREE.as_bytes()
     );
     assert_eq!(
@@ -1465,7 +1465,7 @@ fn new_machine_export_import_round_trip_on_empty_home() {
 #[test]
 fn new_machine_import_git_work_tree_is_exit_5() {
     let bundle = scratch("nm-git-bundle");
-    std::fs::write(bundle.join("desired-state.toml"), DS_ZERO_FREE).expect("ds");
+    std::fs::write(bundle.join("config.toml"), DS_ZERO_FREE).expect("ds");
     std::fs::write(bundle.join("title-index.json"), b"[]").expect("index");
     std::fs::create_dir_all(bundle.join("tls")).expect("tls");
     std::fs::write(bundle.join("tls/ca.pem"), b"ca").expect("pem");
@@ -1490,7 +1490,7 @@ fn new_machine_import_git_work_tree_is_exit_5() {
     assert_eq!(output.status.code(), Some(5));
     let value = stdout_json(&output);
     assert_eq!(value["error"]["code"], "policy_refusal");
-    assert!(!dest.join("desired-state.toml").exists());
+    assert!(!dest.join("config.toml").exists());
     assert!(!dest.join("tls/ca.pem").exists());
     let _ = std::fs::remove_dir_all(&bundle);
     let _ = std::fs::remove_dir_all(&dest);
@@ -1499,7 +1499,7 @@ fn new_machine_import_git_work_tree_is_exit_5() {
 #[test]
 fn new_machine_import_tls_dir_git_work_tree_is_exit_5() {
     let bundle = scratch("nm-tls-git-bundle");
-    std::fs::write(bundle.join("desired-state.toml"), DS_ZERO_FREE).expect("ds");
+    std::fs::write(bundle.join("config.toml"), DS_ZERO_FREE).expect("ds");
     std::fs::write(bundle.join("title-index.json"), b"[]").expect("index");
     std::fs::create_dir_all(bundle.join("tls")).expect("tls");
     std::fs::write(bundle.join("tls/ca.pem"), b"ca").expect("pem");
@@ -1530,7 +1530,7 @@ fn new_machine_import_tls_dir_git_work_tree_is_exit_5() {
     let value = stdout_json(&output);
     assert_eq!(value["error"]["code"], "policy_refusal");
     assert!(!tls_dir.join("ca.pem").exists());
-    assert!(!dest.join("desired-state.toml").exists());
+    assert!(!dest.join("config.toml").exists());
     let _ = std::fs::remove_dir_all(&bundle);
     let _ = std::fs::remove_dir_all(&dest);
     let _ = std::fs::remove_dir_all(&git_root);
@@ -1559,7 +1559,7 @@ fn new_machine_export_git_work_tree_is_exit_5() {
     assert_eq!(output.status.code(), Some(5));
     let value = stdout_json(&output);
     assert_eq!(value["error"]["code"], "policy_refusal");
-    assert!(!out.join("desired-state.toml").exists());
+    assert!(!out.join("config.toml").exists());
     assert!(!out.join("tls/ca.pem").exists());
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&out);

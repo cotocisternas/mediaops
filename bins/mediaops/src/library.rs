@@ -283,7 +283,7 @@ fn write_library_units(
             "home",
             "--tls-dir",
             &tls_arg,
-            "--desired-state",
+            "--config",
             &ds_arg,
             "--socket",
             &sock_arg,
@@ -423,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn relocate_rewrites_root_and_units_without_copying_media() {
         let dir = scratch("relocate");
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         std::fs::write(&ds, DS).expect("ds");
         let old = dir.join("old");
         mediaops_sync::ensure_layout(&old).expect("old layout");
@@ -533,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn relocate_watermark_does_not_write_store_or_units() {
         let dir = scratch("relocate-water");
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         std::fs::write(
             &ds,
             "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 999999999\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
@@ -576,7 +576,7 @@ mod tests {
     #[tokio::test]
     async fn relocate_refuses_filesystem_root_and_empty() {
         let dir = scratch("relocate-root");
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         std::fs::write(&ds, DS).expect("ds");
         let db = dir.join("state.db");
         let units = dir.join("units");

@@ -241,7 +241,7 @@ fn serve_home_without_upstream_exits_usage() {
     assert_eq!(
         output.status.code(),
         Some(2),
-        "home without --upstream/--desired-state must exit usage, status={:?} stderr={}",
+        "home without --upstream/--config must exit usage, status={:?} stderr={}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );

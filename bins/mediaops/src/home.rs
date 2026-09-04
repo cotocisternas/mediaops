@@ -144,7 +144,7 @@ pub async fn pull(
     let ds = DesiredState::from_toml(&ds_text).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
     if ds.lock() {
         return Err(AppError::Policy(
-            "desired-state lock is set; pull is frozen".into(),
+            "config lock is set; pull is frozen".into(),
         ));
     }
     let title_id = TitleId::parse(&title_id).map_err(|err| AppError::Usage(err.to_string()))?;

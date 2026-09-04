@@ -88,7 +88,7 @@ pub fn plan_steps(args: &BootstrapArgs, address: &str) -> Vec<String> {
         ProviderKind::SwizzinBox => {
             steps.push("build x86_64-unknown-linux-musl mediaopsd".into());
             steps.push(
-                "scp binary + server certs + desired-state + systemd user unit to Host seedbox"
+                "scp binary + server certs + config.toml + systemd user unit to Host seedbox"
                     .into(),
             );
             steps.push(format!(
@@ -223,7 +223,7 @@ pub async fn bootstrap(
             .map_err(|err| BootstrapError::Io(err.to_string()))?;
         if updated_text.contains("BEGIN ") {
             return Err(BootstrapError::Io(
-                "desired-state grew a PEM body; refusing to write".into(),
+                "config.toml grew a PEM body; refusing to write".into(),
             ));
         }
     }
@@ -487,7 +487,7 @@ fn path_string(path: &Path) -> String {
 /// operator picks one of them.
 fn seedbox_exec_start(roots: &[(String, PathBuf)], bind_port: u16) -> String {
     let mut cmd = format!(
-        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:{bind_port} --tls-dir %h/.config/mediaops/tls --desired-state %h/.config/mediaops/desired-state.toml --nginx-dir /etc/nginx/apps",
+        "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:{bind_port} --tls-dir %h/.config/mediaops/tls --config %h/.config/mediaops/config.toml --nginx-dir /etc/nginx/apps",
     );
     for (id, path) in roots {
         cmd.push_str(" --root ");
@@ -504,7 +504,7 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), BootstrapError> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("desired-state.toml");
+        .unwrap_or("config.toml");
     let tmp = parent.join(format!(".{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, contents).map_err(|err| BootstrapError::Io(err.to_string()))?;
     std::fs::rename(&tmp, path).map_err(|err| BootstrapError::Io(err.to_string()))?;
@@ -648,7 +648,7 @@ pub fn render_needs_confirm(
     }
 }
 
-/// The active config dir: `desired-state.toml` + `tls/`.
+/// The active config dir: `config.toml` + `tls/`.
 ///
 /// `$MEDIAOPS_CONFIG_DIR` wins. Otherwise `~/.config/mediaops`, unless
 /// `~/.config` is itself a git work tree (dotfiles repos are common), in which
@@ -693,8 +693,10 @@ pub fn default_ssh_config() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".ssh/config"))
 }
 
+pub const CONFIG_FILE: &str = "config.toml";
+
 pub fn default_desired_state(config_dir: &Path) -> PathBuf {
-    config_dir.join("desired-state.toml")
+    config_dir.join(CONFIG_FILE)
 }
 
 pub fn default_tls_dir(config_dir: &Path) -> PathBuf {
@@ -873,11 +875,18 @@ mod tests {
     }
 
     fn write_ds(dir: &Path) -> PathBuf {
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         if !ds.exists() {
             std::fs::write(&ds, DS).expect("ds");
         }
         ds
+    }
+
+    #[test]
+    fn default_config_is_config_toml() {
+        let dir = scratch("cfg-name");
+        assert_eq!(default_desired_state(&dir), dir.join("config.toml"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn args(dir: &Path, yes: bool, skip_probe: bool, provider: ProviderKind) -> BootstrapArgs {
@@ -931,7 +940,7 @@ mod tests {
         ] {
             assert!(tls.join(name).is_file(), "missing {name}");
         }
-        let toml_text = std::fs::read_to_string(dir.join("desired-state.toml")).expect("ds");
+        let toml_text = std::fs::read_to_string(dir.join("config.toml")).expect("ds");
         assert!(!toml_text.contains("BEGIN "));
         assert!(!toml_text.contains("-----BEGIN"));
         let ds = DesiredState::from_toml(&toml_text).expect("parse");
@@ -952,7 +961,7 @@ mod tests {
             .expect("second");
         assert!(again.applied);
         assert_eq!(ca, std::fs::read(tls.join("ca.pem")).expect("ca2"));
-        let toml2 = std::fs::read_to_string(dir.join("desired-state.toml")).expect("ds2");
+        let toml2 = std::fs::read_to_string(dir.join("config.toml")).expect("ds2");
         assert_eq!(toml_text, toml2);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1234,7 +1243,7 @@ mod tests {
     #[tokio::test]
     async fn lidarr_glibc_trap_refuses_upgrade() {
         let dir = scratch("upgrade-pin");
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         std::fs::write(
             &ds,
             r#"
@@ -1277,7 +1286,7 @@ refuse_above = "2.14.5"
     #[tokio::test]
     async fn upgrade_without_yes_is_policy_refusal() {
         let dir = scratch("upgrade-yes");
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         std::fs::write(
             &ds,
             "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\n",
@@ -1305,7 +1314,7 @@ refuse_above = "2.14.5"
     #[tokio::test]
     async fn upgrade_with_yes_copies_binary_skipping_edge() {
         let dir = scratch("upgrade-yes-run");
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         std::fs::write(
             &ds,
             "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\n",

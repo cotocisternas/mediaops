@@ -42,11 +42,11 @@ struct ServeArgs {
     socket: Option<PathBuf>,
     #[arg(long)]
     tls_dir: PathBuf,
-    /// Home role: seedbox `HOST:PORT`. Alternative to `--desired-state`.
+    /// Home role: seedbox `HOST:PORT`. Alternative to `--config`.
     #[arg(long)]
     upstream: Option<String>,
-    /// Home role: read `seedbox_address` + underlay from desired-state.
-    #[arg(long)]
+    /// Home role: read `seedbox_address` + underlay from config.toml.
+    #[arg(long = "config", value_name = "PATH")]
     desired_state: Option<PathBuf>,
     /// Allowlisted root as `id=path`. Repeatable. Seedbox role only.
     #[arg(long = "root", value_parser = parse_root)]
@@ -208,12 +208,12 @@ fn resolve_upstream(args: &ServeArgs) -> Result<(String, SocketAddr, UnderlayMod
         return Ok((raw.to_string(), addr, UnderlayMode::Direct));
     }
     let path = args.desired_state.as_ref().ok_or_else(|| {
-        AppError::Usage("home role requires --upstream HOST:PORT or --desired-state".into())
+        AppError::Usage("home role requires --upstream HOST:PORT or --config".into())
     })?;
     let text = std::fs::read_to_string(path).map_err(|err| AppError::Runtime(err.into()))?;
     let ds = DesiredState::from_toml(&text).map_err(|err| AppError::Runtime(anyhow!(err)))?;
     let raw = ds.seedbox_address().ok_or_else(|| {
-        AppError::Usage("desired-state has no seedbox_address; pass --upstream".into())
+        AppError::Usage("config.toml has no seedbox_address; pass --upstream".into())
     })?;
     let addr = parse_grpc_addr(raw)?;
     Ok((raw.to_string(), addr, ds.underlay()))
@@ -430,7 +430,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let ds = dir.join("desired-state.toml");
+        let ds = dir.join("config.toml");
         std::fs::write(
             &ds,
             "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\nseedbox_address = \"127.0.0.1:9\"\n",

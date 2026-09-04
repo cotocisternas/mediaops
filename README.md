@@ -11,17 +11,16 @@ Story commits put the story key in the subject as `N-M` (hyphen, e.g. `2-1`), so
 - Rust **1.98** (`rust-toolchain.toml` pins it)
 - `protobuf-compiler` (`protoc`) — `crates/proto` builds the gRPC stubs
 - A lockfile-aware Cargo (`make` passes `--locked`)
-- For `make musl` (the static daemon the seedbox runs): **either** `musl-tools` + `cmake`, **or** just `zig`. Without `musl-gcc` the Makefile uses `zig cc` as the musl C toolchain (`scripts/zig-musl-cc`). Not needed for `make test`.
+- For `make musl` (the static daemon the seedbox runs): `musl-tools` + `cmake` (`musl-gcc`). Not needed for `make test`.
 
 On Debian/Arch:
 
 ```bash
 sudo apt-get install -y protobuf-compiler   # Debian/Ubuntu
 # sudo pacman -S protobuf                    # Arch
-# make musl only (pick one):
+# make musl also needs:
 sudo apt-get install -y musl-tools cmake    # Debian/Ubuntu (`musl-gcc`)
 # sudo pacman -S musl cmake                  # Arch
-# ...or have `zig` on PATH (mise/pacman); no musl-gcc needed
 ```
 
 ## Make targets
@@ -39,7 +38,7 @@ make fmt
 make mediaops ARGS='--help'
 make daemon  ARGS='--help'
 make ci            # fetch + test --offline --locked, then make musl (same as GitHub Actions)
-make musl          # link musl-static mediaopsd (musl-gcc, or zig as the C toolchain; not part of make test)
+make musl          # link musl-static mediaopsd (needs musl-gcc; not part of make test)
 make install       # both binaries into ~/.cargo/bin
 ```
 
@@ -87,30 +86,30 @@ Both units are written for you (`seedbox bootstrap` on the box, `library bootstr
 ```bash
 # seedbox: what the generated user unit runs (bind port = the port in seedbox_address)
 mediaopsd serve --role seedbox --bind 0.0.0.0:25410 \
-  --tls-dir ~/.config/mediaops/tls --desired-state ~/.config/mediaops/desired-state.toml \
+  --tls-dir ~/.config/mediaops/tls --config ~/.config/mediaops/config.toml \
   --nginx-dir /etc/nginx/apps --root movies=/home/me/media/movies --root tv=/home/me/media/tv
 
-# home gateway (unix socket; seedbox address comes from desired-state, not the CLI)
-mediaopsd serve --role home --tls-dir <config-dir>/tls --desired-state <config-dir>/desired-state.toml
+# home gateway (unix socket; seedbox address comes from config.toml, not the CLI)
+mediaopsd serve --role home --tls-dir <config-dir>/tls --config <config-dir>/config.toml
 ```
 
 ## Default paths
 
 | What | Where |
 | ---- | ----- |
-| Config dir (desired-state + `tls/`) | `~/.config/mediaops`, **or** `~/.local/share/mediaops` when `~/.config` is a git work tree (dotfiles), **or** `$MEDIAOPS_CONFIG_DIR` |
-| Desired-state | `<config-dir>/desired-state.toml` |
+| Config dir (`config.toml` + `tls/`) | `~/.config/mediaops`, **or** `~/.local/share/mediaops` when `~/.config` is a git work tree (dotfiles), **or** `$MEDIAOPS_CONFIG_DIR` |
+| Config | `<config-dir>/config.toml` |
 | mTLS PEMs | `<config-dir>/tls/` (never in a git work tree; bootstrap refuses) |
 | sqlite + lock | `~/.local/state/mediaops/state.db` |
 | Plan artifacts | `~/.local/state/mediaops/plans/` |
 | Home socket | `$XDG_RUNTIME_DIR/mediaopsd.sock` |
-| On the box | `~/.local/bin/mediaopsd`, `~/.config/mediaops/{desired-state.toml,tls/}`, `~/.config/systemd/user/mediaopsd.service` |
+| On the box | `~/.local/bin/mediaopsd`, `~/.config/mediaops/{config.toml,tls/}`, `~/.config/systemd/user/mediaopsd.service` |
 
 Every verb and every generated unit derives its paths from the same defaults, so the config dir is one consistent choice per machine.
 
-Desired-state is deny-unknown-fields TOML. Sizes are `*_gib` / `*_mib` in the file and bytes in code.
+`config.toml` is deny-unknown-fields TOML. Sizes are `*_gib` / `*_mib` in the file and bytes in code.
 
-### Desired-state example (this operator's)
+### Config example (this operator's)
 
 ```toml
 schema_version = 1
@@ -160,7 +159,7 @@ Identity is **per file**: an episode is `(show, season, episode)`, a track is `(
 ## Setting it up (replacing `media-sync`)
 
 1. `make install` — `mediaops` and `mediaopsd` into `~/.cargo/bin`.
-2. Write `<config-dir>/desired-state.toml` (example above).
+2. Write `<config-dir>/config.toml` (example above).
 3. Bootstrap the box. The daemon must bind a port the box actually forwards; a rented box usually only forwards its per-user ports (`~/.<app>_port` on Swizzin/SeedIt4Me) — pick a free one with `--address`:
 
    ```bash
@@ -173,7 +172,7 @@ Identity is **per file**: an episode is `(show, season, episode)`, a track is `(
    mediaops seedbox bootstrap --yes ...same flags...                               # apply
    ```
 
-   It mints certs, ships `mediaopsd` + server certs + desired-state + a user unit, writes `seedbox_address` into desired-state, and edge-checks the box.
+   It mints certs, ships `mediaopsd` + server certs + `config.toml` + a user unit, writes `seedbox_address` into the config, and edge-checks the box.
 4. `mediaops library bootstrap --library-root /mnt/storage/videos` — schema dirs, sqlite, NVENC probe (prefers `/usr/lib/jellyfin-ffmpeg/ffmpeg`), and the `mediaopsd-home.service` / `mediaops-run.{service,timer}` user units.
 5. `systemctl --user daemon-reload && systemctl --user enable --now mediaopsd-home.service`, then `mediaops plan` (read-only) and `mediaops run`.
 6. Cut over: `systemctl --user disable --now media-sync.timer && systemctl --user enable --now mediaops-run.timer`. The timer fires one hour after the previous run finishes, like the old one; the service is niced for the spinning disk. Do not run both timers: both would pull the same files.
@@ -204,7 +203,7 @@ Live bootstrap, pull, and NVENC are **not** automatic. The ordered runbook, incl
 ```
 bins/mediaops     CLI composition root
 bins/mediaopsd    daemon composition root
-crates/core       TitleId (key/tmdb/tvdb/mbid), PathSchema v2, desired-state, Plan, jobs (no I/O)
+crates/core       TitleId (key/tmdb/tvdb/mbid), PathSchema v2, config.toml, Plan, jobs (no I/O)
 crates/proto      gRPC / prost (built from proto/mediaops.proto)
 crates/store      sqlite
 crates/net        mTLS, channels, seedbox + home serve

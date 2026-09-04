@@ -68,7 +68,7 @@ enum Command {
         config_dir: Option<PathBuf>,
         #[arg(long)]
         state_db: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         install: bool,
@@ -86,7 +86,7 @@ enum Command {
     Plan {
         #[arg(long)]
         state_db: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         library_root: Option<PathBuf>,
@@ -103,7 +103,7 @@ enum Command {
     Run {
         #[arg(long)]
         state_db: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         library_root: Option<PathBuf>,
@@ -127,7 +127,7 @@ enum Command {
         title: String,
         #[arg(long)]
         state_db: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         library_root: Option<PathBuf>,
@@ -144,7 +144,7 @@ enum Command {
         state_db: Option<PathBuf>,
         #[arg(long)]
         plans_dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         library_root: Option<PathBuf>,
@@ -160,7 +160,7 @@ enum Command {
     Reclaim(ReclaimArgs),
     /// Import-blocked inbox (lock-free).
     Hold(HoldArgs),
-    /// Export/import desired-state + tls/ + title-index into the active XDG dirs.
+    /// Export/import config.toml + tls/ + title-index into the active XDG dirs.
     NewMachine(NewMachineArgs),
     /// Read-only EdgeInvariant + key presence + PEM-in-git scan.
     Doctor {
@@ -170,7 +170,7 @@ enum Command {
         confirm: bool,
         #[arg(long)]
         pin: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -200,7 +200,7 @@ enum RepairCommand {
         confirm: bool,
         #[arg(long)]
         pin: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -274,13 +274,13 @@ struct NewMachineArgs {
 
 #[derive(Subcommand, Debug)]
 enum NewMachineCommand {
-    /// Write desired-state.toml, tls/, and title-index.json into `--out`.
+    /// Write config.toml, tls/, and title-index.json into `--out`.
     Export {
         #[arg(long)]
         out: PathBuf,
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         tls_dir: Option<PathBuf>,
@@ -295,7 +295,7 @@ enum NewMachineCommand {
         library_root: PathBuf,
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         tls_dir: Option<PathBuf>,
@@ -361,7 +361,7 @@ enum EncodeCommand {
         state_db: Option<PathBuf>,
         #[arg(long)]
         library_root: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         config_dir: Option<PathBuf>,
@@ -393,7 +393,7 @@ enum LibraryCommand {
     Bootstrap {
         #[arg(long)]
         library_root: PathBuf,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         config_dir: Option<PathBuf>,
@@ -408,7 +408,7 @@ enum LibraryCommand {
     Relocate {
         #[arg(long)]
         library_root: PathBuf,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         config_dir: Option<PathBuf>,
@@ -436,7 +436,7 @@ enum SeedboxCommand {
         yes: bool,
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         ssh_config: Option<PathBuf>,
@@ -447,9 +447,9 @@ enum SeedboxCommand {
         #[arg(long)]
         tls_dir: Option<PathBuf>,
     },
-    /// Apply grabber indexer/client sets from desired-state (Control GrabApply).
+    /// Apply grabber indexer/client sets from config.toml (Control GrabApply).
     Apply {
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -469,7 +469,7 @@ enum SeedboxCommand {
         yes: bool,
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long = "config", value_name = "PATH")]
         desired_state: Option<PathBuf>,
         #[arg(long)]
         ssh_config: Option<PathBuf>,

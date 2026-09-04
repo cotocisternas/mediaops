@@ -114,8 +114,7 @@ pub fn systemd_user_unit(exec_start: &str) -> String {
     )
 }
 
-/// `make musl`: the Makefile picks `musl-gcc` when present and falls back to
-/// `zig cc` as the musl C toolchain, so a box without musl-tools still builds.
+/// `make musl`: builds the static daemon with the musl target.
 pub fn musl_build_command() -> ExecCommand {
     ExecCommand::new("make", vec!["musl".into()])
 }
@@ -383,7 +382,7 @@ pub async fn install_provider(
             // and roots; without it the service crash-loops on start.
             exec.run(&scp_file_command(
                 desired_state,
-                ".config/mediaops/desired-state.toml",
+                ".config/mediaops/config.toml",
                 ssh_config,
             ))
             .await?;
@@ -546,7 +545,7 @@ mod tests {
             "",
             Path::new("/tmp/unit"),
             Path::new("/tmp/tls"),
-            Path::new("/tmp/desired-state.toml"),
+            Path::new("/tmp/config.toml"),
             Path::new("/tmp/ssh_config"),
         )
         .await
@@ -568,7 +567,7 @@ mod tests {
             "",
             Path::new("/tmp/unit"),
             Path::new("/tmp/tls"),
-            Path::new("/tmp/desired-state.toml"),
+            Path::new("/tmp/config.toml"),
             Path::new("/tmp/ssh_config"),
         )
         .await
@@ -705,7 +704,7 @@ mod tests {
         let unit_text = systemd_user_unit(
             "%h/.local/bin/mediaopsd serve --role seedbox --bind 0.0.0.0:50051 --tls-dir %h/.config/mediaops/tls",
         );
-        let desired_state = tls.parent().expect("dir").join("desired-state.toml");
+        let desired_state = tls.parent().expect("dir").join("config.toml");
         std::fs::write(&desired_state, "schema_version = 1\n").expect("ds");
         install_provider(
             &exec,
@@ -720,8 +719,8 @@ mod tests {
         .await
         .expect("install");
         assert!(
-            calls_scp_to(&exec, ".config/mediaops/desired-state.toml"),
-            "desired-state must be shipped: the unit reads it on the box"
+            calls_scp_to(&exec, ".config/mediaops/config.toml"),
+            "config.toml must be shipped: the unit reads it on the box"
         );
         let calls = exec.recorded();
         assert_eq!(calls[0].program_name(), "make");

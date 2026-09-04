@@ -33,7 +33,7 @@ pub fn scratch(tag: &str) -> PathBuf {
 }
 
 pub fn write_ds(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("desired-state.toml");
+    let path = dir.join("config.toml");
     std::fs::write(&path, body).expect("ds");
     path
 }
