@@ -1,4 +1,4 @@
-use mediaops_core::{Blake3Hex, TitleId, TitleIndexEntry, TitleIndexError};
+use mediaops_core::{Blake3Hex, TitleId, TitleIndexEntry, TitleIndexError, rewrite_absolute_under};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{StoreError, sqlite};
@@ -113,6 +113,59 @@ pub(crate) fn record_replace(
     Ok(())
 }
 
+pub(crate) fn import_rows(
+    conn: &mut Connection,
+    rows: &[TitleIndexEntry],
+) -> Result<(), StoreError> {
+    let tx = conn.transaction().map_err(sqlite)?;
+    let n: i64 = tx
+        .query_row("SELECT COUNT(*) FROM title_index", [], |row| row.get(0))
+        .map_err(sqlite)?;
+    if n > 0 {
+        return Err(StoreError::TitleIndex(TitleIndexError::NotEmpty));
+    }
+    for row in rows {
+        tx.execute(
+            "INSERT INTO title_index (title_id, path, install_b3, current_b3) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                row.title_id().render(),
+                row.path(),
+                row.install_b3().as_str(),
+                row.current_b3().as_str(),
+            ],
+        )
+        .map_err(sqlite)?;
+    }
+    tx.commit().map_err(sqlite)?;
+    Ok(())
+}
+
+pub(crate) fn rewrite_absolute_prefix(
+    conn: &mut Connection,
+    old_root: &str,
+    new_root: &str,
+) -> Result<u64, StoreError> {
+    if old_root.is_empty() || old_root == new_root {
+        return Ok(0);
+    }
+    let rows = list_titles(conn)?;
+    let tx = conn.transaction().map_err(sqlite)?;
+    let mut rewritten = 0_u64;
+    for row in rows {
+        let Some(new_path) = rewrite_absolute_under(row.path(), old_root, new_root) else {
+            continue;
+        };
+        tx.execute(
+            "UPDATE title_index SET path = ?1 WHERE title_id = ?2",
+            params![new_path, row.title_id().render()],
+        )
+        .map_err(sqlite)?;
+        rewritten += 1;
+    }
+    tx.commit().map_err(sqlite)?;
+    Ok(rewritten)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +245,96 @@ mod tests {
         drop(conn);
         let err = store.get_title(&title).await.expect_err("bad digest");
         assert!(matches!(err, StoreError::Digest(_)), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn import_rows_keeps_distinct_digests_and_refuses_non_empty() {
+        let dir = scratch("title-import");
+        let store = Store::open(dir.join("state.db")).await.expect("open");
+        let title = TitleId::movie("603").expect("title");
+        let a = digest('a');
+        let b = digest('b');
+        let path = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        let row = TitleIndexEntry::new(title.clone(), path, a.clone(), b.clone());
+        store.import_rows(&[row.clone()]).await.expect("import");
+        let entry = store.get_title(&title).await.expect("get").expect("row");
+        assert_eq!(entry.install_b3(), &a);
+        assert_eq!(entry.current_b3(), &b);
+        assert_eq!(entry.path(), path);
+        let err = store
+            .import_rows(std::slice::from_ref(&row))
+            .await
+            .expect_err("non-empty");
+        assert!(
+            matches!(err, StoreError::TitleIndex(TitleIndexError::NotEmpty)),
+            "{err}"
+        );
+        let listed = store.list_titles().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].current_b3(), &b);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rewrite_absolute_prefix_skips_relative_rows() {
+        let dir = scratch("title-rewrite");
+        let store = Store::open(dir.join("state.db")).await.expect("open");
+        let rel = TitleId::movie("603").expect("rel");
+        let abs = TitleId::movie("604").expect("abs");
+        let other = TitleId::movie("605").expect("other");
+        let a = digest('a');
+        let rel_path = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        store
+            .import_rows(&[
+                TitleIndexEntry::new(rel.clone(), rel_path, a.clone(), a.clone()),
+                TitleIndexEntry::new(
+                    abs.clone(),
+                    "/data/old/movies/Other.(1999).{tmdb-604}/Other.(1999).mkv",
+                    a.clone(),
+                    digest('b'),
+                ),
+                TitleIndexEntry::new(
+                    other.clone(),
+                    "/other/movies/Skip.(1999).{tmdb-605}/Skip.(1999).mkv",
+                    a.clone(),
+                    a.clone(),
+                ),
+            ])
+            .await
+            .expect("import");
+        let n = store
+            .rewrite_absolute_prefix("/data/old", "/mnt/new")
+            .await
+            .expect("rewrite");
+        assert_eq!(n, 1);
+        assert_eq!(
+            store
+                .get_title(&rel)
+                .await
+                .expect("rel")
+                .expect("row")
+                .path(),
+            rel_path
+        );
+        assert_eq!(
+            store
+                .get_title(&abs)
+                .await
+                .expect("abs")
+                .expect("row")
+                .path(),
+            "/mnt/new/movies/Other.(1999).{tmdb-604}/Other.(1999).mkv"
+        );
+        assert_eq!(
+            store
+                .get_title(&other)
+                .await
+                .expect("other")
+                .expect("row")
+                .path(),
+            "/other/movies/Skip.(1999).{tmdb-605}/Skip.(1999).mkv"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

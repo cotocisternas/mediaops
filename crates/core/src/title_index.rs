@@ -4,13 +4,19 @@
 //! [`TitleIndexRepo::record_install`] after a successful [`crate::install::install`].
 //! `current_b3` is what `verify` checks: that same call sets it, and only
 //! [`TitleIndexRepo::record_replace`] (after encode's [`crate::install::replace`])
-//! updates it afterwards.
+//! updates it afterwards. Full-row import keeps a distinct `current_b3`;
+//! `record_install` cannot.
+
+use std::path::{Component, Path};
+
+use serde::{Deserialize, Serialize};
 
 use crate::digest::Blake3Hex;
 use crate::title_id::TitleId;
 
 /// One `title_index` row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TitleIndexEntry {
     title_id: TitleId,
     /// Library-relative schema path. Empty means a pre-v5 row; callers walk
@@ -62,6 +68,38 @@ pub enum TitleIndexError {
     InstallDigestImmutable,
     #[error("no title_index row to replace")]
     NotInstalled,
+    #[error("title_index is not empty")]
+    NotEmpty,
+}
+
+/// Rewrite `path` when it is absolute and lives under `old_root`.
+///
+/// Relative (schema) paths are left alone. `/` and empty roots never match.
+/// A `..` remainder does not rewrite (would escape `new_root`).
+pub fn rewrite_absolute_under(path: &str, old_root: &str, new_root: &str) -> Option<String> {
+    let path_p = Path::new(path);
+    if !path_p.is_absolute() {
+        return None;
+    }
+    let old = trim_trailing_slashes(old_root);
+    let new = trim_trailing_slashes(new_root);
+    if old.is_empty() || old == "/" || new.is_empty() || new == "/" {
+        return None;
+    }
+    let old_p = Path::new(old);
+    let new_p = Path::new(new);
+    if path_p == old_p {
+        return Some(new_p.display().to_string());
+    }
+    let rest = path_p.strip_prefix(old_p).ok()?;
+    if rest.components().any(|c| matches!(c, Component::ParentDir)) {
+        return None;
+    }
+    Some(new_p.join(rest).display().to_string())
+}
+
+fn trim_trailing_slashes(s: &str) -> &str {
+    if s == "/" { s } else { s.trim_end_matches('/') }
 }
 
 /// Persistence door for the install gate. Adapter lives in `store`.
@@ -88,6 +126,16 @@ pub trait TitleIndexRepo: Send + Sync {
         title_id: &TitleId,
         current_b3: &Blake3Hex,
     ) -> Result<(), Self::Error>;
+    /// New-machine import: insert full rows including distinct digests.
+    /// Refuses when `title_index` is already non-empty.
+    async fn import_rows(&self, rows: &[TitleIndexEntry]) -> Result<(), Self::Error>;
+    /// Relocate: rewrite absolute paths stored under `old_root`. Relative rows
+    /// are unchanged. Returns how many rows were rewritten.
+    async fn rewrite_absolute_prefix(
+        &self,
+        old_root: &str,
+        new_root: &str,
+    ) -> Result<u64, Self::Error>;
 }
 
 #[cfg(test)]
@@ -113,5 +161,68 @@ mod tests {
         assert!(!entry.path_missing());
         assert_eq!(entry.install_b3(), &install);
         assert_eq!(entry.current_b3(), &current);
+    }
+
+    #[test]
+    fn rewrite_leaves_relative_and_foreign_absolute_paths() {
+        let rel = "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        assert_eq!(rewrite_absolute_under(rel, "/data/old", "/data/new"), None);
+        assert_eq!(
+            rewrite_absolute_under("/other/movies/x.mkv", "/data/old", "/data/new"),
+            None
+        );
+        assert_eq!(
+            rewrite_absolute_under("/data/old-backup/x.mkv", "/data/old", "/data/new"),
+            None
+        );
+        assert_eq!(
+            rewrite_absolute_under("/data/old/x.mkv", "/", "/data/new"),
+            None
+        );
+        assert_eq!(
+            rewrite_absolute_under("/data/old/x.mkv", "", "/data/new"),
+            None
+        );
+        assert_eq!(
+            rewrite_absolute_under("/data/old/x.mkv", "/data/old", ""),
+            None
+        );
+        assert_eq!(
+            rewrite_absolute_under("/data/old/x.mkv", "/data/old", "/"),
+            None
+        );
+        assert_eq!(
+            rewrite_absolute_under("/data/old/foo/../x.mkv", "/data/old", "/data/new"),
+            None
+        );
+    }
+
+    #[test]
+    fn rewrite_absolute_under_old_root_uses_new_prefix() {
+        let abs = "/data/old/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv";
+        assert_eq!(
+            rewrite_absolute_under(abs, "/data/old", "/data/new").as_deref(),
+            Some("/data/new/movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv")
+        );
+        assert_eq!(
+            rewrite_absolute_under("/data/old", "/data/old/", "/mnt/lib").as_deref(),
+            Some("/mnt/lib")
+        );
+    }
+
+    #[test]
+    fn json_round_trip_keeps_distinct_digests() {
+        let entry = TitleIndexEntry::new(
+            TitleId::movie("603").expect("title"),
+            "movies/The.Matrix.(1999).{tmdb-603}/The.Matrix.(1999).mkv",
+            digest('a'),
+            digest('b'),
+        );
+        let json = serde_json::to_string(&entry).expect("json");
+        assert!(json.contains("\"install_b3\""));
+        assert!(json.contains("\"current_b3\""));
+        let back: TitleIndexEntry = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, entry);
+        assert_ne!(back.install_b3(), back.current_b3());
     }
 }

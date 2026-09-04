@@ -136,6 +136,23 @@ impl Store {
             .await
     }
 
+    pub async fn import_rows(&self, rows: &[TitleIndexEntry]) -> Result<(), StoreError> {
+        let rows = rows.to_vec();
+        self.with(move |conn| title_index::import_rows(conn, &rows))
+            .await
+    }
+
+    pub async fn rewrite_absolute_prefix(
+        &self,
+        old_root: &str,
+        new_root: &str,
+    ) -> Result<u64, StoreError> {
+        let old_root = old_root.to_string();
+        let new_root = new_root.to_string();
+        self.with(move |conn| title_index::rewrite_absolute_prefix(conn, &old_root, &new_root))
+            .await
+    }
+
     pub async fn get_job(&self, id: JobId) -> Result<Option<Job>, StoreError> {
         self.with(move |conn| jobs::get_job(conn, id)).await
     }
@@ -232,6 +249,18 @@ impl TitleIndexRepo for Store {
         current_b3: &Blake3Hex,
     ) -> Result<(), StoreError> {
         Store::record_replace(self, title_id, current_b3).await
+    }
+
+    async fn import_rows(&self, rows: &[TitleIndexEntry]) -> Result<(), StoreError> {
+        Store::import_rows(self, rows).await
+    }
+
+    async fn rewrite_absolute_prefix(
+        &self,
+        old_root: &str,
+        new_root: &str,
+    ) -> Result<u64, StoreError> {
+        Store::rewrite_absolute_prefix(self, old_root, new_root).await
     }
 }
 
