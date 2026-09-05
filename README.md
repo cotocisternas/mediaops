@@ -1,5 +1,8 @@
 # mediaops
 
+[![CI](https://github.com/cotocisternas/mediaops/actions/workflows/ci.yml/badge.svg)](https://github.com/cotocisternas/mediaops/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Home-disk library of record plus a disposable seedbox. The CLI (`mediaops`) talks only to a local `mediaopsd` over a unix socket. The seedbox daemon is the only process that opens the WAN. Pull is one-way Range RPC (not FTP, rsync, or SSH copy). `grabber=None` is a valid path: a schema folder on the box, a disk at home.
 
 This repo is a Cargo workspace. The product contract lives under `_bmad-output/specs/spec-mediaops/`. This file is how to build and run it.
@@ -378,3 +381,7 @@ crates/arch-tests dependency-graph law
 - [`_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md`](_bmad-output/planning-artifacts/architecture/architecture-mediaops-2026-08-29/ARCHITECTURE-SPINE.md) — crate graph and ADs
 
 Not in this tree yet: `docs render`, TUI.
+
+## License
+
+[MIT](LICENSE). See [CONTRIBUTING](CONTRIBUTING.md) and [SECURITY](SECURITY.md).
