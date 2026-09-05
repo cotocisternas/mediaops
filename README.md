@@ -59,7 +59,164 @@ make build
 ./target/debug/mediaopsd --help
 ```
 
-`--json` on every verb prints one `{ok,data,error}` envelope on stdout. Tracing goes to stderr.
+`--json` on every verb prints one `{ok,data,error}` envelope on stdout. Tracing goes to stderr. Human stdout is the operator UI: color and bold only when stdout is a tty, sizes as `7.1 GiB`, ages as `21m`. Plan JSON / lock / socket paths are the last line or omitted.
+
+## How to use it
+
+One operator, their machines. After `make install`, type these. The timer runs `mediaops run`; you peek with the rest.
+
+`why` and `watch` take a spoken name (`Hearts`, `Mr Robot`) or a title id. A name only resolves when the library, a job, the hold inbox, or a listing already knows it. `hold approve` / `reject` take the id from `hold list` (`movie:tmdb:4539`).
+
+### Daily
+
+```bash
+mediaops status
+mediaops hold list
+mediaops plan
+mediaops run
+mediaops why 'Mr Robot'
+```
+
+`status` — lock-free. Quiet means nothing in flight:
+
+```
+nothing happening
+
+disk      693.1 GiB free
+home      3.8 TiB free
+```
+
+Work looks like:
+
+```
+want      The Matrix (1999)
+pull      The Matrix (1999)  pulling
+
+disk      693.1 GiB free
+```
+
+`hold list` — inbox. The id on the second line is what you approve:
+
+```
+1.  Hearts of Darkness A Filmmaker's Apocalypse (1991)  7.1 GiB  75m
+    movie:tmdb:4539
+    Found matching movie via grab history, but release was matched to movie by ID. Manual Import required.
+    Hearts.of.Darkness-Reise.ins.Herz.der.Finsternis.GERMAN.DL.DOKU.1080P.BLURAY.X264-WATCHABLE
+
+approve   mediaops hold approve movie:tmdb:4539
+```
+
+```bash
+mediaops hold approve movie:tmdb:4539   # records a decision; does not install
+mediaops hold reject movie:tmdb:4539    # never this release
+```
+
+```
+approved  Hearts of Darkness A Filmmaker's Apocalypse (1991)
+          movie:tmdb:4539
+```
+
+`plan` — exclusive lock. One line per copy / skip / review. Reconciler bookkeeping (`grab_apply`, `edge_apply`) is hidden. Empty is `nothing to copy`.
+
+```
+copy      Mr Robot (2015) S01E02  4.0 GiB
+copy      Mr Robot (2015) S04E01  2.6 GiB
+review    usenet_tv / _UNPACK_Mr.Robot.S02…  unparseable
+
+/home/coto/.local/state/mediaops/plans/….json
+```
+
+`run` — exclusive lock. Plan then apply that artifact in this process. Lock conflict is exit 3, never silent 0. A long pull prints progress on stderr (tty only):
+
+```
+pull    Mr Robot (2015) S01E02  1.2 GiB / 4.0 GiB
+```
+
+When it finishes:
+
+```
+copied    Mr Robot (2015) S01E02
+copied    Mr Robot (2015) S04E01
+```
+
+`why` — lock-free. Headline, then id, then only the facts that exist:
+
+```
+$ mediaops why Hearts
+Hearts of Darkness A Filmmaker's Apocalypse (1991)
+movie:tmdb:4539
+
+hold      Found matching movie via grab history, but release was matched to movie by ID. Manual Import required.  7.1 GiB
+grab      wanted, not on the box
+
+$ mediaops why 'Mr Robot'
+Mr Robot (2015)
+series:key:mrrobot.2015
+
+grab      wanted, not on the box
+import    Mr Robot (2015) S01E02
+
+$ mediaops why series:key:foundation.2021
+Foundation (2021)
+series:key:foundation.2021
+
+quiet
+```
+
+### Occasional
+
+```bash
+mediaops list
+mediaops watch 'Mr Robot'                   # or series:key:mrrobot.2015
+mediaops pull --root tv --path 'Mr.Robot.(2015)/Season.01/Mr.Robot.(2015).S01E02.mkv' \
+  --title-id series:key:mrrobot.2015 --name 'Mr.Robot.(2015).S01E02.mkv' --install
+mediaops reclaim preview
+mediaops reclaim apply
+mediaops encode scan
+mediaops encode run
+mediaops doctor
+```
+
+`list` — files on the box, grouped by root:
+
+```
+tv
+   4.0 GiB  Mr.Robot.(2015)/Season.01/Mr.Robot.(2015).S01E02.eps1.1_ones-and-zer0es.mpeg.mkv
+
+usenet_movies
+   6.8 GiB  Hearts.of.Darkness-…WATCHABLE.mkv
+```
+
+`watch` records a want and exits. It does not wait for playable:
+
+```
+watching  Foundation (2021)
+          series:key:foundation.2021
+```
+
+`reclaim preview` is lock-free. `reclaim apply` is exclusive and unlinks box copies proved installed at home (index row + file on disk) and not seeding.
+
+```
+nothing to reclaim
+```
+
+or
+
+```
+reclaim   The Matrix (1999)  6.8 GiB
+          seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
+          ratio 2.1  public
+```
+
+`encode scan` / `run` are home GPU only (not in `mediaopsd`). Empty is `nothing to encode`. Scan of a movie that should go through NVENC:
+
+```
+encode    The Matrix (1999)
+```
+
+`doctor` prints `ok` when the edge invariant holds.
+
+Empty states are English: `nothing happening`, `nothing on hold`, `nothing to copy`, `nothing on the box`, `nothing to reclaim`, `nothing to encode`.
 
 ### CLI verbs (`mediaops`)
 
@@ -177,7 +334,7 @@ Identity is **per file**: an episode is `(show, season, episode)`, a track is `(
 5. `systemctl --user daemon-reload && systemctl --user enable --now mediaopsd-home.service`, then `mediaops plan` (read-only) and `mediaops run`.
 6. Cut over: `systemctl --user disable --now media-sync.timer && systemctl --user enable --now mediaops-run.timer`. The timer fires one hour after the previous run finishes, like the old one; the service is niced for the spinning disk. Do not run both timers: both would pull the same files.
 
-`mediaops status`, `mediaops why TITLE`, `mediaops doctor`, and `mediaops reclaim preview` are lock-free and safe at any time. `reclaim apply` unlinks box copies that are proved installed at home (index row + file on disk) and not seeding.
+See [How to use it](#how-to-use-it) for the daily commands and what they print. `status`, `why`, `doctor`, `hold list`, and `reclaim preview` are lock-free. `reclaim apply` unlinks box copies that are proved installed at home (index row + file on disk) and not seeding.
 
 ## Tests
 
