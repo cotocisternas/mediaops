@@ -154,9 +154,9 @@ impl TryFrom<RemoteEntry> for CoreRemoteEntry {
     type Error = ConvertError;
 
     fn try_from(value: RemoteEntry) -> Result<Self, Self::Error> {
-        let r#ref = CoreRemoteRef::try_from(require_nested(value.r#ref, "ref")?)?;
+        let remote_ref = CoreRemoteRef::try_from(require_nested(value.remote_ref, "remote_ref")?)?;
         Ok(CoreRemoteEntry::from_wire_parts(
-            r#ref,
+            remote_ref,
             value.len,
             value.mtime,
             value.nlink,
@@ -169,7 +169,7 @@ impl TryFrom<&CoreRemoteEntry> for RemoteEntry {
 
     fn try_from(value: &CoreRemoteEntry) -> Result<Self, Self::Error> {
         Ok(Self {
-            r#ref: Some(RemoteRef::try_from(value.r#ref())?),
+            remote_ref: Some(RemoteRef::try_from(value.r#ref())?),
             len: value.len(),
             mtime: value.mtime(),
             nlink: value.nlink(),
@@ -189,7 +189,7 @@ impl TryFrom<StatRequest> for CoreRemoteRef {
     type Error = ConvertError;
 
     fn try_from(value: StatRequest) -> Result<Self, Self::Error> {
-        Self::try_from(require_nested(value.r#ref, "ref")?)
+        Self::try_from(require_nested(value.remote_ref, "remote_ref")?)
     }
 }
 
@@ -197,7 +197,7 @@ impl TryFrom<DeleteRemoteRequest> for CoreRemoteRef {
     type Error = ConvertError;
 
     fn try_from(value: DeleteRemoteRequest) -> Result<Self, Self::Error> {
-        Self::try_from(require_nested(value.r#ref, "ref")?)
+        Self::try_from(require_nested(value.remote_ref, "remote_ref")?)
     }
 }
 
@@ -205,7 +205,7 @@ impl TryFrom<GetRangeRequest> for CoreRemoteRef {
     type Error = ConvertError;
 
     fn try_from(value: GetRangeRequest) -> Result<Self, Self::Error> {
-        Self::try_from(require_nested(value.r#ref, "ref")?)
+        Self::try_from(require_nested(value.remote_ref, "remote_ref")?)
     }
 }
 
@@ -276,7 +276,7 @@ impl From<&CoreHoldLiveItem> for HoldLiveItem {
             added_unix: item.added_unix,
             size: item.size,
             reason: item.reason.clone(),
-            remote: item.remote.as_ref().map(remote_ref_to_wire),
+            remote_ref: item.remote.as_ref().map(remote_ref_to_wire),
             placement: item.placement.as_ref().map(Placement::from),
         }
     }
@@ -300,7 +300,7 @@ impl TryFrom<HoldLiveItem> for CoreHoldLiveItem {
             added_unix: value.added_unix,
             size: value.size,
             reason: value.reason,
-            remote: value.remote.map(CoreRemoteRef::try_from).transpose()?,
+            remote: value.remote_ref.map(CoreRemoteRef::try_from).transpose()?,
             placement: value.placement.map(CorePlacement::try_from).transpose()?,
             output_path: None,
         })
@@ -337,7 +337,7 @@ impl From<&CorePlacement> for Placement {
             } => Self {
                 kind: Some(placement::Kind::Movie(MoviePlacement {
                     title: title.clone(),
-                    year: u32::from(*year),
+                    year: Some(u32::from(*year)),
                     extension: extension.clone(),
                 })),
             },
@@ -352,12 +352,12 @@ impl From<&CorePlacement> for Placement {
             } => Self {
                 kind: Some(placement::Kind::Episode(EpisodePlacement {
                     title: title.clone(),
-                    year: u32::from(*year),
-                    season: u32::from(*season),
-                    episode: u32::from(*episode),
+                    year: Some(u32::from(*year)),
+                    season: Some(u32::from(*season)),
+                    episode: Some(u32::from(*episode)),
                     extension: extension.clone(),
-                    episode_end: episode_end.map(u32::from).unwrap_or(0),
-                    episode_title: episode_title.clone().unwrap_or_default(),
+                    episode_end: episode_end.map(u32::from),
+                    episode_title: episode_title.clone(),
                 })),
             },
             CorePlacement::Track {
@@ -371,12 +371,12 @@ impl From<&CorePlacement> for Placement {
             } => Self {
                 kind: Some(placement::Kind::Track(TrackPlacement {
                     album: album.clone(),
-                    year: u32::from(*year),
-                    track: track.map(u32::from).unwrap_or(0),
+                    year: Some(u32::from(*year)),
+                    track: track.map(u32::from),
                     title: title.clone(),
                     extension: extension.clone(),
                     artist: artist.clone(),
-                    disc: disc.map(u32::from).unwrap_or(0),
+                    disc: disc.map(u32::from),
                 })),
             },
         }
@@ -390,30 +390,26 @@ impl TryFrom<Placement> for CorePlacement {
         match value.kind {
             Some(placement::Kind::Movie(movie)) => Ok(Self::movie(
                 movie.title,
-                fit_u16(movie.year, "year")?,
+                fit_u16(movie.year.unwrap_or(0), "year")?,
                 movie.extension,
             )),
             Some(placement::Kind::Episode(ep)) => Ok(Self::episode_titled(
                 ep.title,
-                fit_u16(ep.year, "year")?,
-                fit_u8(ep.season, "season")?,
-                fit_u16(ep.episode, "episode")?,
-                (ep.episode_end != 0)
-                    .then(|| fit_u16(ep.episode_end, "episode_end"))
+                fit_u16(ep.year.unwrap_or(0), "year")?,
+                fit_u8(ep.season.unwrap_or(0), "season")?,
+                fit_u16(ep.episode.unwrap_or(0), "episode")?,
+                ep.episode_end
+                    .map(|n| fit_u16(n, "episode_end"))
                     .transpose()?,
-                (!ep.episode_title.is_empty()).then_some(ep.episode_title),
+                ep.episode_title.filter(|s| !s.is_empty()),
                 ep.extension,
             )),
             Some(placement::Kind::Track(track)) => Ok(Self::track(
                 track.artist,
                 track.album,
-                fit_u16(track.year, "year")?,
-                (track.disc != 0)
-                    .then(|| fit_u8(track.disc, "disc"))
-                    .transpose()?,
-                (track.track != 0)
-                    .then(|| fit_u8(track.track, "track"))
-                    .transpose()?,
+                fit_u16(track.year.unwrap_or(0), "year")?,
+                track.disc.map(|n| fit_u8(n, "disc")).transpose()?,
+                track.track.map(|n| fit_u8(n, "track")).transpose()?,
                 track.title,
                 track.extension,
             )),
@@ -442,11 +438,11 @@ impl TryFrom<WantedMissingResponse> for Vec<TitleId> {
     type Error = ConvertError;
 
     fn try_from(value: WantedMissingResponse) -> Result<Self, Self::Error> {
-        Ok(value
-            .title_id
+        value
+            .title_ids
             .into_iter()
-            .filter_map(|raw| TitleId::parse(&raw).ok())
-            .collect())
+            .map(|raw| TitleId::parse(&raw).map_err(ConvertError::from))
+            .collect()
     }
 }
 
@@ -513,7 +509,7 @@ impl TryFrom<GuardPreviewItem> for CoreGuardPreviewItem {
             is_private: value.is_private,
             content_path: value.content_path,
             save_path: value.save_path,
-            remote: value.r#ref.map(CoreRemoteRef::try_from).transpose()?,
+            remote: value.remote_ref.map(CoreRemoteRef::try_from).transpose()?,
         })
     }
 }
@@ -529,7 +525,7 @@ impl TryFrom<&CoreGuardPreviewItem> for GuardPreviewItem {
             is_private: value.is_private,
             content_path: value.content_path.clone(),
             save_path: value.save_path.clone(),
-            r#ref: value.remote.as_ref().map(RemoteRef::try_from).transpose()?,
+            remote_ref: value.remote.as_ref().map(RemoteRef::try_from).transpose()?,
         })
     }
 }
@@ -615,14 +611,14 @@ fn control_error_from_status(status: tonic::Status) -> ControlError {
     }
 }
 
-/// Canonical [`ControlPort`] over the generated [`control_client::ControlClient`].
+/// Canonical [`ControlPort`] over the generated [`control_service_client::ControlServiceClient`].
 #[derive(Debug, Clone)]
 pub struct ControlPortClient<T> {
-    inner: control_client::ControlClient<T>,
+    inner: control_service_client::ControlServiceClient<T>,
 }
 
 impl<T> ControlPortClient<T> {
-    pub fn new(inner: control_client::ControlClient<T>) -> Self {
+    pub fn new(inner: control_service_client::ControlServiceClient<T>) -> Self {
         Self { inner }
     }
 }
@@ -669,7 +665,7 @@ where
         let mut client = self.inner.clone();
         Box::pin(async move {
             let request = DeleteRemoteRequest {
-                r#ref: Some(RemoteRef::try_from(remote).map_err(convert_to_control)?),
+                remote_ref: Some(RemoteRef::try_from(remote).map_err(convert_to_control)?),
             };
             let response = client
                 .delete_remote(request)
@@ -1034,7 +1030,7 @@ mod tests {
             is_private: false,
             content_path: String::new(),
             save_path: String::new(),
-            r#ref: None,
+            remote_ref: None,
         };
         let parsed = CoreGuardPreviewItem::try_from(empty).expect("optional ref");
         assert!(parsed.remote.is_none());
@@ -1096,28 +1092,28 @@ mod tests {
     fn missing_nested_refs_are_convert_errors() {
         assert!(matches!(
             CoreRemoteEntry::try_from(RemoteEntry {
-                r#ref: None,
+                remote_ref: None,
                 len: 1,
                 mtime: 0,
                 nlink: 1,
             }),
-            Err(ConvertError::MissingField("ref"))
+            Err(ConvertError::MissingField("remote_ref"))
         ));
         assert!(matches!(
-            CoreRemoteRef::try_from(StatRequest { r#ref: None }),
-            Err(ConvertError::MissingField("ref"))
+            CoreRemoteRef::try_from(StatRequest { remote_ref: None }),
+            Err(ConvertError::MissingField("remote_ref"))
         ));
         assert!(matches!(
-            CoreRemoteRef::try_from(DeleteRemoteRequest { r#ref: None }),
-            Err(ConvertError::MissingField("ref"))
+            CoreRemoteRef::try_from(DeleteRemoteRequest { remote_ref: None }),
+            Err(ConvertError::MissingField("remote_ref"))
         ));
         assert!(matches!(
             CoreRemoteRef::try_from(GetRangeRequest {
-                r#ref: None,
+                remote_ref: None,
                 offset: 0,
                 len: 1,
             }),
-            Err(ConvertError::MissingField("ref"))
+            Err(ConvertError::MissingField("remote_ref"))
         ));
         assert!(matches!(
             CoreRemoteEntry::try_from(StatResponse { entry: None }),
@@ -1125,7 +1121,7 @@ mod tests {
         ));
         let list = ListResponse {
             entries: vec![RemoteEntry {
-                r#ref: None,
+                remote_ref: None,
                 len: 1,
                 mtime: 0,
                 nlink: 1,
@@ -1133,7 +1129,7 @@ mod tests {
         };
         assert!(matches!(
             Vec::<CoreRemoteEntry>::try_from(list),
-            Err(ConvertError::MissingField("ref"))
+            Err(ConvertError::MissingField("remote_ref"))
         ));
     }
 
@@ -1161,7 +1157,7 @@ mod tests {
         let response = WantedMissingResponse {
             semver: "0.1.0".into(),
             proto_package: PROTO_PACKAGE.into(),
-            title_id: vec!["movie:tmdb:603".into(), "series:tvdb:79126".into()],
+            title_ids: vec!["movie:tmdb:603".into(), "series:tvdb:79126".into()],
         };
         let ids = Vec::<TitleId>::try_from(response).expect("ids");
         assert_eq!(ids[0].render(), "movie:tmdb:603");
@@ -1169,11 +1165,12 @@ mod tests {
         let mixed = WantedMissingResponse {
             semver: "0.1.0".into(),
             proto_package: PROTO_PACKAGE.into(),
-            title_id: vec!["not-a-title".into(), "movie:tmdb:603".into()],
+            title_ids: vec!["not-a-title".into(), "movie:tmdb:603".into()],
         };
-        let ids = Vec::<TitleId>::try_from(mixed).expect("skip bad");
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0].render(), "movie:tmdb:603");
+        assert!(matches!(
+            Vec::<TitleId>::try_from(mixed),
+            Err(ConvertError::TitleId(_))
+        ));
     }
 
     #[test]
@@ -1196,7 +1193,7 @@ mod tests {
         assert_eq!(wire.added_unix, 1_577_836_800);
         assert_eq!(wire.size, 1234);
         assert_eq!(
-            wire.remote.as_ref().expect("remote").rel_path,
+            wire.remote_ref.as_ref().expect("remote").rel_path,
             "The.Matrix.1999.mkv"
         );
         let back = CoreHoldLiveItem::try_from(wire).expect("from wire");
@@ -1234,7 +1231,7 @@ mod tests {
         };
         let wire = HoldLiveItem::from(&domain);
         assert!(
-            wire.remote.is_some(),
+            wire.remote_ref.is_some(),
             "mapped RemoteRef must not be dropped on the wire"
         );
         let back = CoreHoldLiveItem::try_from(wire).expect("from wire");
@@ -1263,11 +1260,18 @@ mod tests {
         };
         let wire = HoldLiveItem::from(&domain);
         assert!(
-            wire.remote.is_some(),
+            wire.remote_ref.is_some(),
             "lossy RemoteRef must still be emitted"
         );
-        assert_eq!(wire.remote.as_ref().expect("remote").root_id, "seedbox");
-        assert!(!wire.remote.as_ref().expect("remote").rel_path.is_empty());
+        assert_eq!(wire.remote_ref.as_ref().expect("remote").root_id, "seedbox");
+        assert!(
+            !wire
+                .remote_ref
+                .as_ref()
+                .expect("remote")
+                .rel_path
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1278,7 +1282,7 @@ mod tests {
             added_unix: 0,
             size: 0,
             reason: String::new(),
-            remote: None,
+            remote_ref: None,
             placement: None,
         })
         .unwrap_err();
@@ -1289,7 +1293,7 @@ mod tests {
             added_unix: 0,
             size: 0,
             reason: String::new(),
-            remote: None,
+            remote_ref: None,
             placement: None,
         })
         .unwrap_err();

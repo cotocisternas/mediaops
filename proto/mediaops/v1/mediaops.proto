@@ -1,0 +1,444 @@
+// mediaops.v1 is the home↔seedbox gRPC contract.
+//
+// Three services share this package: TransferService (disk listing and Range
+// pull), ControlService (df, grabber, holds, reclaim), and GatewayService
+// (home unix-socket pool only). Additive evolution stays in this package.
+syntax = "proto3";
+
+package mediaops.v1;
+
+// Allowlisted remote path. Identity is root_id plus a relative path, never a
+// raw filesystem string.
+message RemoteRef {
+  // Allowlist root name (for example "seedbox").
+  string root_id = 1;
+  // Path relative to that root. Must not be absolute or escape the root.
+  string rel_path = 2;
+}
+
+// One file on an allowlisted root, as returned by List and Stat.
+message RemoteEntry {
+  // Path of this file on the box.
+  RemoteRef remote_ref = 1;
+  // Size in bytes.
+  uint64 len = 2;
+  // POSIX mtime as Unix seconds. Negative values are preserved.
+  int64 mtime = 3;
+  // Hard-link count from the remote inode.
+  uint64 nlink = 4;
+}
+
+// Domain error packed into gRPC Status.details. Construction lives in the
+// proto crate only.
+message ErrorDetail {
+  // Process exit code (0–5). Unknown values are rejected at conversion.
+  int32 exit_code = 1;
+  // Stable machine token, such as an ExitCode error_code or resource_exhausted.
+  string reason = 2;
+  // Operator-facing message. Also copied into Status.message.
+  string message = 3;
+}
+
+// Range pull and remote listing. Served by seedbox mediaopsd and re-exported
+// on the home unix socket.
+service TransferService {
+  // Walk every allowlisted root and return the files the planner may see.
+  rpc List(ListRequest) returns (ListResponse);
+  // Stat one remote path. Missing or escaped paths are an error.
+  rpc Stat(StatRequest) returns (StatResponse);
+  // Read [offset, offset+len) and stream the bytes. The daemon caps len.
+  rpc GetRange(GetRangeRequest) returns (stream GetRangeResponse);
+}
+
+// Empty List input. The walker uses the daemon's allowlist, not the request.
+message ListRequest {}
+
+// Listing of every allowlisted file the seedbox will show the planner.
+message ListResponse {
+  // Files in walker order.
+  repeated RemoteEntry entries = 1;
+}
+
+// Stat one remote file.
+message StatRequest {
+  // File to stat.
+  RemoteRef remote_ref = 1;
+}
+
+// Stat result for one remote file.
+message StatResponse {
+  // Size, mtime, and nlink for the requested path.
+  RemoteEntry entry = 1;
+}
+
+// Byte range to pull. offset+len must not overflow; len is capped by the
+// daemon (range_len_mib).
+message GetRangeRequest {
+  // File to read.
+  RemoteRef remote_ref = 1;
+  // First byte, inclusive.
+  uint64 offset = 2;
+  // Number of bytes requested.
+  uint64 len = 3;
+}
+
+// One chunk of a GetRange stream.
+message GetRangeResponse {
+  // Raw file bytes. Empty only if the range was empty.
+  bytes data = 1;
+}
+
+// Grabber, holds, reclaim, and handshake. Served by seedbox mediaopsd and
+// re-exported on the home unix socket.
+service ControlService {
+  // Free disk plus the proto-package handshake.
+  rpc Df(DfRequest) returns (DfResponse);
+  // Tell *arr a title is already local. No-op when grabber is none.
+  rpc Unmonitor(UnmonitorRequest) returns (UnmonitorResponse);
+  // Unlink a remote file after local proof, unless a torrent still covers it.
+  rpc DeleteRemote(DeleteRemoteRequest) returns (DeleteRemoteResponse);
+  // Apply grabber desired state (Sonarr/Radarr/Lidarr/Prowlarr/SAB).
+  rpc GrabApply(GrabApplyRequest) returns (GrabApplyResponse);
+  // Compare the box edge (nginx, TLS) against desired state.
+  rpc EdgeCheck(EdgeCheckRequest) returns (EdgeCheckResponse);
+  // Apply edge desired state.
+  rpc EdgeApply(EdgeApplyRequest) returns (EdgeApplyResponse);
+  // Report which grabber API keys the box config already has. Never echo keys.
+  rpc KeyDiscovery(KeyDiscoveryRequest) returns (KeyDiscoveryResponse);
+  // Ranked reclaim preview from qBittorrent. Empty when qBit is off.
+  rpc GuardPreview(GuardPreviewRequest) returns (GuardPreviewResponse);
+  // Import-blocked holds the seedbox currently sees.
+  rpc HoldList(HoldListRequest) returns (HoldListResponse);
+  // Record a reject decision. Copy still waits for the next exclusive run.
+  rpc HoldReject(HoldRejectRequest) returns (HoldRejectResponse);
+  // Titles *arr still thinks are missing.
+  rpc WantedMissing(WantedMissingRequest) returns (WantedMissingResponse);
+}
+
+// Home unix socket only. Seedbox mediaopsd does not serve this.
+service GatewayService {
+  // Pin the upstream channel pool to a concurrency.
+  rpc ConfigurePool(ConfigurePoolRequest) returns (ConfigurePoolResponse);
+  // Current pool size and the upstream endpoint fingerprint.
+  rpc PoolStatus(PoolStatusRequest) returns (PoolStatusResponse);
+  // Probe concurrent GetRange until throughput plateaus; persist the result.
+  rpc ProbeRange(ProbeRangeRequest) returns (ProbeRangeResponse);
+}
+
+// Pin the home gateway's upstream channel pool.
+message ConfigurePoolRequest {
+  // Concurrent Range streams the pool should hold.
+  uint32 concurrency = 1;
+}
+
+// Pool size after ConfigurePool.
+message ConfigurePoolResponse {
+  // Concurrent Range streams now held.
+  uint32 concurrency = 1;
+}
+
+// Empty PoolStatus input.
+message PoolStatusRequest {}
+
+// Live pool size and which seedbox endpoint it is pinned to.
+message PoolStatusResponse {
+  // SHA-256 fingerprint of the upstream leaf cert.
+  string endpoint_fingerprint = 1;
+  // Concurrent Range streams currently held.
+  uint32 concurrency = 2;
+}
+
+// Upper bound for a live GetRange concurrency probe.
+message ProbeRangeRequest {
+  // Do not try more concurrent streams than this.
+  uint32 max_concurrency = 1;
+}
+
+// Plateau found by ProbeRange.
+message ProbeRangeResponse {
+  // Concurrent streams at the measured plateau.
+  uint32 concurrency = 1;
+}
+
+// Empty Df input. The daemon reports its own disk.
+message DfRequest {}
+
+// Free space plus the proto-package handshake.
+message DfResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1. The client refuses any other package.
+  string proto_package = 2;
+  // Free bytes on the seedbox volume the walker uses.
+  uint64 free_bytes = 3;
+}
+
+// Unmonitor one title in *arr.
+message UnmonitorRequest {
+  // TitleId render (kind:source:id).
+  string title_id = 1;
+}
+
+// Handshake after Unmonitor. The RPC is otherwise empty.
+message UnmonitorResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+}
+
+// Delete one remote file after local install-digest proof.
+message DeleteRemoteRequest {
+  // File to unlink. The daemon still refuses seeding and private-under-goal
+  // torrents.
+  RemoteRef remote_ref = 1;
+}
+
+// Outcome of DeleteRemote. Zero is unspecified and must not mean success.
+enum DeleteRemoteResult {
+  // Field omitted or a peer that does not speak this enum.
+  DELETE_REMOTE_RESULT_UNSPECIFIED = 0;
+  // The file was unlinked.
+  DELETE_REMOTE_RESULT_DELETED = 1;
+  // A torrent still covers the file, or it is hardlinked. Nothing deleted.
+  DELETE_REMOTE_RESULT_SKIPPED_SEEDING = 2;
+  // qBittorrent is configured but could not be asked. Nothing was deleted.
+  DELETE_REMOTE_RESULT_QBIT_UNAVAILABLE = 3;
+}
+
+// DeleteRemote result plus handshake.
+message DeleteRemoteResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // What the daemon did. Unspecified is a conversion error.
+  DeleteRemoteResult result = 3;
+}
+
+// Push grabber desired state as the raw config.toml bytes.
+message GrabApplyRequest {
+  // config.toml snapshot. The daemon parses and applies; it does not hot-reload
+  // mid-copy.
+  bytes desired_state_toml = 1;
+}
+
+// GrabApply result plus handshake.
+message GrabApplyResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // True when the box already matched desired state.
+  bool noop = 3;
+  // Unified diff when something changed. Empty on noop.
+  string diff = 4;
+}
+
+// Empty EdgeCheck input.
+message EdgeCheckRequest {}
+
+// Edge (nginx / TLS) compared to desired state.
+message EdgeCheckResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // Current edge fingerprint.
+  string fingerprint = 3;
+  // True when the edge matches desired state.
+  bool invariant_ok = 4;
+  // Human description of drift. Empty when invariant_ok.
+  string drift = 5;
+}
+
+// Push edge desired state as the raw config.toml bytes.
+message EdgeApplyRequest {
+  // config.toml snapshot used to rewrite the edge.
+  bytes desired_state_toml = 1;
+}
+
+// EdgeApply result plus handshake.
+message EdgeApplyResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // True when the edge already matched.
+  bool noop = 3;
+  // Unified diff when something changed. Empty on noop.
+  string diff = 4;
+}
+
+// Empty KeyDiscovery input. Keys are read from the box config at runtime.
+message KeyDiscoveryRequest {}
+
+// Which grabber keys the box already has. Values are presence only.
+message KeyDiscoveryResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // Sonarr API key is set.
+  bool sonarr_key_present = 3;
+  // Radarr API key is set.
+  bool radarr_key_present = 4;
+  // Lidarr API key is set.
+  bool lidarr_key_present = 5;
+  // Prowlarr API key is set.
+  bool prowlarr_key_present = 6;
+  // SABnzbd API key is set.
+  bool sab_key_present = 7;
+  // qBittorrent password or cookie is set.
+  bool qbit_key_present = 8;
+}
+
+// Empty GuardPreview input.
+message GuardPreviewRequest {}
+
+// One torrent the reclaim ranker may consider.
+message GuardPreviewItem {
+  // Infohash.
+  string hash = 1;
+  // qBittorrent state string (for example uploading, pausedDL).
+  string state = 2;
+  // Share ratio as qBit reports it.
+  double ratio = 3;
+  // True when the torrent is private.
+  bool is_private = 4;
+  // qBit content_path.
+  string content_path = 5;
+  // qBit save_path.
+  string save_path = 6;
+  // Matching allowlisted file, when the walker can map the torrent.
+  RemoteRef remote_ref = 7;
+}
+
+// Ranked reclaim preview plus handshake.
+message GuardPreviewResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // Torrents in ranker order.
+  repeated GuardPreviewItem items = 3;
+}
+
+// Empty HoldList input.
+message HoldListRequest {}
+
+// One import-blocked hold the seedbox currently sees.
+message HoldLiveItem {
+  // TitleId render (kind:source:id).
+  string title_id = 1;
+  // Release id as the grabber reported it.
+  string release_id = 2;
+  // When the hold appeared, Unix seconds.
+  int64 added_unix = 3;
+  // Release size in bytes when known.
+  uint64 size = 4;
+  // Grabber import-blocked reason.
+  string reason = 5;
+  // Remote file the hold maps to, when the walker can see it.
+  RemoteRef remote_ref = 6;
+  // Suggested library placement, when the grabber named one.
+  Placement placement = 7;
+}
+
+// Live holds plus handshake.
+message HoldListResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // Holds in grabber order.
+  repeated HoldLiveItem items = 3;
+}
+
+// Record a reject. Does not install or delete.
+message HoldRejectRequest {
+  // TitleId render (kind:source:id).
+  string title_id = 1;
+  // Release id to reject.
+  string release_id = 2;
+}
+
+// Handshake after HoldReject.
+message HoldRejectResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+}
+
+// Empty WantedMissing input.
+message WantedMissingRequest {}
+
+// Titles *arr still reports as missing.
+message WantedMissingResponse {
+  // Daemon cargo semver.
+  string semver = 1;
+  // Must be mediaops.v1.
+  string proto_package = 2;
+  // TitleId renders. An unparseable id is a conversion error.
+  repeated string title_ids = 3;
+}
+
+// Library placement for a hold or an install. Exactly one variant is set.
+message Placement {
+  // Which kind of library path this placement renders.
+  oneof kind {
+    // Feature film.
+    MoviePlacement movie = 1;
+    // Series episode, including multi-episode ranges.
+    EpisodePlacement episode = 2;
+    // Music track.
+    TrackPlacement track = 3;
+  }
+}
+
+// Movie folder and file name (title, year, extension).
+message MoviePlacement {
+  // PathSchema title token.
+  string title = 1;
+  // Release year. Unset means the renderer has no year.
+  optional uint32 year = 2;
+  // File extension without a dot.
+  string extension = 3;
+}
+
+// Episode folder and file name.
+message EpisodePlacement {
+  // Series title token.
+  string title = 1;
+  // Series year. Unset means the renderer has no year.
+  optional uint32 year = 2;
+  // Season number.
+  optional uint32 season = 3;
+  // First episode number.
+  optional uint32 episode = 4;
+  // File extension without a dot.
+  string extension = 5;
+  // Last episode in a multi-episode file. Unset means a single episode.
+  optional uint32 episode_end = 6;
+  // Episode title token. Unset means the renderer has none.
+  optional string episode_title = 7;
+}
+
+// Album track file name.
+message TrackPlacement {
+  // Album title token.
+  string album = 1;
+  // Album year. Unset means the renderer has no year.
+  optional uint32 year = 2;
+  // Track number. Unset means the renderer has none.
+  optional uint32 track = 3;
+  // Track title token.
+  string title = 4;
+  // File extension without a dot.
+  string extension = 5;
+  // Album artist token.
+  string artist = 6;
+  // Disc number. Unset means a single disc.
+  optional uint32 disc = 7;
+}

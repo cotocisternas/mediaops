@@ -31,7 +31,7 @@ Planning files under `_bmad-output/` are historical. Do not treat them as curren
 
 - CLI verbs: `bins/mediaops/src/main.rs` (clap), one module per verb beside it
 - Daemon serve: `bins/mediaopsd/src/main.rs` → `crates/net`
-- Wire: `proto/mediaops.proto` (`mediaops.v1`); conversions only in `crates/proto`
+- Wire: `proto/mediaops/v1/mediaops.proto` (`mediaops.v1`); conversions only in `crates/proto`. `make proto` is `buf lint` + `buf format --diff`
 - Config parse: `crates/core/src/desired_state.rs` (file on disk is `config.toml`)
 - Path grammar: `crates/core/src/pathschema.rs`
 - Title ids: `crates/core/src/title_id.rs`
@@ -42,7 +42,7 @@ Planning files under `_bmad-output/` are historical. Do not treat them as curren
 
 ## Running and verifying
 
-`Makefile` is the entry point (`make test`, `make test-arch`, `make clippy`, `make fmt`). CI is `.github/workflows/ci.yml`: `cargo test --locked --offline --workspace` then `make musl`.
+`Makefile` is the entry point (`make test`, `make test-arch`, `make clippy`, `make fmt`, `make proto`). CI is `.github/workflows/ci.yml`: `make proto`, `cargo test --locked --offline --workspace`, then `make musl`. Default `make test` stays Cargo-only.
 
 Iterate on one crate with `cargo test -p <crate> --locked`. The live test (`cargo test -p mediaops --features live-box --test live`) is `#[ignore]` and still does not SSH or encode.
 

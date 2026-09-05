@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use mediaops_core::{ControlPort, Envelope, JobKind, JobState, TitleId, WantState};
 use mediaops_proto::ControlPortClient;
-use mediaops_proto::control_client::ControlClient;
+use mediaops_proto::control_service_client::ControlServiceClient;
 use mediaops_store::Store;
 use mediaops_transfer::connect_home;
 use serde::Serialize;
@@ -87,7 +87,7 @@ async fn resolve_watch_title(store: &Store, query: &str) -> Result<TitleId, AppE
     let tls_dir = bootstrap::default_tls_dir(&config_dir);
     let socket = bootstrap::default_socket();
     if let Ok(channel) = connect_home(&socket, &tls_dir).await {
-        let control = ControlPortClient::new(ControlClient::new(channel));
+        let control = ControlPortClient::new(ControlServiceClient::new(channel));
         if let Ok(holds) = control.hold_list().await {
             hints.extend(hints_from_holds(&holds));
         }

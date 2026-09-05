@@ -1,4 +1,4 @@
-//! Home overlay gateway: UDS Control+Transfer proxy plus WAN channel pool (AD-4, AD-12).
+//! Home overlay gateway: UDS ControlService+TransferService proxy plus WAN channel pool.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use mediaops_core::{ControlError, ExitCode};
-use mediaops_proto::control_client::ControlClient;
-use mediaops_proto::control_server::Control;
-use mediaops_proto::gateway_server::Gateway;
-use mediaops_proto::transfer_client::TransferClient;
-use mediaops_proto::transfer_server::Transfer;
+use mediaops_proto::control_service_client::ControlServiceClient;
+use mediaops_proto::control_service_server::ControlService;
+use mediaops_proto::gateway_service_server::GatewayService;
+use mediaops_proto::transfer_service_client::TransferServiceClient;
+use mediaops_proto::transfer_service_server::TransferService;
 use mediaops_proto::{
     ConfigurePoolRequest, ConfigurePoolResponse, DeleteRemoteRequest, DeleteRemoteResponse,
     DfRequest, DfResponse, EdgeApplyRequest, EdgeApplyResponse, EdgeCheckRequest,
@@ -114,16 +114,18 @@ impl Stream for GuardedRange {
 }
 
 #[tonic::async_trait]
-impl Control for HomeGateway {
+impl ControlService for HomeGateway {
     async fn df(&self, request: Request<DfRequest>) -> Result<Response<DfResponse>, Status> {
-        ControlClient::new(self.control.clone()).df(request).await
+        ControlServiceClient::new(self.control.clone())
+            .df(request)
+            .await
     }
 
     async fn unmonitor(
         &self,
         request: Request<UnmonitorRequest>,
     ) -> Result<Response<UnmonitorResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .unmonitor(request)
             .await
     }
@@ -132,7 +134,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<DeleteRemoteRequest>,
     ) -> Result<Response<DeleteRemoteResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .delete_remote(request)
             .await
     }
@@ -141,7 +143,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<GrabApplyRequest>,
     ) -> Result<Response<GrabApplyResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .grab_apply(request)
             .await
     }
@@ -150,7 +152,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<EdgeCheckRequest>,
     ) -> Result<Response<EdgeCheckResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .edge_check(request)
             .await
     }
@@ -159,7 +161,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<EdgeApplyRequest>,
     ) -> Result<Response<EdgeApplyResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .edge_apply(request)
             .await
     }
@@ -168,7 +170,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<KeyDiscoveryRequest>,
     ) -> Result<Response<KeyDiscoveryResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .key_discovery(request)
             .await
     }
@@ -177,7 +179,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<GuardPreviewRequest>,
     ) -> Result<Response<GuardPreviewResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .guard_preview(request)
             .await
     }
@@ -186,7 +188,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<HoldListRequest>,
     ) -> Result<Response<HoldListResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .hold_list(request)
             .await
     }
@@ -195,7 +197,7 @@ impl Control for HomeGateway {
         &self,
         request: Request<HoldRejectRequest>,
     ) -> Result<Response<HoldRejectResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .hold_reject(request)
             .await
     }
@@ -204,22 +206,22 @@ impl Control for HomeGateway {
         &self,
         request: Request<WantedMissingRequest>,
     ) -> Result<Response<WantedMissingResponse>, Status> {
-        ControlClient::new(self.control.clone())
+        ControlServiceClient::new(self.control.clone())
             .wanted_missing(request)
             .await
     }
 }
 
 #[tonic::async_trait]
-impl Transfer for HomeGateway {
+impl TransferService for HomeGateway {
     async fn list(&self, request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        TransferClient::new(self.control.clone())
+        TransferServiceClient::new(self.control.clone())
             .list(request)
             .await
     }
 
     async fn stat(&self, request: Request<StatRequest>) -> Result<Response<StatResponse>, Status> {
-        TransferClient::new(self.control.clone())
+        TransferServiceClient::new(self.control.clone())
             .stat(request)
             .await
     }
@@ -235,7 +237,7 @@ impl Transfer for HomeGateway {
             let pool = self.pool.lock().await;
             pool.try_checkout().map_err(Self::net_status)?
         };
-        let mut client = TransferClient::new(slot.channel().clone());
+        let mut client = TransferServiceClient::new(slot.channel().clone());
         let stream = match client.get_range(request).await {
             Ok(response) => response.into_inner(),
             Err(status) => return Err(status),
@@ -248,14 +250,17 @@ impl Transfer for HomeGateway {
 }
 
 #[tonic::async_trait]
-impl Gateway for HomeGateway {
+impl GatewayService for HomeGateway {
     async fn configure_pool(
         &self,
         request: Request<ConfigurePoolRequest>,
     ) -> Result<Response<ConfigurePoolResponse>, Status> {
-        let n = request.into_inner().n;
-        let n = self.configure(n as usize).await.map_err(Self::net_status)?;
-        Ok(Response::new(ConfigurePoolResponse { n }))
+        let concurrency = request.into_inner().concurrency;
+        let concurrency = self
+            .configure(concurrency as usize)
+            .await
+            .map_err(Self::net_status)?;
+        Ok(Response::new(ConfigurePoolResponse { concurrency }))
     }
 
     async fn pool_status(
@@ -264,7 +269,7 @@ impl Gateway for HomeGateway {
     ) -> Result<Response<PoolStatusResponse>, Status> {
         Ok(Response::new(PoolStatusResponse {
             endpoint_fingerprint: self.fingerprint.clone(),
-            n: self.pool_n().await,
+            concurrency: self.pool_n().await,
         }))
     }
 
@@ -272,11 +277,11 @@ impl Gateway for HomeGateway {
         &self,
         request: Request<ProbeRangeRequest>,
     ) -> Result<Response<ProbeRangeResponse>, Status> {
-        let max_n = request.into_inner().max_n.max(1);
-        let n = probe_range_n(self.addr, self.client.clone(), max_n)
+        let max_concurrency = request.into_inner().max_concurrency.max(1);
+        let concurrency = probe_range_n(self.addr, self.client.clone(), max_concurrency)
             .await
             .map_err(Self::net_status)?;
-        Ok(Response::new(ProbeRangeResponse { n }))
+        Ok(Response::new(ProbeRangeResponse { concurrency }))
     }
 }
 
@@ -287,7 +292,7 @@ mod tests {
         IdentityBundle, Seedbox, connect_unix, mint, serve_home_unix, serve_tcp, tcp_connect_count,
     };
     use mediaops_core::{Allowlist, Grabber, UnderlayMode, endpoint_fingerprint};
-    use mediaops_proto::gateway_client::GatewayClient;
+    use mediaops_proto::gateway_service_client::GatewayServiceClient;
     use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
     use std::io::Write;
     use std::path::Path;
@@ -400,7 +405,7 @@ mod tests {
         let (_addr, sock, id, seed_task, uds_task, root) = start_pair().await;
         let client = id.client_config().expect("client");
         let ch = wait_unix(&sock, client).await;
-        let mut control = ControlClient::new(ch.clone());
+        let mut control = ControlServiceClient::new(ch.clone());
         let df = control.df(DfRequest {}).await.expect("df").into_inner();
         assert!(df.free_bytes > 0);
         let holds = control
@@ -410,7 +415,7 @@ mod tests {
             .into_inner();
         assert!(holds.items.is_empty());
 
-        let mut transfer = TransferClient::new(ch.clone());
+        let mut transfer = TransferServiceClient::new(ch.clone());
         let list = transfer
             .list(ListRequest {})
             .await
@@ -419,7 +424,7 @@ mod tests {
         assert_eq!(list.entries.len(), 1);
         let mut stream = transfer
             .get_range(GetRangeRequest {
-                r#ref: list.entries[0].r#ref.clone(),
+                remote_ref: list.entries[0].remote_ref.clone(),
                 offset: 1,
                 len: 4,
             })
@@ -432,14 +437,14 @@ mod tests {
         }
         assert_eq!(body, b"bcde");
 
-        let mut gateway = GatewayClient::new(ch);
+        let mut gateway = GatewayServiceClient::new(ch);
         let status = gateway
             .pool_status(PoolStatusRequest {})
             .await
             .expect("status")
             .into_inner();
         assert!(!status.endpoint_fingerprint.is_empty());
-        assert_eq!(status.n, 1);
+        assert_eq!(status.concurrency, 1);
 
         seed_task.abort();
         uds_task.abort();
@@ -475,14 +480,14 @@ mod tests {
             let _ = serve_home_unix(unix, uds_server, gateway).await;
         });
         let ch = wait_unix(&sock, client).await;
-        let mut gateway = GatewayClient::new(ch.clone());
+        let mut gateway = GatewayServiceClient::new(ch.clone());
         let before = tcp_connect_count();
         let configured = gateway
-            .configure_pool(ConfigurePoolRequest { n: 3 })
+            .configure_pool(ConfigurePoolRequest { concurrency: 3 })
             .await
             .expect("configure")
             .into_inner();
-        assert_eq!(configured.n, 3);
+        assert_eq!(configured.concurrency, 3);
         let opened = tcp_connect_count() - before;
         assert_eq!(
             opened, 3,
@@ -491,33 +496,33 @@ mod tests {
 
         let before_again = tcp_connect_count();
         let again = gateway
-            .configure_pool(ConfigurePoolRequest { n: 3 })
+            .configure_pool(ConfigurePoolRequest { concurrency: 3 })
             .await
             .expect("configure again")
             .into_inner();
-        assert_eq!(again.n, 3);
+        assert_eq!(again.concurrency, 3);
         assert_eq!(
             tcp_connect_count() - before_again,
             0,
             "ConfigurePool with the same N must not open new WAN channels"
         );
 
-        let mut transfer = TransferClient::new(ch.clone());
+        let mut transfer = TransferServiceClient::new(ch.clone());
         let list = transfer
             .list(ListRequest {})
             .await
             .expect("list")
             .into_inner();
-        let r#ref = list.entries[0].r#ref.clone();
+        let remote_ref = list.entries[0].remote_ref.clone();
         let _ = blob;
 
         let mut held = Vec::new();
         for _ in 0..3 {
             held.push(holder.checkout_slot().await.expect("slot"));
         }
-        let fourth = TransferClient::new(ch.clone())
+        let fourth = TransferServiceClient::new(ch.clone())
             .get_range(GetRangeRequest {
-                r#ref: r#ref.clone(),
+                remote_ref: remote_ref.clone(),
                 offset: 0,
                 len: 1,
             })
@@ -568,28 +573,28 @@ mod tests {
             let _ = serve_home_unix(unix, uds_server, gateway).await;
         });
         let ch = wait_unix(&sock, client).await;
-        let mut gateway = GatewayClient::new(ch.clone());
+        let mut gateway = GatewayServiceClient::new(ch.clone());
         let configured = gateway
-            .configure_pool(ConfigurePoolRequest { n: 3 })
+            .configure_pool(ConfigurePoolRequest { concurrency: 3 })
             .await
             .expect("configure")
             .into_inner();
-        assert_eq!(configured.n, 3);
+        assert_eq!(configured.concurrency, 3);
 
-        let mut transfer = TransferClient::new(ch.clone());
+        let mut transfer = TransferServiceClient::new(ch.clone());
         let list = transfer
             .list(ListRequest {})
             .await
             .expect("list")
             .into_inner();
-        let r#ref = list.entries[0].r#ref.clone();
+        let remote_ref = list.entries[0].remote_ref.clone();
 
         let before_range = tcp_connect_count();
         let mut held = Vec::new();
         for _ in 0..3 {
-            let stream = TransferClient::new(ch.clone())
+            let stream = TransferServiceClient::new(ch.clone())
                 .get_range(GetRangeRequest {
-                    r#ref: r#ref.clone(),
+                    remote_ref: remote_ref.clone(),
                     offset: 0,
                     len: hold_len,
                 })
@@ -608,12 +613,12 @@ mod tests {
             .expect("status")
             .into_inner();
         assert_eq!(
-            status.n, 3,
+            status.concurrency, 3,
             "GetRange must not grow the WAN pool (collapsing Range onto one TCP)"
         );
-        let fourth = TransferClient::new(ch.clone())
+        let fourth = TransferServiceClient::new(ch.clone())
             .get_range(GetRangeRequest {
-                r#ref: r#ref.clone(),
+                remote_ref: remote_ref.clone(),
                 offset: 0,
                 len: hold_len,
             })
@@ -639,10 +644,10 @@ mod tests {
         let (_addr, sock, id, seed_task, uds_task, root) = start_pair().await;
         let client = id.client_config().expect("client");
         let ch = wait_unix(&sock, client).await;
-        let mut transfer = TransferClient::new(ch);
+        let mut transfer = TransferServiceClient::new(ch);
         let err = transfer
             .stat(StatRequest {
-                r#ref: Some(mediaops_proto::RemoteRef {
+                remote_ref: Some(mediaops_proto::RemoteRef {
                     root_id: "nope".into(),
                     rel_path: "missing.bin".into(),
                 }),
@@ -685,22 +690,22 @@ mod tests {
             let _ = serve_home_unix(unix, uds_server, gateway).await;
         });
         let ch = wait_unix(&sock, client).await;
-        let mut gateway = GatewayClient::new(ch.clone());
+        let mut gateway = GatewayServiceClient::new(ch.clone());
         gateway
-            .configure_pool(ConfigurePoolRequest { n: 2 })
+            .configure_pool(ConfigurePoolRequest { concurrency: 2 })
             .await
             .expect("configure");
 
-        let mut transfer = TransferClient::new(ch.clone());
+        let mut transfer = TransferServiceClient::new(ch.clone());
         let list = transfer
             .list(ListRequest {})
             .await
             .expect("list")
             .into_inner();
-        let r#ref = list.entries[0].r#ref.clone();
-        let first = TransferClient::new(ch.clone())
+        let remote_ref = list.entries[0].remote_ref.clone();
+        let first = TransferServiceClient::new(ch.clone())
             .get_range(GetRangeRequest {
-                r#ref: r#ref.clone(),
+                remote_ref: remote_ref.clone(),
                 offset: 0,
                 len: 8,
             })
@@ -708,8 +713,8 @@ mod tests {
             .expect("first range");
         let second = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            TransferClient::new(ch.clone()).get_range(GetRangeRequest {
-                r#ref,
+            TransferServiceClient::new(ch.clone()).get_range(GetRangeRequest {
+                remote_ref,
                 offset: 8,
                 len: 8,
             }),
@@ -751,13 +756,17 @@ mod tests {
             let _ = serve_home_unix(unix, uds_server, gateway).await;
         });
         let ch = wait_unix(&sock, client).await;
-        let mut gateway = GatewayClient::new(ch);
+        let mut gateway = GatewayServiceClient::new(ch);
         let probed = gateway
-            .probe_range(ProbeRangeRequest { max_n: 2 })
+            .probe_range(ProbeRangeRequest { max_concurrency: 2 })
             .await
             .expect("probe")
             .into_inner();
-        assert!(probed.n >= 1, "ProbeRange n={}", probed.n);
+        assert!(
+            probed.concurrency >= 1,
+            "ProbeRange concurrency={}",
+            probed.concurrency
+        );
         seed_task.abort();
         uds_task.abort();
         let _ = std::fs::remove_file(&sock);

@@ -5,7 +5,7 @@ use mediaops_core::{
     TitleId, TitleIndexEntry, WantState, classify_remote, free_bytes, reclaim_preview,
 };
 use mediaops_proto::ControlPortClient;
-use mediaops_proto::control_client::ControlClient;
+use mediaops_proto::control_service_client::ControlServiceClient;
 use mediaops_store::Store;
 use mediaops_sync::scan_schema_files;
 use mediaops_transfer::{connect_home, list_entries};
@@ -309,7 +309,7 @@ async fn load_remote_why(
             reclaim: None,
         };
     };
-    let control = ControlPortClient::new(ControlClient::new(channel.clone()));
+    let control = ControlPortClient::new(ControlServiceClient::new(channel.clone()));
     let df = control.df().await.ok().map(|snap| DfView {
         free: snap.free.get(),
     });
@@ -370,7 +370,7 @@ async fn load_remote_df(socket: &Path, tls_dir: &Path) -> Option<DfView> {
     let Ok(channel) = connect_home(socket, tls_dir).await else {
         return None;
     };
-    let control = ControlPortClient::new(ControlClient::new(channel));
+    let control = ControlPortClient::new(ControlServiceClient::new(channel));
     control.df().await.ok().map(|snap| DfView {
         free: snap.free.get(),
     })
@@ -492,7 +492,7 @@ async fn resolve_why_title(
     let mut hints = hints_from_index(titles);
     hints.extend(hints_from_jobs(jobs));
     if let Ok(channel) = connect_home(socket, tls_dir).await {
-        let control = ControlPortClient::new(ControlClient::new(channel.clone()));
+        let control = ControlPortClient::new(ControlServiceClient::new(channel.clone()));
         if let Ok(holds) = control.hold_list().await {
             hints.extend(hints_from_holds(&holds));
         }

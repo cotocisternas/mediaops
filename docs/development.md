@@ -5,6 +5,7 @@ Cargo workspace. Rust 1.98 (`rust-toolchain.toml`). `make` passes `--locked`.
 ## Requirements
 
 - `protobuf-compiler` (`protoc`) — `crates/proto` builds the gRPC stubs
+- [Buf](https://buf.build/docs/installation) — `make proto` runs `buf lint` and `buf format --diff`. Not required for `make test`
 - For `make musl` (the static daemon the seedbox runs): `musl-tools` + `cmake` (`musl-gcc`). Not needed for `make test`
 
 ```bash
@@ -24,9 +25,10 @@ make test-arch     # crate-graph / I/O-boundary law
 make coverage      # cargo-llvm-cov summary (needs llvm-tools-preview)
 make clippy
 make fmt
+make proto         # buf lint + format --diff (needs Buf; CI runs this)
 make mediaops ARGS='--help'
 make daemon  ARGS='--help'
-make ci            # fetch + test --offline --locked, then make musl (same as GitHub Actions)
+make ci            # proto lint, fetch + test --offline --locked, then make musl (same as GitHub Actions)
 make musl          # link musl-static mediaopsd (needs musl-gcc; not part of make test)
 make install       # both binaries into ~/.cargo/bin
 ```
@@ -70,7 +72,7 @@ Human stdout is the operator UI. Changing a formatter means adding or updating a
 bins/mediaops     CLI composition root
 bins/mediaopsd    daemon composition root
 crates/core       TitleId, PathSchema, config.toml, Plan, jobs
-crates/proto      gRPC / prost (built from proto/mediaops.proto)
+crates/proto      gRPC / prost (built from proto/mediaops/v1/mediaops.proto)
 crates/store      sqlite
 crates/net        mTLS, channels, seedbox + home serve
 crates/ssh        bootstrap exec only
@@ -79,7 +81,7 @@ crates/sync       planner + apply
 crates/encode     EncodePolicy, ffprobe/ffmpeg
 crates/arr        grabber HTTP (daemon only)
 crates/arch-tests dependency-graph law
-proto/            mediaops.proto
+proto/            mediaops/v1/mediaops.proto (package mediaops.v1)
 docs/             this documentation
 ```
 

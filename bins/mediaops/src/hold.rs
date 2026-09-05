@@ -6,7 +6,7 @@ use mediaops_core::{
     PathSchemaError, ReleaseId, TitleId, preflight_approve_placement, title_key,
 };
 use mediaops_proto::ControlPortClient;
-use mediaops_proto::control_client::ControlClient;
+use mediaops_proto::control_service_client::ControlServiceClient;
 use mediaops_store::Store;
 use mediaops_sync::inbox;
 use mediaops_transfer::connect_home;
@@ -59,7 +59,7 @@ pub async fn list(
     let channel = connect_home(&socket, &tls_dir)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let control = ControlPortClient::new(ControlClient::new(channel));
+    let control = ControlPortClient::new(ControlServiceClient::new(channel));
     let live = control.hold_list().await.map_err(map_control)?;
     let decided = store
         .list_decided()
@@ -103,7 +103,7 @@ pub async fn decide(
     let channel = connect_home(&socket, &tls_dir)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let control = ControlPortClient::new(ControlClient::new(channel));
+    let control = ControlPortClient::new(ControlServiceClient::new(channel));
     let live = control.hold_list().await.map_err(map_control)?;
     let decided = store
         .list_decided()

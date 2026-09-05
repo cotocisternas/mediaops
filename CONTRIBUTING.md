@@ -5,11 +5,12 @@ Build and test on the machine you already use. Do not put a live seedbox, a real
 ```bash
 make fetch
 make test
+make proto
 make fmt
 make clippy
 ```
 
-`make test OFFLINE=1` after a fetch. `make musl` needs `musl-gcc` and is what CI runs for the static daemon.
+`make test OFFLINE=1` after a fetch. `make proto` needs [Buf](https://buf.build/docs/installation). `make musl` needs `musl-gcc` and is what CI runs for the static daemon.
 
 Read [docs/development.md](docs/development.md) and [AGENTS.md](AGENTS.md) before changing crate boundaries, PathSchema, or the JSON envelope.
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use mediaops_core::{ControlPort, Envelope, GrabApplyReport};
 use mediaops_proto::ControlPortClient;
-use mediaops_proto::control_client::ControlClient;
+use mediaops_proto::control_service_client::ControlServiceClient;
 use mediaops_store::Store;
 use mediaops_transfer::connect_home;
 use serde::Serialize;
@@ -38,7 +38,7 @@ pub async fn seedbox_apply(
     let channel = connect_home(&socket, &tls_dir)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let control = ControlPortClient::new(ControlClient::new(channel));
+    let control = ControlPortClient::new(ControlServiceClient::new(channel));
     let edge = control.edge_check().await.map_err(map_control)?;
     let store = Store::open(&state_db)
         .await

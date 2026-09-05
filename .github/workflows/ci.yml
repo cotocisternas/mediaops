@@ -13,6 +13,11 @@ jobs:
         run: rustup show
       - name: Install protobuf compiler, musl, cmake
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools cmake
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+      - name: Lint and format protos
+        run: make proto
       - name: Fetch crates
         run: cargo fetch --locked
       - name: Test workspace

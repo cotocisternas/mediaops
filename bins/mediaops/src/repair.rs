@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use mediaops_core::{ControlPort, Envelope, ExecPort};
 use mediaops_proto::ControlPortClient;
-use mediaops_proto::control_client::ControlClient;
+use mediaops_proto::control_service_client::ControlServiceClient;
 use mediaops_ssh::{nginx_test_and_reload, write_spliced_nginx_app};
 use mediaops_store::Store;
 use mediaops_transfer::connect_home;
@@ -58,7 +58,7 @@ pub async fn repair_edge(
     let channel = connect_home(&socket, &tls_dir)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let control = ControlPortClient::new(ControlClient::new(channel));
+    let control = ControlPortClient::new(ControlServiceClient::new(channel));
     let mut diffs = Vec::new();
     let ssh_config = ssh_config.unwrap_or_else(bootstrap::default_ssh_config);
     let bases = ds.edge().map(|e| e.url_bases.clone()).unwrap_or_default();

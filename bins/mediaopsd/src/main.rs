@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Bind Control + Transfer (seedbox role).
+    /// Bind ControlService + TransferService (seedbox role).
     Serve(ServeArgs),
 }
 

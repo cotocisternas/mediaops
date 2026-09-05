@@ -115,12 +115,10 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     Server::builder()
-        .add_service(mediaops_proto::control_server::ControlServer::new(
-            seedbox.clone(),
-        ))
-        .add_service(mediaops_proto::transfer_server::TransferServer::new(
-            seedbox,
-        ))
+        .add_service(
+            mediaops_proto::control_service_server::ControlServiceServer::new(seedbox.clone()),
+        )
+        .add_service(mediaops_proto::transfer_service_server::TransferServiceServer::new(seedbox))
         .serve_with_incoming(incoming)
         .await
         .map_err(|err| NetError::Serve(err.to_string()))
@@ -140,13 +138,13 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     Server::builder()
-        .add_service(mediaops_proto::control_server::ControlServer::new(
-            gateway.clone(),
-        ))
-        .add_service(mediaops_proto::transfer_server::TransferServer::new(
-            gateway.clone(),
-        ))
-        .add_service(mediaops_proto::gateway_server::GatewayServer::new(gateway))
+        .add_service(
+            mediaops_proto::control_service_server::ControlServiceServer::new(gateway.clone()),
+        )
+        .add_service(
+            mediaops_proto::transfer_service_server::TransferServiceServer::new(gateway.clone()),
+        )
+        .add_service(mediaops_proto::gateway_service_server::GatewayServiceServer::new(gateway))
         .serve_with_incoming(incoming)
         .await
         .map_err(|err| NetError::Serve(err.to_string()))

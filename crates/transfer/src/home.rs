@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use mediaops_core::{RemoteEntry, RemoteRef};
 use mediaops_net::{IdentityBundle, connect_unix};
-use mediaops_proto::gateway_client::GatewayClient;
-use mediaops_proto::transfer_client::TransferClient;
+use mediaops_proto::gateway_service_client::GatewayServiceClient;
+use mediaops_proto::transfer_service_client::TransferServiceClient;
 use mediaops_proto::{
     ConfigurePoolRequest, GetRangeRequest, ListRequest, PoolStatusRequest, ProbeRangeRequest,
     RemoteRef as WireRef, StatRequest,
@@ -30,7 +30,7 @@ pub async fn connect_home(socket: &Path, tls_dir: &Path) -> Result<Channel, Tran
 }
 
 pub async fn list_entries(channel: Channel) -> Result<Vec<RemoteEntry>, TransferError> {
-    let mut client = TransferClient::new(channel);
+    let mut client = TransferServiceClient::new(channel);
     let list = client
         .list(ListRequest {})
         .await
@@ -47,10 +47,12 @@ pub async fn stat_entry(
     channel: Channel,
     remote: &RemoteRef,
 ) -> Result<RemoteEntry, TransferError> {
-    let mut client = TransferClient::new(channel);
+    let mut client = TransferServiceClient::new(channel);
     let wire = WireRef::try_from(remote).map_err(|err| TransferError::Wire(err.to_string()))?;
     let st = client
-        .stat(StatRequest { r#ref: Some(wire) })
+        .stat(StatRequest {
+            remote_ref: Some(wire),
+        })
         .await
         .map_err(TransferError::from_status)?
         .into_inner();
@@ -61,33 +63,35 @@ pub async fn stat_entry(
 }
 
 pub async fn configure_pool(channel: Channel, n: u32) -> Result<u32, TransferError> {
-    let mut client = GatewayClient::new(channel);
+    let mut client = GatewayServiceClient::new(channel);
     let resp = client
-        .configure_pool(ConfigurePoolRequest { n })
+        .configure_pool(ConfigurePoolRequest { concurrency: n })
         .await
         .map_err(TransferError::from_status)?
         .into_inner();
-    Ok(resp.n)
+    Ok(resp.concurrency)
 }
 
 pub async fn pool_status(channel: Channel) -> Result<(String, u32), TransferError> {
-    let mut client = GatewayClient::new(channel);
+    let mut client = GatewayServiceClient::new(channel);
     let resp = client
         .pool_status(PoolStatusRequest {})
         .await
         .map_err(TransferError::from_status)?
         .into_inner();
-    Ok((resp.endpoint_fingerprint, resp.n))
+    Ok((resp.endpoint_fingerprint, resp.concurrency))
 }
 
 pub async fn probe_range(channel: Channel, max_n: u32) -> Result<u32, TransferError> {
-    let mut client = GatewayClient::new(channel);
+    let mut client = GatewayServiceClient::new(channel);
     let resp = client
-        .probe_range(ProbeRangeRequest { max_n })
+        .probe_range(ProbeRangeRequest {
+            max_concurrency: max_n,
+        })
         .await
         .map_err(TransferError::from_status)?
         .into_inner();
-    Ok(resp.n)
+    Ok(resp.concurrency)
 }
 
 #[derive(Clone)]
@@ -108,11 +112,11 @@ impl RangeSource for GrpcRangeSource {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, TransferError> {
-        let mut client = TransferClient::new(self.channel.clone());
+        let mut client = TransferServiceClient::new(self.channel.clone());
         let wire = WireRef::try_from(remote).map_err(|err| TransferError::Wire(err.to_string()))?;
         let mut stream = client
             .get_range(GetRangeRequest {
-                r#ref: Some(wire),
+                remote_ref: Some(wire),
                 offset,
                 len,
             })

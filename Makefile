@@ -15,7 +15,7 @@ endif
 .DEFAULT_GOAL := help
 
 .PHONY: help fetch build release check test test-arch test-live coverage clippy fmt fmt-check \
-	run mediaops daemon musl ci install clean
+	proto proto-breaking run mediaops daemon musl ci install clean
 
 help: ## Show this list
 	@awk 'BEGIN {FS = ":.*##"; printf "mediaops\n\nTargets:\n"} \
@@ -55,6 +55,15 @@ fmt: ## rustfmt
 fmt-check: ## rustfmt --check
 	$(CARGO) fmt --all -- --check
 
+BUF ?= buf
+
+proto: ## buf lint + format --diff (needs Buf; not part of make test)
+	$(BUF) lint
+	$(BUF) format --diff
+
+proto-breaking: ## buf breaking against main (use after this change lands)
+	$(BUF) breaking --against '.git#branch=main'
+
 run: mediaops ## Run the CLI (default: --help). Override with ARGS='…'
 
 mediaops: ## cargo run -p mediaops -- $(ARGS)
@@ -69,6 +78,7 @@ musl: ## Link musl-static mediaopsd (needs musl-gcc). Not part of make test.
 	$(CARGO) build --release --target $(MUSL_TARGET) -p $(PKG_DAEMON) --bin $(PKG_DAEMON) $(CARGO_FLAGS)
 
 ci: fetch ## Same sequence as .github/workflows/ci.yml
+	$(MAKE) proto
 	$(CARGO) test --locked --offline --workspace
 	$(MAKE) musl OFFLINE=1
 

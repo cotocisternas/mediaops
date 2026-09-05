@@ -8,7 +8,7 @@ use mediaops_core::{
     TlsIdentity, endpoint_fingerprint, pin_matrix_refuse, upsert_seedbox_address, upsert_tls_table,
 };
 use mediaops_proto::ControlPortClient;
-use mediaops_proto::control_client::ControlClient;
+use mediaops_proto::control_service_client::ControlServiceClient;
 use mediaops_ssh::{
     SshHost, copy_binary_and_restart_unit, install_provider, musl_binary_path, parse_ssh_config,
     refuse_git_work_tree, systemd_user_unit,
@@ -299,7 +299,7 @@ pub async fn bootstrap(
                 let channel = connect_tcp(sock, client)
                     .await
                     .map_err(|err| BootstrapError::Io(format!("{uds_err}; tcp fallback: {err}")))?;
-                let c = ControlPortClient::new(ControlClient::new(channel));
+                let c = ControlPortClient::new(ControlServiceClient::new(channel));
                 c.df()
                     .await
                     .map_err(|err| BootstrapError::Io(err.message))?;
@@ -431,7 +431,7 @@ async fn connect_control_uds(
     for _ in 0..30 {
         match connect_home(socket, tls_dir).await {
             Ok(channel) => {
-                let c = ControlPortClient::new(ControlClient::new(channel));
+                let c = ControlPortClient::new(ControlServiceClient::new(channel));
                 if c.df().await.is_ok() {
                     return Ok(c);
                 }

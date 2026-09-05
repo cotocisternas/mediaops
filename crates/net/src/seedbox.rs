@@ -1,4 +1,4 @@
-//! Seedbox Control + Transfer over the walker.
+//! Seedbox ControlService + TransferService over the walker.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -10,8 +10,8 @@ use mediaops_core::{
     GuardPreviewItem, HoldKey, HoldLiveItem, RemoteRef, TitleId, WalkerError, nginx_host_ok,
     panel_fingerprint,
 };
-use mediaops_proto::control_server::Control;
-use mediaops_proto::transfer_server::Transfer;
+use mediaops_proto::control_service_server::ControlService;
+use mediaops_proto::transfer_service_server::TransferService;
 use mediaops_proto::{
     DeleteRemoteRequest, DeleteRemoteResponse, DeleteRemoteResult, DfRequest, DfResponse,
     EdgeApplyRequest, EdgeApplyResponse, EdgeCheckRequest, EdgeCheckResponse, ErrorDetail,
@@ -127,7 +127,7 @@ fn unused(name: &str) -> Status {
 }
 
 #[tonic::async_trait]
-impl Control for Seedbox {
+impl ControlService for Seedbox {
     async fn df(&self, _request: Request<DfRequest>) -> Result<Response<DfResponse>, Status> {
         let allowlist = self.allowlist.clone();
         let free = tokio::task::spawn_blocking(move || allowlist.free_bytes())
@@ -416,7 +416,7 @@ impl Control for Seedbox {
         _request: Request<WantedMissingRequest>,
     ) -> Result<Response<WantedMissingResponse>, Status> {
         let (semver, proto_package) = self.handshake();
-        let title_id = if self.grabber == Grabber::None {
+        let title_ids = if self.grabber == Grabber::None {
             Vec::new()
         } else if let Some(ops) = &self.grab_ops {
             ops.wanted_missing()
@@ -431,7 +431,7 @@ impl Control for Seedbox {
         Ok(Response::new(WantedMissingResponse {
             semver,
             proto_package,
-            title_id,
+            title_ids,
         }))
     }
 
@@ -556,7 +556,7 @@ fn is_hold_media_name(name: &str) -> bool {
 }
 
 #[tonic::async_trait]
-impl Transfer for Seedbox {
+impl TransferService for Seedbox {
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let allowlist = self.allowlist.clone();
         let entries = tokio::task::spawn_blocking(move || allowlist.list())
@@ -716,7 +716,7 @@ mod tests {
         .expect("ref");
         let resp = seed
             .delete_remote(Request::new(DeleteRemoteRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: remote.root_id().into(),
                     rel_path: remote.rel_path().display().to_string(),
                 }),
@@ -766,7 +766,7 @@ mod tests {
         .expect("ref");
         let resp = seed
             .delete_remote(Request::new(DeleteRemoteRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: remote.root_id().into(),
                     rel_path: remote.rel_path().display().to_string(),
                 }),
@@ -812,7 +812,7 @@ mod tests {
             })));
         let resp = seed
             .delete_remote(Request::new(DeleteRemoteRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: "seedbox".into(),
                     rel_path: movie_rel().into(),
                 }),
@@ -837,7 +837,7 @@ mod tests {
             })));
         let resp = seed
             .delete_remote(Request::new(DeleteRemoteRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: "seedbox".into(),
                     rel_path: movie_rel().into(),
                 }),
@@ -864,7 +864,7 @@ mod tests {
         ));
         let resp = seed
             .delete_remote(Request::new(DeleteRemoteRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: "seedbox".into(),
                     rel_path: movie_rel().into(),
                 }),
@@ -897,7 +897,7 @@ mod tests {
             })));
         let resp = seed
             .delete_remote(Request::new(DeleteRemoteRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: "seedbox".into(),
                     rel_path: movie_rel().into(),
                 }),
@@ -924,7 +924,7 @@ mod tests {
         let seed = seedbox_with(root.clone());
         let resp = seed
             .delete_remote(Request::new(DeleteRemoteRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: "seedbox".into(),
                     rel_path: movie_rel().into(),
                 }),
@@ -955,7 +955,10 @@ mod tests {
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].state, "uploading");
         assert_eq!(
-            resp.items[0].r#ref.as_ref().map(|r| r.rel_path.as_str()),
+            resp.items[0]
+                .remote_ref
+                .as_ref()
+                .map(|r| r.rel_path.as_str()),
             Some(movie_rel())
         );
         let _ = std::fs::remove_dir_all(root);
@@ -992,7 +995,7 @@ mod tests {
             .expect("wanted none")
             .into_inner();
         assert_eq!(wanted.proto_package, PROTO_PACKAGE);
-        assert!(wanted.title_id.is_empty());
+        assert!(wanted.title_ids.is_empty());
         let none_err = seed
             .unmonitor(Request::new(UnmonitorRequest {
                 title_id: "movie:tmdb:603".into(),
@@ -1195,7 +1198,7 @@ mod tests {
             .await
             .expect("wanted")
             .into_inner();
-        assert_eq!(wanted.title_id, vec!["movie:tmdb:603".to_string()]);
+        assert_eq!(wanted.title_ids, vec!["movie:tmdb:603".to_string()]);
         let unmonitored = servarr
             .unmonitor(Request::new(UnmonitorRequest {
                 title_id: "movie:tmdb:603".into(),
@@ -1235,7 +1238,7 @@ mod tests {
             .expect("list")
             .into_inner();
         assert_eq!(listed.items.len(), 1);
-        let remote = listed.items[0].remote.as_ref().expect("remote");
+        let remote = listed.items[0].remote_ref.as_ref().expect("remote");
         assert_eq!(remote.root_id, "seedbox");
         assert_eq!(remote.rel_path, "The.Matrix.1999.mkv");
         let _ = std::fs::remove_dir_all(root);
@@ -1272,7 +1275,7 @@ mod tests {
             .await
             .expect("list")
             .into_inner();
-        let remote = listed.items[0].remote.as_ref().expect("remote");
+        let remote = listed.items[0].remote_ref.as_ref().expect("remote");
         assert_eq!(remote.root_id, "seedbox");
         assert_eq!(remote.rel_path, "The.Matrix.1999/The.Matrix.1999.mkv");
         let _ = std::fs::remove_dir_all(root);
@@ -1321,7 +1324,7 @@ mod tests {
         let seed = seedbox_with(root.clone());
         let err = seed
             .stat(Request::new(StatRequest {
-                r#ref: Some(WireRef {
+                remote_ref: Some(WireRef {
                     root_id: "seedbox".into(),
                     rel_path: "missing.bin".into(),
                 }),
@@ -1343,7 +1346,7 @@ mod tests {
         };
         let past = seed
             .get_range(Request::new(GetRangeRequest {
-                r#ref: Some(wire.clone()),
+                remote_ref: Some(wire.clone()),
                 offset: 10,
                 len: 4,
             }))
@@ -1355,7 +1358,7 @@ mod tests {
 
         let oversize = seed
             .get_range(Request::new(GetRangeRequest {
-                r#ref: Some(wire),
+                remote_ref: Some(wire),
                 offset: 8,
                 len: 100,
             }))

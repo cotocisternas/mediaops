@@ -5,7 +5,7 @@ use mediaops_core::{
     reclaim_preview, reclaim_proved,
 };
 use mediaops_proto::ControlPortClient;
-use mediaops_proto::control_client::ControlClient;
+use mediaops_proto::control_service_client::ControlServiceClient;
 use mediaops_store::Store;
 use mediaops_sync::{apply_reclaim, scan_schema_files};
 use mediaops_transfer::{HomeChannel, connect_home, list_entries};
@@ -115,7 +115,7 @@ pub async fn apply(
     )
     .await?;
     let remotes: Vec<_> = snap.candidates.iter().map(|c| c.remote.clone()).collect();
-    let control = ControlPortClient::new(ControlClient::new(snap.channel));
+    let control = ControlPortClient::new(ControlServiceClient::new(snap.channel));
     let report = apply_reclaim(&control, &remotes)
         .await
         .map_err(map_control)?;
@@ -225,7 +225,7 @@ async fn snapshot(
     let listings = list_entries(channel.clone())
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let control = ControlPortClient::new(ControlClient::new(channel.clone()));
+    let control = ControlPortClient::new(ControlServiceClient::new(channel.clone()));
     let torrents = control.guard_preview().await;
     let mut candidates = match (exclusive, torrents) {
         (_, Ok(items)) => reclaim_preview(&listings, &root_kinds, &title_index, &on_disk, &items),

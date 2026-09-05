@@ -276,7 +276,7 @@ pub async fn cmd_run(
         .range_concurrency();
     let n = configure_from_probes(&prepared.store, channel.clone(), pinned).await?;
     let control = mediaops_proto::ControlPortClient::new(
-        mediaops_proto::control_client::ControlClient::new(channel.clone()),
+        mediaops_proto::control_service_client::ControlServiceClient::new(channel.clone()),
     );
     let meter = Arc::new(Mutex::new(None::<(String, PullMeter)>));
     let on_pull_progress = if json {
@@ -490,7 +490,7 @@ async fn prepare(
         .filter(|j| matches!(j.state(), JobState::Want(WantState::Open)))
         .collect();
     let control = mediaops_proto::ControlPortClient::new(
-        mediaops_proto::control_client::ControlClient::new(channel.clone()),
+        mediaops_proto::control_service_client::ControlServiceClient::new(channel.clone()),
     );
     // Only a desired-state with an `[edge]` table has an nginx edge to freeze
     // on. A plain folder on a box (or a non-Swizzin box) planned fine before

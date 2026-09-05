@@ -103,7 +103,7 @@ pub async fn probe_range_n(
     max_n: u32,
 ) -> Result<u32, NetError> {
     use mediaops_core::plateau_n;
-    use mediaops_proto::transfer_client::TransferClient;
+    use mediaops_proto::transfer_service_client::TransferServiceClient;
     use mediaops_proto::{GetRangeRequest, ListRequest};
     use tokio::time::Instant;
 
@@ -116,9 +116,9 @@ pub async fn probe_range_n(
         for _ in 0..n {
             guards.push(pool.try_checkout()?);
         }
-        let mut clients: Vec<TransferClient<Channel>> = guards
+        let mut clients: Vec<TransferServiceClient<Channel>> = guards
             .iter()
-            .map(|guard| TransferClient::new(guard.channel().clone()))
+            .map(|guard| TransferServiceClient::new(guard.channel().clone()))
             .collect();
         let mut listing = clients[0]
             .list(ListRequest {})
@@ -132,11 +132,11 @@ pub async fn probe_range_n(
         let mut total = 0_u64;
         let mut joins = Vec::new();
         for mut client in clients {
-            let r#ref = entry.r#ref.clone();
+            let remote_ref = entry.remote_ref.clone();
             joins.push(tokio::spawn(async move {
                 let mut stream = client
                     .get_range(GetRangeRequest {
-                        r#ref,
+                        remote_ref,
                         offset: 0,
                         len: 1024 * 1024,
                     })
@@ -167,8 +167,8 @@ pub async fn probe_range_n(
 mod tests {
     use super::*;
     use mediaops_core::{Allowlist, ControlPort, Grabber};
-    use mediaops_proto::control_client::ControlClient;
-    use mediaops_proto::transfer_client::TransferClient;
+    use mediaops_proto::control_service_client::ControlServiceClient;
+    use mediaops_proto::transfer_service_client::TransferServiceClient;
     use mediaops_proto::{DfRequest, GetRangeRequest, ListRequest, PROTO_PACKAGE, StatRequest};
     use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
     use rustls::pki_types::{CertificateDer, pem::PemObject};
@@ -262,7 +262,7 @@ mod tests {
         match connect_tcp(addr, client).await {
             Err(_) => {}
             Ok(channel) => {
-                let mut control = ControlClient::new(channel);
+                let mut control = ControlServiceClient::new(channel);
                 let result = control.df(DfRequest {}).await;
                 assert!(result.is_err(), "Control/Transfer RPC must fail");
             }
@@ -342,13 +342,13 @@ mod tests {
         let uds_task = tokio::spawn(async move { serve_unix(unix, server, uds_seed).await });
 
         let tcp_ch = wait_tcp(addr, client.clone()).await;
-        let mut tcp_control = ControlClient::new(tcp_ch.clone());
+        let mut tcp_control = ControlServiceClient::new(tcp_ch.clone());
         let df = tcp_control.df(DfRequest {}).await.expect("df").into_inner();
         assert_eq!(df.proto_package, PROTO_PACKAGE);
         assert_eq!(df.semver, "0.1.0");
         assert!(df.free_bytes > 0);
 
-        let mut tcp_transfer = TransferClient::new(tcp_ch);
+        let mut tcp_transfer = TransferServiceClient::new(tcp_ch);
         let list = tcp_transfer
             .list(ListRequest {})
             .await
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(list.entries.len(), 1);
         let mut stream = tcp_transfer
             .get_range(GetRangeRequest {
-                r#ref: list.entries[0].r#ref.clone(),
+                remote_ref: list.entries[0].remote_ref.clone(),
                 offset: 1,
                 len: 4,
             })
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(body, b"bcde");
 
         let uds_ch = wait_unix(&sock, client).await;
-        let uds_control = mediaops_proto::ControlPortClient::new(ControlClient::new(uds_ch));
+        let uds_control = mediaops_proto::ControlPortClient::new(ControlServiceClient::new(uds_ch));
         let snapshot = uds_control.df().await.expect("uds df");
         assert!(snapshot.free.get() > 0);
 
@@ -400,20 +400,20 @@ mod tests {
         let b = pool.try_checkout().expect("b");
         let c = pool.try_checkout().expect("c");
         assert!(matches!(pool.try_checkout(), Err(NetError::Exhausted)));
-        let mut listing = TransferClient::new(a.channel().clone())
+        let mut listing = TransferServiceClient::new(a.channel().clone())
             .list(ListRequest {})
             .await
             .expect("list")
             .into_inner();
-        let r#ref = listing.entries.pop().expect("entry").r#ref;
+        let remote_ref = listing.entries.pop().expect("entry").remote_ref;
         let mut joins = Vec::new();
         for guard in [a, b, c] {
-            let r#ref = r#ref.clone();
+            let remote_ref = remote_ref.clone();
             joins.push(tokio::spawn(async move {
-                let mut client = TransferClient::new(guard.channel().clone());
+                let mut client = TransferServiceClient::new(guard.channel().clone());
                 let mut stream = client
                     .get_range(GetRangeRequest {
-                        r#ref,
+                        remote_ref,
                         offset: 0,
                         len: 4,
                     })
@@ -451,7 +451,7 @@ mod tests {
             seedbox_for(root.clone()),
         ));
         let ch = wait_tcp(addr, id.client_config().expect("client")).await;
-        let mut control = ControlClient::new(ch);
+        let mut control = ControlServiceClient::new(ch);
         control
             .grab_apply(mediaops_proto::GrabApplyRequest::default())
             .await
@@ -475,7 +475,7 @@ mod tests {
         ));
         let matching = id.client_config().expect("matching");
         let ch = wait_tcp(addr, matching.clone()).await;
-        ControlClient::new(ch)
+        ControlServiceClient::new(ch)
             .df(DfRequest {})
             .await
             .expect("matching client");
@@ -510,7 +510,7 @@ mod tests {
         let addr = tcp.local_addr().expect("addr");
         let task = tokio::spawn(serve_tcp(tcp, server, seedbox_for(root.clone())));
         let ch = wait_tcp(addr, client).await;
-        ControlClient::new(ch)
+        ControlServiceClient::new(ch)
             .df(DfRequest {})
             .await
             .expect("loaded handshake");
@@ -529,7 +529,7 @@ mod tests {
         let addr = tcp.local_addr().expect("addr2");
         let task = tokio::spawn(serve_tcp(tcp, server, seedbox_for(root.clone())));
         let ch = wait_tcp(addr, id.client_config().expect("minted client")).await;
-        ControlClient::new(ch)
+        ControlServiceClient::new(ch)
             .df(DfRequest {})
             .await
             .expect("server-only serve");
@@ -574,7 +574,7 @@ mod tests {
             seedbox_for(root.clone()),
         ));
         let ch = wait_tcp(addr, id.client_config().expect("client")).await;
-        let mut transfer = TransferClient::new(ch);
+        let mut transfer = TransferServiceClient::new(ch);
         let list = transfer
             .list(ListRequest {})
             .await
@@ -584,13 +584,13 @@ mod tests {
         let listed = &list.entries[0];
         let st = transfer
             .stat(StatRequest {
-                r#ref: listed.r#ref.clone(),
+                remote_ref: listed.remote_ref.clone(),
             })
             .await
             .expect("stat")
             .into_inner();
         let entry = st.entry.expect("entry");
-        assert_eq!(entry.r#ref, listed.r#ref);
+        assert_eq!(entry.remote_ref, listed.remote_ref);
         assert_eq!(entry.len, listed.len);
         task.abort();
         let _ = std::fs::remove_dir_all(root);

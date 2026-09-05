@@ -8,8 +8,8 @@ Two processes, one wire. The home filesystem is the catalog. The seedbox is dumb
   mediaops  ──unix socket──►  mediaopsd            mediaopsd
   (CLI)                       (gateway)  ──mTLS──► (gRPC)
                                  │                    │
-                                 │                    ├── Transfer.GetRange
-                                 │                    ├── Control.*  (*arr on 127.0.0.1)
+                                 │                    ├── TransferService.GetRange
+                                 │                    ├── ControlService.*  (*arr on 127.0.0.1)
                                  │                    └── allowlisted roots only
                                  └── seedbox_address
                                      from config.toml
@@ -21,11 +21,11 @@ The CLI never contains a seedbox address and never speaks *arr HTTP. SSH exists 
 
 **`mediaops`** — home CLI. Plan/apply, watch/why/status, hold inbox, reclaim, pull, encode, bootstrap. Encode and sqlite live here, not in the daemon.
 
-**`mediaopsd --role home`** — unix-socket gateway. Owns the upstream address and the channel pool. Serves a small `Gateway` service (`ConfigurePool`, `PoolStatus`, `ProbeRange`) that the seedbox role does not.
+**`mediaopsd --role home`** — unix-socket gateway. Owns the upstream address and the channel pool. Serves a small `GatewayService` (`ConfigurePool`, `PoolStatus`, `ProbeRange`) that the seedbox role does not.
 
-**`mediaopsd --role seedbox`** — the only process that opens the WAN and the only process that opens grabber HTTP on localhost. Serves `Transfer` (`List`, `Stat`, `GetRange`) and `Control` (df, unmonitor, delete-remote, grab/edge apply, holds, …).
+**`mediaopsd --role seedbox`** — the only process that opens the WAN and the only process that opens grabber HTTP on localhost. Serves `TransferService` (`List`, `Stat`, `GetRange`) and `ControlService` (df, unmonitor, delete-remote, grab/edge apply, holds, …).
 
-Wire contract: `proto/mediaops.proto`, package `mediaops.v1`. Handshake refuses an unknown package; minor version skew is a warning.
+Wire contract: `proto/mediaops/v1/mediaops.proto`, package `mediaops.v1`. Handshake refuses an unknown package; minor version skew is a warning.
 
 ## Pull
 
@@ -52,7 +52,7 @@ Cargo workspace. Edges are allowlisted and tested in `crates/arch-tests` (`make 
 | `bins/mediaops` | CLI composition root |
 | `bins/mediaopsd` | Daemon composition root |
 | `crates/core` | `TitleId`, PathSchema, `config.toml`, Plan, jobs. No tokio, no tonic, no rusqlite. Only `walker` and `install` touch the filesystem, through caller-supplied roots |
-| `crates/proto` | gRPC stubs from `proto/mediaops.proto`; the only wire↔domain conversions |
+| `crates/proto` | gRPC stubs from `proto/mediaops/v1/mediaops.proto`; the only wire↔domain conversions |
 | `crates/store` | sqlite (`state.db`). The only crate that may depend on `rusqlite` |
 | `crates/net` | mTLS, channel pool, seedbox + home serve |
 | `crates/ssh` | Bootstrap exec only. No bulk copy |
