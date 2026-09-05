@@ -15,6 +15,7 @@ mod hold;
 mod home;
 mod library;
 mod new_machine;
+mod out;
 mod reclaim;
 mod repair;
 mod run;
@@ -319,8 +320,10 @@ enum HoldCommand {
     },
     /// Persist Approved. Does not install; exclusive `run` copies later. Lock-free.
     Approve {
-        title_id: String,
-        release_id: String,
+        /// Title id from `hold list` (`movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…`).
+        target: String,
+        /// Release id. Only needed when the same title id is in the inbox twice.
+        release_id: Option<String>,
         #[arg(long)]
         socket: Option<PathBuf>,
         #[arg(long)]
@@ -332,8 +335,10 @@ enum HoldCommand {
     },
     /// Persist Rejected and tell *arr never-this-release. Lock-free.
     Reject {
-        title_id: String,
-        release_id: String,
+        /// Title id from `hold list` (`movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…`).
+        target: String,
+        /// Release id. Only needed when the same title id is in the inbox twice.
+        release_id: Option<String>,
         #[arg(long)]
         socket: Option<PathBuf>,
         #[arg(long)]
@@ -1021,7 +1026,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Some(Command::Hold(HoldArgs {
             command:
                 HoldCommand::Approve {
-                    title_id,
+                    target: title_id,
                     release_id,
                     socket,
                     tls_dir,
@@ -1045,7 +1050,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Some(Command::Hold(HoldArgs {
             command:
                 HoldCommand::Reject {
-                    title_id,
+                    target: title_id,
                     release_id,
                     socket,
                     tls_dir,

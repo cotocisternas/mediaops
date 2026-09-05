@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use mediaops_core::{
     Action, ControlPort, DesiredState, Envelope, ExecPort, ExitCode, HoldDecision, JobState, Plan,
@@ -8,6 +9,11 @@ use mediaops_core::{
 };
 use mediaops_store::Store;
 use mediaops_sync::{ApplyCtx, ApplyError, PlanRequest, apply, plan_actions, scan_schema_files};
+
+use crate::out::{
+    PullMeter, Style, Tone, finish, fmt_bytes, human_from_path, human_placement, human_title_id,
+    human_title_id_str, indent, row,
+};
 use mediaops_transfer::{
     HomeChannel, configure_pool, connect_home, grpc_source, list_entries, pool_status, probe_range,
 };
@@ -101,8 +107,120 @@ pub async fn cmd_plan(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!("plan {} actions {}", data.path, data.actions.len()))
+        Ok(format_plan_human(&data.path, &data.actions))
     }
+}
+
+fn format_plan_human(path: &str, actions: &[Action]) -> String {
+    let style = Style::stdout();
+    let mut lines = Vec::new();
+    for action in actions {
+        match action {
+            Action::Copy {
+                file_len,
+                placement,
+                ..
+            } => lines.push(row(
+                style,
+                "copy",
+                Tone::Go,
+                &human_placement(placement),
+                &fmt_bytes(*file_len),
+            )),
+            Action::Skip { title_id, reason } => {
+                let title = title_id.as_ref().map(human_title_id).unwrap_or_default();
+                lines.push(row(style, "skip", Tone::Quiet, &title, reason));
+            }
+            Action::Review { remote, reason } => {
+                let title = match remote {
+                    Some(r) => format!("{} / {}", r.root_id(), r.rel_path().display()),
+                    None => String::new(),
+                };
+                lines.push(row(style, "review", Tone::Wait, &title, reason));
+            }
+            Action::Unmonitor { title_id } => {
+                lines.push(row(
+                    style,
+                    "drop",
+                    Tone::Quiet,
+                    &human_title_id(title_id),
+                    "",
+                ));
+            }
+            Action::DeleteRemote { remote } => lines.push(row(
+                style,
+                "delete",
+                Tone::Wait,
+                &format!("{} / {}", remote.root_id(), remote.rel_path().display()),
+                "",
+            )),
+            Action::Encode { title_id } => {
+                lines.push(row(
+                    style,
+                    "encode",
+                    Tone::Go,
+                    &human_title_id(title_id),
+                    "",
+                ));
+            }
+            Action::Reclaim | Action::EdgeApply | Action::GrabApply => {}
+        }
+    }
+    if lines.is_empty() {
+        return "nothing to copy".into();
+    }
+    if !path.is_empty() {
+        lines.push(String::new());
+        lines.push(style.dim(path));
+    }
+    finish(lines)
+}
+
+fn format_run_human(data: &RunData) -> String {
+    let style = Style::stdout();
+    let mut lines = Vec::new();
+    for path in &data.installed {
+        let title = human_from_path(path).unwrap_or_else(|| path.clone());
+        lines.push(row(style, "copied", Tone::Go, &title, ""));
+    }
+    for fail in &data.copy_failed {
+        lines.push(row(
+            style,
+            "failed",
+            Tone::Bad,
+            &human_title_id_str(&fail.title_id),
+            "",
+        ));
+        if !fail.remote.is_empty() {
+            lines.push(indent(style, &fail.remote));
+        }
+        lines.push(indent(style, &fail.error));
+    }
+    for fail in &data.unmonitor_failed {
+        lines.push(row(
+            style,
+            "drop",
+            Tone::Bad,
+            &human_title_id_str(&fail.title_id),
+            &fail.error,
+        ));
+    }
+    if data.encode.ran > 0 {
+        lines.push(row(
+            style,
+            "encoded",
+            Tone::Go,
+            "",
+            &data.encode.ran.to_string(),
+        ));
+    }
+    if let Some(err) = &data.encode.error {
+        lines.push(row(style, "encode", Tone::Bad, "failed", err));
+    }
+    if lines.is_empty() {
+        return "nothing to copy".into();
+    }
+    finish(lines)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,6 +278,27 @@ pub async fn cmd_run(
     let control = mediaops_proto::ControlPortClient::new(
         mediaops_proto::control_client::ControlClient::new(channel.clone()),
     );
+    let meter = Arc::new(Mutex::new(None::<(String, PullMeter)>));
+    let on_pull_progress = if json {
+        None
+    } else {
+        let meter = meter.clone();
+        Some(Arc::new(move |label: String, done, total| {
+            let label = crate::out::humanize_schema_label(&label);
+            let mut slot = meter.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.as_mut() {
+                Some((current, m)) if *current == label => m.update(done, total),
+                _ => {
+                    if let Some((_, mut old)) = slot.take() {
+                        old.finish();
+                    }
+                    let mut m = PullMeter::new(label.clone());
+                    m.update(done, total);
+                    *slot = Some((label, m));
+                }
+            }
+        }) as mediaops_sync::PullProgress)
+    };
     let report = apply(
         &plan,
         &active,
@@ -170,10 +309,16 @@ pub async fn cmd_run(
             library_root: &prepared.library_root,
             concurrency: n as usize,
             control: Some(&control),
+            on_pull_progress,
         },
     )
     .await
     .map_err(map_apply)?;
+    if let Ok(mut slot) = meter.lock()
+        && let Some((_, mut m)) = slot.take()
+    {
+        m.finish();
+    }
 
     let ds = plan
         .desired_state()
@@ -288,15 +433,7 @@ pub async fn cmd_run(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!(
-            "run copies {} skips {} reviews {} installed {} copy_failed {} unmonitor_failed {}",
-            data.copies,
-            data.skips,
-            data.reviews,
-            data.installed.len(),
-            data.copy_failed.len(),
-            data.unmonitor_failed.len()
-        ))
+        Ok(format_run_human(&data))
     }
 }
 
@@ -516,7 +653,73 @@ fn unique_plan_path(plans_dir: &Path, plan: &Plan) -> Result<PathBuf, AppError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mediaops_core::TitleId;
+    use mediaops_core::{Placement, RemoteRef, TitleId};
+
+    #[test]
+    fn plan_human_lists_the_copy_not_just_the_json_path() {
+        let remote = RemoteRef::from_wire_parts(
+            "usenet_movies".into(),
+            "Hearts.of.Darkness-GERMAN/Hearts.mkv".into(),
+        )
+        .expect("remote");
+        let text = format_plan_human(
+            "/tmp/plan.json",
+            &[
+                Action::Copy {
+                    title_id: TitleId::movie_key("Hearts of Darkness", 1991).expect("id"),
+                    remote,
+                    file_len: 7_250_189_951,
+                    placement: Placement::movie(
+                        "Hearts.of.Darkness.A.Filmmaker's.Apocalypse",
+                        1991,
+                        "mkv",
+                    ),
+                },
+                Action::GrabApply,
+            ],
+        );
+        assert_eq!(
+            text,
+            "\
+copy      Hearts of Darkness A Filmmaker's Apocalypse (1991)  6.8 GiB
+
+/tmp/plan.json"
+        );
+    }
+
+    #[test]
+    fn plan_human_empty_is_english() {
+        assert_eq!(format_plan_human("/tmp/plan.json", &[]), "nothing to copy");
+        assert_eq!(
+            format_plan_human("/tmp/plan.json", &[Action::GrabApply]),
+            "nothing to copy"
+        );
+    }
+
+    #[test]
+    fn run_human_lists_what_landed() {
+        let text = format_run_human(&RunData {
+            path: "/tmp/plan.json".into(),
+            copies: 1,
+            skips: 0,
+            reviews: 0,
+            installed: vec![
+                "movies/Hearts.of.Darkness.A.Filmmaker's.Apocalypse.(1991)/Hearts.of.Darkness.A.Filmmaker's.Apocalypse.(1991).mkv"
+                    .into(),
+            ],
+            copy_failed: Vec::new(),
+            encode: EncodeData {
+                ran: 0,
+                skipped: 1,
+                error: None,
+            },
+            unmonitor_failed: Vec::new(),
+        });
+        assert_eq!(
+            text,
+            "copied    Hearts of Darkness A Filmmaker's Apocalypse (1991)"
+        );
+    }
 
     #[test]
     fn map_apply_preserves_control_usage() {

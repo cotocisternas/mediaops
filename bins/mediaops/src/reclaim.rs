@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::AppError;
 use crate::bootstrap;
+use crate::out::{Style, Tone, finish, fmt_bytes, human_from_path, human_title_id, indent, row};
 
 #[derive(Debug, Serialize)]
 struct PreviewData {
@@ -54,21 +55,43 @@ pub async fn preview(
     };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-    } else if data.candidates.is_empty() {
-        Ok("reclaim preview: 0".into())
     } else {
-        let mut out = format!("reclaim preview: {}\n", data.candidates.len());
-        for c in &data.candidates {
-            out.push_str(&format!(
-                "{} {} ratio={:?} private={:?}\n",
-                c.title_id.render(),
-                c.remote.rel_path().display(),
-                c.ratio,
-                c.is_private
-            ));
-        }
-        Ok(out)
+        Ok(format_preview(&data.candidates))
     }
+}
+
+fn format_preview(candidates: &[ReclaimCandidate]) -> String {
+    if candidates.is_empty() {
+        return "nothing to reclaim".into();
+    }
+    let style = Style::stdout();
+    let mut lines = Vec::new();
+    for candidate in candidates {
+        let path = candidate.remote.rel_path().display().to_string();
+        let title = human_from_path(&path).unwrap_or_else(|| human_title_id(&candidate.title_id));
+        lines.push(row(
+            style,
+            "reclaim",
+            Tone::Wait,
+            &title,
+            &fmt_bytes(candidate.len),
+        ));
+        lines.push(indent(
+            style,
+            &format!("{} / {path}", candidate.remote.root_id()),
+        ));
+        let mut bits = Vec::new();
+        if let Some(ratio) = candidate.ratio {
+            bits.push(format!("ratio {ratio:.1}"));
+        }
+        if let Some(private) = candidate.is_private {
+            bits.push(if private { "private" } else { "public" }.into());
+        }
+        if !bits.is_empty() {
+            lines.push(indent(style, &bits.join("  ")));
+        }
+    }
+    finish(lines)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -106,16 +129,50 @@ pub async fn apply(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        let mut line = format!(
-            "reclaim apply deleted {} skipped_seeding {} qbit_unavailable {} failed {}",
-            data.deleted, data.skipped_seeding, data.qbit_unavailable, data.failed
-        );
-        for err in &data.errors {
-            line.push('\n');
-            line.push_str(err);
-        }
-        Ok(line)
+        Ok(format_apply(&data))
     }
+}
+
+fn format_apply(data: &ApplyData) -> String {
+    let style = Style::stdout();
+    let mut lines = Vec::new();
+    if data.deleted > 0 {
+        lines.push(row(
+            style,
+            "deleted",
+            Tone::Go,
+            "",
+            &data.deleted.to_string(),
+        ));
+    }
+    if data.skipped_seeding > 0 {
+        lines.push(row(
+            style,
+            "kept",
+            Tone::Quiet,
+            "still seeding",
+            &data.skipped_seeding.to_string(),
+        ));
+    }
+    if data.qbit_unavailable > 0 {
+        lines.push(row(style, "kept", Tone::Wait, "qbit did not answer", ""));
+    }
+    if data.failed > 0 {
+        lines.push(row(
+            style,
+            "failed",
+            Tone::Bad,
+            "",
+            &data.failed.to_string(),
+        ));
+    }
+    for err in &data.errors {
+        lines.push(indent(style, err));
+    }
+    if lines.is_empty() {
+        return "nothing to reclaim".into();
+    }
+    finish(lines)
 }
 
 struct Snapshot {
@@ -566,5 +623,42 @@ mod tests {
             "--max 0 must not unlink"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reclaim_human_screens() {
+        assert_eq!(format_preview(&[]), "nothing to reclaim");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        let candidate = ReclaimCandidate {
+            title_id: title,
+            remote: mediaops_core::RemoteRef::from_wire_parts(
+                "seedbox".into(),
+                std::path::PathBuf::from(crate::test_support::MOVIE_REL),
+            )
+            .expect("ref"),
+            len: 7_250_189_951,
+            mtime: 0,
+            ratio: Some(2.1),
+            is_private: Some(false),
+        };
+        assert_eq!(
+            format_preview(&[candidate]),
+            "\
+reclaim   The Matrix (1999)  6.8 GiB
+          seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
+          ratio 2.1  public"
+        );
+        assert_eq!(
+            format_apply(&ApplyData {
+                deleted: 2,
+                skipped_seeding: 1,
+                qbit_unavailable: 0,
+                failed: 0,
+                errors: Vec::new(),
+            }),
+            "\
+deleted   2
+kept      still seeding  1"
+        );
     }
 }

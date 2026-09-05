@@ -11,7 +11,8 @@ mod plan;
 mod reclaim;
 
 pub use apply::{
-    ApplyCtx, ApplyError, ApplyReport, CopyFailure, InstalledCopy, UnmonitorFailure, apply,
+    ApplyCtx, ApplyError, ApplyReport, CopyFailure, InstalledCopy, PullProgress, UnmonitorFailure,
+    apply,
 };
 pub use hold::inbox;
 pub use plan::{

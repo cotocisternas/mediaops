@@ -10,7 +10,7 @@ use mediaops_core::{
     SKIP_UPGRADE_NEVER, TitleId, TitleIndexRepo, VerifiedStagingHandle, WantEvent, WantState,
     install, render, staging_path,
 };
-use mediaops_transfer::{PullSpec, RangeSource, pull_file};
+use mediaops_transfer::{PullSpec, RangeSource, pull_file_with_progress};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledCopy {
@@ -76,6 +76,8 @@ impl ApplyError {
     }
 }
 
+pub type PullProgress = Arc<dyn Fn(String, u64, u64) + Send + Sync>;
+
 pub struct ApplyCtx<'a, J, T, S> {
     pub jobs: &'a J,
     pub titles: &'a T,
@@ -83,6 +85,7 @@ pub struct ApplyCtx<'a, J, T, S> {
     pub library_root: &'a Path,
     pub concurrency: usize,
     pub control: Option<&'a dyn ControlPort>,
+    pub on_pull_progress: Option<PullProgress>,
 }
 
 pub async fn apply<J, T, S>(
@@ -125,6 +128,7 @@ where
                     remote,
                     *file_len,
                     placement,
+                    ctx.on_pull_progress.as_ref(),
                 )
                 .await
                 {
@@ -222,6 +226,7 @@ async fn apply_copy<J, T, S>(
     remote: &mediaops_core::RemoteRef,
     file_len: u64,
     placement: &Placement,
+    on_pull_progress: Option<&PullProgress>,
 ) -> Result<InstalledCopy, ApplyError>
 where
     J: JobsRepo,
@@ -291,9 +296,15 @@ where
             range_len,
             concurrency: concurrency.max(1),
         };
-        pull_file(source, &spec)
-            .await
-            .map_err(|err| ApplyError::Transfer(err.to_string()))?;
+        let label = placement.label();
+        let progress = on_pull_progress.cloned();
+        pull_file_with_progress(source, &spec, move |done, total| {
+            if let Some(cb) = &progress {
+                cb(label.clone(), done, total);
+            }
+        })
+        .await
+        .map_err(|err| ApplyError::Transfer(err.to_string()))?;
         pull = jobs
             .advance(pull.id(), JobEvent::Pull(PullEvent::FinishRanges))
             .await
@@ -711,6 +722,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -752,6 +764,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -800,6 +813,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -841,6 +855,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -868,6 +883,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -909,6 +925,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -946,6 +963,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -993,6 +1011,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -1052,6 +1071,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: None,
+                on_pull_progress: None,
             },
         )
         .await
@@ -1212,6 +1232,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: Some(&control),
+                on_pull_progress: None,
             },
         )
         .await
@@ -1264,6 +1285,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: Some(&control),
+                on_pull_progress: None,
             },
         )
         .await
@@ -1307,6 +1329,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: Some(&control),
+                on_pull_progress: None,
             },
         )
         .await
@@ -1339,6 +1362,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: Some(&control),
+                on_pull_progress: None,
             },
         )
         .await
@@ -1384,6 +1408,7 @@ mod tests {
                 library_root: &root,
                 concurrency: 1,
                 control: Some(&control),
+                on_pull_progress: None,
             },
         )
         .await

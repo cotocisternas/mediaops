@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mediaops_core::{
-    ControlPort, Envelope, HoldDecision, HoldEvent, HoldKey, JobEvent, JobKind, PathSchemaError,
-    ReleaseId, TitleId, preflight_approve_placement,
+    ControlPort, Envelope, HoldDecision, HoldEvent, HoldKey, HoldLiveItem, JobEvent, JobKind,
+    PathSchemaError, ReleaseId, TitleId, preflight_approve_placement, title_key,
 };
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
@@ -14,9 +14,14 @@ use serde::Serialize;
 
 use crate::AppError;
 use crate::bootstrap;
+use crate::out::{Style, Tone, finish, fmt_age, fmt_bytes, humanize_schema_label, indent, row};
 
 #[derive(Debug, Serialize)]
 struct HoldJson {
+    n: usize,
+    name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    release: String,
     title_id: String,
     release_id: String,
     age_secs: u64,
@@ -31,6 +36,7 @@ struct HoldListData {
 
 #[derive(Debug, Serialize)]
 struct HoldDecideData {
+    name: String,
     title_id: String,
     release_id: String,
     decision: String,
@@ -65,28 +71,14 @@ pub async fn list(
         .unwrap_or(0);
     let holds: Vec<HoldJson> = inbox(&live, &decided)
         .into_iter()
-        .map(|item| HoldJson {
-            title_id: item.key.title_id.render(),
-            release_id: item.key.release_id.as_str().to_string(),
-            age_secs: item.age_secs(now),
-            size: item.size,
-            reason: item.reason,
-        })
+        .enumerate()
+        .map(|(i, item)| hold_json(i + 1, &item, now))
         .collect();
     let data = HoldListData { holds };
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-    } else if data.holds.is_empty() {
-        Ok("hold list: 0".into())
     } else {
-        let mut out = format!("hold list: {}\n", data.holds.len());
-        for h in &data.holds {
-            out.push_str(&format!(
-                "{} {} age={}s size={} {}\n",
-                h.title_id, h.release_id, h.age_secs, h.size, h.reason
-            ));
-        }
-        Ok(out)
+        Ok(format_hold_list(&data.holds))
     }
 }
 
@@ -95,16 +87,12 @@ pub async fn decide(
     json: bool,
     decision: HoldDecision,
     title_id: String,
-    release_id: String,
+    release_id: Option<String>,
     socket: Option<PathBuf>,
     tls_dir: Option<PathBuf>,
     config_dir: Option<PathBuf>,
     state_db: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let title_id = TitleId::parse(&title_id).map_err(|err| AppError::Usage(err.to_string()))?;
-    let release_id =
-        ReleaseId::parse(&release_id).map_err(|err| AppError::Usage(err.to_string()))?;
-    let key = HoldKey::new(title_id, release_id);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
     let socket = socket.unwrap_or_else(bootstrap::default_socket);
@@ -122,11 +110,9 @@ pub async fn decide(
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
     let listed = inbox(&live, &decided);
-    let Some(item) = listed.iter().find(|item| item.key == key) else {
-        return Err(AppError::Usage(
-            "hold is not in the inbox (unknown key or grabber=none)".into(),
-        ));
-    };
+    let item = resolve_hold(&listed, &title_id, release_id.as_deref())?;
+    let key = item.key.clone();
+    let name = hold_label(item);
     if decision == HoldDecision::Approved
         && let Some(placement) = &item.placement
     {
@@ -137,6 +123,7 @@ pub async fn decide(
         control.hold_reject(&key).await.map_err(map_control)?;
     }
     let data = HoldDecideData {
+        name,
         title_id: key.title_id.render(),
         release_id: key.release_id.as_str().to_string(),
         decision: decision.as_str().to_string(),
@@ -144,10 +131,153 @@ pub async fn decide(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!(
-            "hold {} {} {}",
-            data.decision, data.title_id, data.release_id
-        ))
+        Ok(format_hold_decide(&data))
+    }
+}
+
+fn format_hold_decide(data: &HoldDecideData) -> String {
+    let style = Style::stdout();
+    let title = humanize_schema_label(&data.name);
+    let (verb, tone) = match data.decision.as_str() {
+        "approved" => ("approved", Tone::Go),
+        _ => ("rejected", Tone::Quiet),
+    };
+    finish(vec![
+        row(style, verb, tone, &title, ""),
+        indent(style, &data.title_id),
+    ])
+}
+
+fn hold_json(n: usize, item: &HoldLiveItem, now: i64) -> HoldJson {
+    HoldJson {
+        n,
+        name: hold_label(item),
+        release: hold_release_name(item),
+        title_id: item.key.title_id.render(),
+        release_id: item.key.release_id.as_str().to_string(),
+        age_secs: item.age_secs(now),
+        size: item.size,
+        reason: item.reason.clone(),
+    }
+}
+
+fn hold_label(item: &HoldLiveItem) -> String {
+    if let Some(placement) = &item.placement {
+        return placement.label();
+    }
+    let release = hold_release_name(item);
+    if !release.is_empty() {
+        return release;
+    }
+    item.key.title_id.render()
+}
+
+fn hold_release_name(item: &HoldLiveItem) -> String {
+    if let Some(path) = &item.output_path
+        && let Some(name) = path.rsplit(['/', '\\']).find(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+    if let Some(remote) = &item.remote
+        && let Some(first) = remote.rel_path().iter().next()
+    {
+        return first.to_string_lossy().into_owned();
+    }
+    String::new()
+}
+
+fn format_hold_list(holds: &[HoldJson]) -> String {
+    let style = Style::stdout();
+    if holds.is_empty() {
+        return "nothing on hold".into();
+    }
+    let mut lines = Vec::new();
+    for h in holds {
+        let title = humanize_schema_label(&h.name);
+        let meta = format!("{}  {}", fmt_bytes(h.size), fmt_age(h.age_secs));
+        lines.push(format!("{}.  {}  {meta}", h.n, style.bold(&title)));
+        lines.push(format!("    {}", style.dim(&h.title_id)));
+        if !h.reason.is_empty() {
+            lines.push(format!("    {}", h.reason));
+        }
+        if !h.release.is_empty() && h.release != h.name {
+            lines.push(format!("    {}", style.dim(&h.release)));
+        }
+        lines.push(String::new());
+    }
+    if let Some(first) = holds.first() {
+        lines.push(row(
+            style,
+            "approve",
+            Tone::Go,
+            "",
+            &format!("mediaops hold approve {}", first.title_id),
+        ));
+    }
+    finish(lines)
+}
+
+fn resolve_hold<'a>(
+    listed: &'a [HoldLiveItem],
+    target: &str,
+    release_id: Option<&str>,
+) -> Result<&'a HoldLiveItem, AppError> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(AppError::Usage(
+            "say which hold: a number from `hold list`, or a title".into(),
+        ));
+    }
+    if let Some(rel) = release_id {
+        let title_id = TitleId::parse(target).map_err(|err| AppError::Usage(err.to_string()))?;
+        let release_id = ReleaseId::parse(rel).map_err(|err| AppError::Usage(err.to_string()))?;
+        let key = HoldKey::new(title_id, release_id);
+        return listed.iter().find(|item| item.key == key).ok_or_else(|| {
+            AppError::Usage("hold is not in the inbox (unknown key or grabber=none)".into())
+        });
+    }
+    if let Ok(n) = target.parse::<usize>()
+        && n >= 1
+        && n <= listed.len()
+    {
+        return Ok(&listed[n - 1]);
+    }
+    if let Ok(title_id) = TitleId::parse(target) {
+        return unique_hold(
+            listed
+                .iter()
+                .filter(|item| item.key.title_id == title_id)
+                .collect(),
+            target,
+        );
+    }
+    let needle = title_key(target);
+    unique_hold(
+        listed
+            .iter()
+            .filter(|item| {
+                !needle.is_empty()
+                    && title_key(&format!("{} {}", hold_label(item), hold_release_name(item)))
+                        .contains(&needle)
+            })
+            .collect(),
+        target,
+    )
+}
+
+fn unique_hold<'a>(
+    hits: Vec<&'a HoldLiveItem>,
+    target: &str,
+) -> Result<&'a HoldLiveItem, AppError> {
+    match hits.len() {
+        1 => Ok(hits[0]),
+        0 => Err(AppError::Usage(format!(
+            "no hold matches `{target}` — `mediaops hold list`"
+        ))),
+        _ => Err(AppError::Usage(format!(
+            "`{target}` matches {} holds; use the number from `hold list`",
+            hits.len()
+        ))),
     }
 }
 
@@ -424,7 +554,7 @@ mod tests {
             true,
             HoldDecision::Approved,
             "movie:tmdb:603".into(),
-            "deadbeef".into(),
+            Some("deadbeef".into()),
             Some(lb.sock.clone()),
             Some(lb.tls_dir.clone()),
             Some(dir.clone()),
@@ -494,7 +624,7 @@ mod tests {
             true,
             HoldDecision::Approved,
             "movie:tmdb:603".into(),
-            "deadbeef".into(),
+            Some("deadbeef".into()),
             Some(lb.sock.clone()),
             Some(lb.tls_dir.clone()),
             Some(dir.clone()),
@@ -525,7 +655,7 @@ mod tests {
             true,
             HoldDecision::Approved,
             "movie:tmdb:603".into(),
-            "deadbeef".into(),
+            Some("deadbeef".into()),
             Some(lb.sock.clone()),
             Some(lb.tls_dir.clone()),
             Some(dir.clone()),
@@ -557,7 +687,7 @@ mod tests {
             true,
             HoldDecision::Rejected,
             "movie:tmdb:603".into(),
-            "deadbeef".into(),
+            Some("deadbeef".into()),
             Some(lb.sock.clone()),
             Some(lb.tls_dir.clone()),
             Some(dir.clone()),
@@ -608,7 +738,7 @@ mod tests {
                 true,
                 decision,
                 "movie:tmdb:603".into(),
-                "deadbeef".into(),
+                Some("deadbeef".into()),
                 Some(lb.sock.clone()),
                 Some(lb.tls_dir.clone()),
                 Some(dir.clone()),
@@ -625,6 +755,79 @@ mod tests {
         );
         assert!(store.get(&key).await.expect("get").is_none());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hold_list_text_is_a_name_and_a_number() {
+        let text = format_hold_list(&[HoldJson {
+            n: 1,
+            name: "Hearts.of.Darkness.A.Filmmaker's.Apocalypse.(1991)".into(),
+            release: "Hearts.of.Darkness-Reise.ins.Herz.der.Finsternis.GERMAN.DL".into(),
+            title_id: "movie:tmdb:4539".into(),
+            release_id: "deadbeef".into(),
+            age_secs: 748,
+            size: 7_588_856_506,
+            reason: "Manual Import required.".into(),
+        }]);
+        assert_eq!(
+            text,
+            "\
+1.  Hearts of Darkness A Filmmaker's Apocalypse (1991)  7.1 GiB  12m
+    movie:tmdb:4539
+    Manual Import required.
+    Hearts.of.Darkness-Reise.ins.Herz.der.Finsternis.GERMAN.DL
+
+approve   mediaops hold approve movie:tmdb:4539"
+        );
+        assert!(!text.contains("deadbeef"));
+    }
+
+    #[test]
+    fn hold_list_empty_is_english() {
+        assert_eq!(format_hold_list(&[]), "nothing on hold");
+    }
+
+    #[test]
+    fn hold_decide_text_is_a_title_and_an_id() {
+        assert_eq!(
+            format_hold_decide(&HoldDecideData {
+                name: "Hearts.of.Darkness.A.Filmmaker's.Apocalypse.(1991)".into(),
+                title_id: "movie:tmdb:4539".into(),
+                release_id: "deadbeef".into(),
+                decision: "approved".into(),
+            }),
+            "\
+approved  Hearts of Darkness A Filmmaker's Apocalypse (1991)
+          movie:tmdb:4539"
+        );
+    }
+
+    #[test]
+    fn resolve_hold_accepts_number_and_unique_name() {
+        let mut item = live_item("movie:tmdb:4539", "deadbeef", 0, 1, "blocked");
+        item.placement = Some(Placement::movie(
+            "Hearts.of.Darkness.A.Filmmaker's.Apocalypse",
+            1991,
+            "mkv",
+        ));
+        let listed = [item];
+        assert_eq!(
+            resolve_hold(&listed, "1", None)
+                .expect("n")
+                .key
+                .title_id
+                .render(),
+            "movie:tmdb:4539"
+        );
+        assert_eq!(
+            resolve_hold(&listed, "hearts of darkness", None)
+                .expect("name")
+                .key
+                .release_id
+                .as_str(),
+            "deadbeef"
+        );
+        assert!(resolve_hold(&listed, "Silo", None).is_err());
     }
 
     #[test]

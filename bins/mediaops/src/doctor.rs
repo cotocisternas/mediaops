@@ -147,10 +147,7 @@ pub async fn doctor(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!(
-            "doctor ok frozen={} fingerprint={}",
-            data.frozen, data.fingerprint
-        ))
+        Ok("ok".into())
     }
 }
 

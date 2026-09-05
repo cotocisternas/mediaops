@@ -68,11 +68,11 @@ make build
 | `seedbox bootstrap` | SSH Host `seedbox`: copy daemon, mint certs, probe Range N. Needs `--yes` to apply. |
 | `library bootstrap` | Schema dirs, sqlite, lock, systemd-user units, NVENC probe. `--enable-timer` also enables the run timer and home unit. |
 | `list` / `pull` | List remotes / pull one file through the home socket. |
-| `watch TITLE` | Record a want (`kind:source:id`). Exits 0; does not wait for playable. |
+| `watch TITLE` | Record a want. Title id or a name from the library / inbox. Exits 0; does not wait for playable. |
 | `plan` / `run` | Exclusive lock. `run` is plan + apply in this process. Lock conflict is exit 3, never silent 0. Approved holds become Copy on this path. |
-| `why TITLE` / `status` | Lock-free peek. Local FS is truth. |
+| `why TITLE` / `status` | Lock-free peek. `why` takes a title id or a name. Local FS is truth. |
 | `reclaim preview\|apply` | Ranked surplus dry-run (lock-free); exclusive unlink after `install_b3` plus the library file. |
-| `hold list\|approve\|reject` | Lock-free import-blocked inbox. Approve records a decision (does not install). Reject is never-this-release. |
+| `hold list\|approve\|reject` | Lock-free import-blocked inbox. List shows the title and the id; `approve movie:tmdb:…` / `reject movie:tmdb:…`. Approve records a decision (does not install). Reject is never-this-release. |
 | `doctor` / `repair edge` | Read-only EdgeInvariant vs confirmed nginx + API repair. |
 | `seedbox apply\|upgrade` | Grabber set-diff apply; re-copy musl `mediaopsd` and restart. |
 | `encode scan\|run\|pause` | Home GPU only. Not linked into `mediaopsd`. |

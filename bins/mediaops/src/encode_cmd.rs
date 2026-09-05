@@ -14,6 +14,10 @@ use serde::Serialize;
 
 use crate::AppError;
 use crate::bootstrap;
+use crate::out::{
+    Style, Tone, finish, hints_from_index, hints_from_jobs, human_from_path, human_title_id,
+    human_title_id_str, merge_hints, resolve_title, row,
+};
 
 #[derive(Debug, Serialize)]
 struct ScanFile {
@@ -81,8 +85,28 @@ pub async fn scan(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!("encode scan {} files", data.files.len()))
+        Ok(format_scan(&data.files))
     }
+}
+
+fn format_scan(files: &[ScanFile]) -> String {
+    if files.is_empty() {
+        return "nothing to encode".into();
+    }
+    let style = Style::stdout();
+    let mut lines = Vec::new();
+    for file in files {
+        let title =
+            human_from_path(&file.path).unwrap_or_else(|| human_title_id_str(&file.title_id));
+        let (verb, tone, meta) = match file.decision.as_str() {
+            "nvenc_h264" => ("encode", Tone::Go, ""),
+            "keep" => ("keep", Tone::Quiet, ""),
+            "refuse" => ("skip", Tone::Quiet, "hdr"),
+            other => ("scan", Tone::Quiet, other),
+        };
+        lines.push(row(style, verb, tone, &title, meta));
+    }
+    finish(lines)
 }
 
 pub async fn pause(json: bool, off: bool, state_db: Option<PathBuf>) -> Result<String, AppError> {
@@ -99,10 +123,11 @@ pub async fn pause(json: bool, off: bool, state_db: Option<PathBuf>) -> Result<S
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!(
-            "encode pause {}",
-            if data.encode_pause { "on" } else { "off" }
-        ))
+        Ok(if data.encode_pause {
+            "encode    paused".into()
+        } else {
+            "encode    running".into()
+        })
     }
 }
 
@@ -159,7 +184,7 @@ pub async fn run(
         .unwrap_or_else(|| "ffmpeg".into());
 
     if let Some(raw) = title {
-        let title_id = TitleId::parse(&raw).map_err(|err| AppError::Usage(err.to_string()))?;
+        let title_id = resolve_encode_title(&store, &raw).await?;
         if cap == 0 {
             return Err(AppError::Policy("no NVENC capacity".into()));
         }
@@ -183,7 +208,13 @@ pub async fn run(
                     serde_json::to_string(&Envelope::ok(data))
                         .map_err(|e| AppError::Runtime(e.into()))
                 } else {
-                    Ok("encode keep".into())
+                    Ok(row(
+                        Style::stdout(),
+                        "keep",
+                        Tone::Quiet,
+                        &human_title_id(&title_id),
+                        "",
+                    ))
                 };
             }
             EncodeDecision::NvencH264 => {}
@@ -197,7 +228,7 @@ pub async fn run(
             return if json {
                 serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
             } else {
-                Ok("encode paused".into())
+                Ok("encode    paused".into())
             };
         }
         let (_, placement) = parse_placement(&path.strip_prefix(&library_root).unwrap_or(&path))
@@ -226,7 +257,13 @@ pub async fn run(
         return if json {
             serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
         } else {
-            Ok("encode ran 1".into())
+            Ok(row(
+                Style::stdout(),
+                "encoded",
+                Tone::Go,
+                &human_title_id(&title_id),
+                "",
+            ))
         };
     }
 
@@ -239,7 +276,7 @@ pub async fn run(
         return if json {
             serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
         } else {
-            Ok("encode cap 0".into())
+            Ok("nothing to encode".into())
         };
     }
 
@@ -291,8 +328,48 @@ pub async fn run(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!("encode ran {ran} skipped {skipped}"))
+        Ok(format_encode_run(&data))
     }
+}
+
+fn format_encode_run(data: &EncodeRunData) -> String {
+    if data.paused && data.ran == 0 {
+        return "encode    paused".into();
+    }
+    if data.ran == 0 {
+        return "nothing to encode".into();
+    }
+    row(
+        Style::stdout(),
+        "encoded",
+        Tone::Go,
+        "",
+        &data.ran.to_string(),
+    )
+}
+
+async fn resolve_encode_title(store: &Store, raw: &str) -> Result<TitleId, AppError> {
+    if let Ok(id) = TitleId::parse(raw) {
+        return Ok(id);
+    }
+    let titles = store
+        .list_titles()
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let jobs = store
+        .list_jobs()
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    resolve_title(
+        raw,
+        &merge_hints(
+            hints_from_index(&titles)
+                .into_iter()
+                .chain(hints_from_jobs(&jobs))
+                .collect(),
+        ),
+    )
+    .map_err(AppError::Usage)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -561,7 +638,7 @@ mod tests {
             Some("1")
         );
         let off = pause(false, true, Some(db)).await.expect("off");
-        assert!(off.contains("off"), "{off}");
+        assert_eq!(off, "encode    running");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -591,14 +668,23 @@ mod tests {
             &library,
             "series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E01.mkv",
         );
-        let scanned = scan(&probe(HEVC10), true, Some(library), Some(db))
-            .await
-            .expect("scan");
+        let scanned = scan(
+            &probe(HEVC10),
+            true,
+            Some(library.clone()),
+            Some(db.clone()),
+        )
+        .await
+        .expect("scan");
         let value: serde_json::Value = serde_json::from_str(&scanned).expect("json");
         let files = value["data"]["files"].as_array().expect("files");
         assert_eq!(files.len(), 1, "scan walks movies/ only: {files:?}");
         assert_eq!(files[0]["title_id"], "movie:key:thematrix.1999");
         assert_eq!(files[0]["decision"], "nvenc_h264");
+        let human = scan(&probe(HEVC10), false, Some(library), Some(db))
+            .await
+            .expect("human");
+        assert_eq!(human, "encode    The Matrix (1999)");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -8,12 +8,13 @@ use mediaops_store::Store;
 use mediaops_sync::refuse_below_watermark;
 use mediaops_transfer::{
     PullSpec, configure_pool, connect_home, grpc_source, list_entries, pool_status, probe_range,
-    pull_file, stat_entry,
+    pull_file_with_progress, stat_entry,
 };
 use serde::Serialize;
 
 use crate::AppError;
 use crate::bootstrap;
+use crate::out::{PullMeter, Style, Tone, finish, fmt_bytes, human_from_path, indent, row};
 
 #[derive(Debug, Serialize)]
 struct ListEntry {
@@ -74,20 +75,39 @@ pub async fn list(
         };
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        let mut out = String::new();
-        for e in &entries {
-            out.push_str(&format!(
-                "{} {}\t{}\n",
-                e.r#ref().root_id(),
-                e.r#ref().rel_path().display(),
-                e.len()
+        Ok(format_list(&entries))
+    }
+}
+
+fn format_list(entries: &[mediaops_core::RemoteEntry]) -> String {
+    if entries.is_empty() {
+        return "nothing on the box".into();
+    }
+    let style = Style::stdout();
+    let mut groups: Vec<(String, Vec<&mediaops_core::RemoteEntry>)> = Vec::new();
+    for entry in entries {
+        let root = entry.r#ref().root_id().to_string();
+        if let Some((_, list)) = groups.iter_mut().find(|(r, _)| *r == root) {
+            list.push(entry);
+        } else {
+            groups.push((root, vec![entry]));
+        }
+    }
+    let mut lines = Vec::new();
+    for (i, (root, files)) in groups.iter().enumerate() {
+        if i > 0 {
+            lines.push(String::new());
+        }
+        lines.push(style.bold(root));
+        for entry in files {
+            lines.push(format!(
+                "  {:>8}  {}",
+                fmt_bytes(entry.len()),
+                entry.r#ref().rel_path().display()
             ));
         }
-        if out.is_empty() {
-            out.push_str("(empty listing)\n");
-        }
-        Ok(out.trim_end().to_string())
     }
+    finish(lines)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,9 +246,21 @@ pub async fn pull(
         range_len: ds.range_len().get(),
         concurrency: n as usize,
     };
-    let outcome = pull_file(grpc_source(channel), &spec)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
+    let pull_label = placement
+        .as_ref()
+        .map(crate::out::human_placement)
+        .unwrap_or_else(|| name.clone());
+    let mut meter = (!json).then(|| PullMeter::new(pull_label.clone()));
+    let outcome = pull_file_with_progress(grpc_source(channel), &spec, |done, total| {
+        if let Some(m) = meter.as_mut() {
+            m.update(done, total);
+        }
+    })
+    .await
+    .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
+    if let Some(m) = meter.as_mut() {
+        m.finish();
+    }
 
     let job = store
         .create_job(mediaops_core::JobKind::Pull, &title_id, None)
@@ -300,15 +332,27 @@ pub async fn pull(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        let mut line = format!("staged {} b3 {}", data.staged, data.whole_file_b3);
-        if let Some(path) = data.installed {
-            line.push_str(&format!(" installed {path}"));
-        }
-        if !data.resumed_ranges.is_empty() {
-            line.push_str(&format!(" resumed {}", data.resumed_ranges.len()));
-        }
-        Ok(line)
+        Ok(format_pull(&data, &pull_label))
     }
+}
+
+fn format_pull(data: &PullData, label: &str) -> String {
+    let style = Style::stdout();
+    let dest = data.installed.as_deref().unwrap_or(data.staged.as_str());
+    let title = human_from_path(dest).unwrap_or_else(|| label.to_string());
+    let mut lines = vec![row(style, "pulled", Tone::Go, &title, "")];
+    if let Some(path) = &data.installed {
+        lines.push(indent(style, path));
+    } else {
+        lines.push(indent(style, "staged, not installed"));
+    }
+    if !data.resumed_ranges.is_empty() {
+        lines.push(indent(
+            style,
+            &format!("resumed {} ranges", data.resumed_ranges.len()),
+        ));
+    }
+    finish(lines)
 }
 
 fn placement_for(
@@ -446,7 +490,7 @@ mod tests {
         )
         .await
         .expect("empty human");
-        assert_eq!(human, "(empty listing)");
+        assert_eq!(human, "nothing on the box");
         drop(empty);
 
         let lb = crate::test_support::start_pair(Some("a.bin"), b"abcdefghij").await;
@@ -461,8 +505,12 @@ mod tests {
         let human = list(false, Some(lb.sock.clone()), Some(lb.tls_dir.clone()), None)
             .await
             .expect("list human");
-        assert!(human.contains("seedbox a.bin"), "{human}");
-        assert!(human.contains("10"), "{human}");
+        assert_eq!(
+            human,
+            "\
+seedbox
+      10 B  a.bin"
+        );
     }
 
     #[tokio::test]

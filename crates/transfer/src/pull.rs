@@ -49,6 +49,19 @@ pub async fn pull_file<S: RangeSource + 'static>(
     src: Arc<S>,
     spec: &PullSpec,
 ) -> Result<PullOutcome, TransferError> {
+    pull_file_with_progress(src, spec, |_, _| {}).await
+}
+
+/// Same as [`pull_file`], reporting `(done, total)` bytes after each range.
+pub async fn pull_file_with_progress<S, F>(
+    src: Arc<S>,
+    spec: &PullSpec,
+    mut on_progress: F,
+) -> Result<PullOutcome, TransferError>
+where
+    S: RangeSource + 'static,
+    F: FnMut(u64, u64) + Send,
+{
     if spec.file_len == 0 {
         return Err(TransferError::Sidecar("file_len must be > 0".into()));
     }
@@ -75,6 +88,7 @@ pub async fn pull_file<S: RangeSource + 'static>(
         // refusing forever.
         if meta.is_file() && !partial.exists() && meta.len() == spec.file_len {
             let _ = fs::remove_file(&sidecar_path);
+            on_progress(spec.file_len, spec.file_len);
             return Ok(PullOutcome {
                 staged,
                 resumed_ranges: Vec::new(),
@@ -109,6 +123,7 @@ pub async fn pull_file<S: RangeSource + 'static>(
     let mut todo = remaining(&planned, &sidecar);
     let resumed_ranges: Vec<(u64, u64)> =
         sidecar.ranges.iter().map(|r| (r.offset, r.len)).collect();
+    on_progress(sidecar_done(&sidecar), spec.file_len);
 
     {
         let file = OpenOptions::new()
@@ -153,6 +168,7 @@ pub async fn pull_file<S: RangeSource + 'static>(
             write_range(&partial, offset, &bytes)?;
             sidecar.record(offset, len, digest.to_string());
             sidecar::save(&sidecar_path, &sidecar)?;
+            on_progress(sidecar_done(&sidecar), spec.file_len);
         }
     }
 
@@ -166,6 +182,10 @@ pub async fn pull_file<S: RangeSource + 'static>(
         resumed_ranges,
         already_staged: false,
     })
+}
+
+fn sidecar_done(sidecar: &Sidecar) -> u64 {
+    sidecar.ranges.iter().map(|r| r.len).sum()
 }
 
 fn verify_recorded_ranges(mut sidecar: Sidecar, partial: &Path) -> Result<Sidecar, TransferError> {
@@ -265,7 +285,20 @@ mod tests {
             range_len: 4,
             concurrency: 2,
         };
-        let out = pull_file(src.clone(), &spec).await.expect("pull");
+        let hits_progress = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tracked = hits_progress.clone();
+        let out = pull_file_with_progress(src.clone(), &spec, move |done, total| {
+            tracked.lock().expect("prog").push((done, total));
+        })
+        .await
+        .expect("pull");
+        let progress = hits_progress.lock().expect("prog").clone();
+        assert!(
+            progress
+                .iter()
+                .any(|(done, total)| *done == body.len() as u64 && *total == body.len() as u64),
+            "progress must reach the whole file: {progress:?}"
+        );
         assert_eq!(fs::read(&out.staged).expect("read"), body);
         assert!(out.resumed_ranges.is_empty());
         assert!(!out.already_staged);

@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    ControlPort, DesiredState, Envelope, JobKind, JobState, ReclaimCandidate, TitleId,
-    TitleIndexEntry, WantState, free_bytes, reclaim_preview,
+    ControlPort, DesiredState, Envelope, Job, JobKind, JobState, Placement, ReclaimCandidate,
+    TitleId, TitleIndexEntry, WantState, classify_remote, free_bytes, reclaim_preview,
 };
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_client::ControlClient;
@@ -13,6 +13,11 @@ use serde::Serialize;
 
 use crate::AppError;
 use crate::bootstrap;
+use crate::out::{
+    Style, TitleHint, Tone, finish, fmt_bytes, hint_from_placement, hints_from_holds,
+    hints_from_index, hints_from_jobs, human_from_path, human_title_from_placement, human_title_id,
+    lock_command, merge_hints, names_for, placement_from_path, resolve_title, row,
+};
 
 #[derive(Debug, Serialize)]
 struct WhyData {
@@ -109,7 +114,6 @@ pub async fn why(
     socket: Option<PathBuf>,
     tls_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let title_id = TitleId::parse(&title).map_err(|err| AppError::Usage(err.to_string()))?;
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
     let socket = socket.unwrap_or_else(bootstrap::default_socket);
@@ -119,6 +123,17 @@ pub async fn why(
     let store = Store::open(&state_db)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let index = store
+        .list_titles()
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let all_jobs = store
+        .list_jobs()
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let root_kinds = crate::reclaim::root_kinds_from(&desired_state);
+    let title_id =
+        resolve_why_title(&title, &index, &all_jobs, &socket, &tls_dir, &root_kinds).await?;
     let jobs = store
         .list_jobs_by_title(&title_id)
         .await
@@ -169,7 +184,6 @@ pub async fn why(
             .collect(),
         _ => Vec::new(),
     };
-    let root_kinds = crate::reclaim::root_kinds_from(&desired_state);
     let remote =
         load_remote_why(&socket, &tls_dir, &title_id, &root_kinds, &titles, &on_disk).await;
 
@@ -190,29 +204,13 @@ pub async fn why(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!(
-            "why {} grab {:?} import {:?} hold {:?} want {:?} pull {:?} encode {:?} free {:?} min_free {:?} df {:?} reclaim {}",
-            data.title_id,
-            data.grab
-                .as_ref()
-                .map(|g| match (g.wanted_missing, g.error.as_deref()) {
-                    (_, Some(err)) => format!("error {err}"),
-                    (Some(true), None) => "wanted_missing".into(),
-                    (_, None) => "unknown".to_string(),
-                }),
-            data.import.as_ref().map(|i| i.path.as_str()),
-            data.hold.as_ref().map(|h| h.release_id.as_str()),
-            data.want.as_ref().map(|j| j.state.as_str()),
-            data.pull.as_ref().map(|j| j.state.as_str()),
-            data.encode.as_ref().map(|j| j.state.as_str()),
-            data.watermark.free,
-            data.watermark.min_free,
-            data.df.as_ref().map(|d| d.free),
-            data.reclaim
-                .as_ref()
-                .map(|r| r.candidates.len())
-                .unwrap_or(0)
-        ))
+        let label = why_label(
+            &title_id,
+            data.library.as_ref(),
+            data.import.as_ref(),
+            remote.hold_placement.as_ref(),
+        );
+        Ok(format_why(&data, &label))
     }
 }
 
@@ -254,6 +252,11 @@ pub async fn status(
         .map(job_view)
         .collect();
     let last_plan = latest_plan_name(&plans_dir);
+    let title_index = store
+        .list_titles()
+        .await
+        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
+    let hints = hints_from_index(&title_index);
     let library_root = match library_root {
         Some(p) => Some(p),
         None => store
@@ -275,13 +278,7 @@ pub async fn status(
     if json {
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
-        Ok(format!(
-            "status wants {} in_flight {} plan {:?} df {:?}",
-            data.open_wants.len(),
-            data.in_flight.len(),
-            data.last_plan,
-            data.df.as_ref().map(|d| d.free),
-        ))
+        Ok(format_status(&data, &hints))
     }
 }
 
@@ -289,6 +286,7 @@ struct RemoteWhy {
     grab: Option<GrabView>,
     import: Option<ImportView>,
     hold: Option<HoldView>,
+    hold_placement: Option<Placement>,
     df: Option<DfView>,
     reclaim: Option<ReclaimView>,
 }
@@ -306,6 +304,7 @@ async fn load_remote_why(
             grab: None,
             import: None,
             hold: None,
+            hold_placement: None,
             df: None,
             reclaim: None,
         };
@@ -361,6 +360,7 @@ async fn load_remote_why(
         grab,
         import,
         hold,
+        hold_placement: hold_item.and_then(|item| item.placement.clone()),
         df,
         reclaim,
     }
@@ -478,6 +478,217 @@ fn latest_plan_name(plans_dir: &std::path::Path) -> Option<String> {
     names.pop()
 }
 
+async fn resolve_why_title(
+    query: &str,
+    titles: &[TitleIndexEntry],
+    jobs: &[Job],
+    socket: &Path,
+    tls_dir: &Path,
+    root_kinds: &mediaops_core::RootKinds,
+) -> Result<TitleId, AppError> {
+    if let Ok(id) = TitleId::parse(query) {
+        return Ok(id);
+    }
+    let mut hints = hints_from_index(titles);
+    hints.extend(hints_from_jobs(jobs));
+    if let Ok(channel) = connect_home(socket, tls_dir).await {
+        let control = ControlPortClient::new(ControlClient::new(channel.clone()));
+        if let Ok(holds) = control.hold_list().await {
+            hints.extend(hints_from_holds(&holds));
+        }
+        if let Ok(entries) = list_entries(channel).await {
+            for entry in &entries {
+                if let Ok((id, placement)) = classify_remote(root_kinds, entry) {
+                    hints.push(hint_from_placement(id, &placement));
+                }
+            }
+        }
+    }
+    resolve_title(query, &merge_hints(hints)).map_err(AppError::Usage)
+}
+
+fn why_label(
+    title_id: &TitleId,
+    library: Option<&LibraryView>,
+    import: Option<&ImportView>,
+    hold_placement: Option<&Placement>,
+) -> String {
+    if let Some(placement) = hold_placement {
+        return human_title_from_placement(placement);
+    }
+    if let Some(lib) = library
+        && let Some(placement) = placement_from_path(&lib.path)
+    {
+        return human_title_from_placement(&placement);
+    }
+    if let Some(imp) = import
+        && let Some(placement) = placement_from_path(&imp.path)
+    {
+        return human_title_from_placement(&placement);
+    }
+    human_title_id(title_id)
+}
+
+fn format_why(data: &WhyData, label: &str) -> String {
+    let style = Style::stdout();
+    let mut lines = vec![style.bold(label), style.dim(&data.title_id), String::new()];
+    let mut said = false;
+    if let Some(lock) = &data.lock {
+        lines.push(row(style, "busy", Tone::Wait, &lock_command(lock), ""));
+        said = true;
+    }
+    if let Some(hold) = &data.hold {
+        let meta = if hold.size > 0 {
+            fmt_bytes(hold.size)
+        } else {
+            String::new()
+        };
+        let reason = if hold.reason.is_empty() {
+            "on hold"
+        } else {
+            hold.reason.as_str()
+        };
+        lines.push(row(style, "hold", Tone::Wait, reason, &meta));
+        said = true;
+    }
+    if let Some(grab) = &data.grab {
+        if let Some(err) = &grab.error {
+            lines.push(row(style, "grab", Tone::Bad, err, ""));
+            said = true;
+        } else if grab.wanted_missing == Some(true) {
+            lines.push(row(style, "grab", Tone::Wait, "wanted, not on the box", ""));
+            said = true;
+        }
+    }
+    if let Some(import) = &data.import {
+        let title = human_from_path(&import.path).unwrap_or_else(|| import.path.clone());
+        lines.push(row(style, "import", Tone::Go, &title, ""));
+        said = true;
+    }
+    if let Some(want) = &data.want
+        && want.state == "open"
+    {
+        lines.push(row(style, "want", Tone::Quiet, "open", ""));
+        said = true;
+    }
+    if let Some(pull) = &data.pull {
+        lines.push(row(style, "pull", Tone::Go, &pull.state, ""));
+        said = true;
+    }
+    if let Some(encode) = &data.encode {
+        lines.push(row(style, "encode", Tone::Go, &encode.state, ""));
+        said = true;
+    }
+    match &data.library {
+        Some(lib) if lib.present => {
+            let path = if lib.path.is_empty() {
+                "here"
+            } else {
+                lib.path.as_str()
+            };
+            lines.push(row(style, "library", Tone::Go, path, ""));
+            said = true;
+        }
+        Some(_) => {
+            lines.push(row(style, "library", Tone::Quiet, "not here", ""));
+        }
+        None => {}
+    }
+    if let Some(n) = data
+        .reclaim
+        .as_ref()
+        .map(|r| r.candidates.len())
+        .filter(|n| *n > 0)
+    {
+        lines.push(row(
+            style,
+            "reclaim",
+            Tone::Wait,
+            &format!("{n} leftover on the box"),
+            "",
+        ));
+        said = true;
+    }
+    if !said {
+        lines.push("quiet".into());
+    }
+    if let Some(line) = watermark_tight(&data.watermark) {
+        lines.push(String::new());
+        lines.push(row(style, "disk", Tone::Wait, "", &line));
+    }
+    finish(lines)
+}
+
+fn format_status(data: &StatusData, hints: &[TitleHint]) -> String {
+    let style = Style::stdout();
+    let mut lines = Vec::new();
+    if let Some(lock) = &data.lock {
+        lines.push(row(style, "busy", Tone::Wait, &lock_command(lock), ""));
+    }
+    for job in &data.in_flight {
+        let title = TitleId::parse(&job.title_id)
+            .map(|id| names_for(&id, hints))
+            .unwrap_or_else(|_| job.title_id.clone());
+        let (verb, tone) = match job.kind.as_str() {
+            "pull" => ("pull", Tone::Go),
+            "encode" => ("encode", Tone::Go),
+            "hold" => ("hold", Tone::Wait),
+            "want" => ("want", Tone::Quiet),
+            other => (other, Tone::Quiet),
+        };
+        let meta = if job.kind == "want" || job.state == "open" {
+            String::new()
+        } else {
+            job.state.clone()
+        };
+        lines.push(row(style, verb, tone, &title, &meta));
+    }
+    if lines.is_empty() {
+        lines.push("nothing happening".into());
+    }
+    if let Some(disk) = status_disk(&data.watermark) {
+        lines.push(String::new());
+        lines.push(row(style, "disk", Tone::Quiet, "", &disk));
+        if let Some(home) = data.df.as_ref() {
+            lines.push(row(
+                style,
+                "home",
+                Tone::Quiet,
+                "",
+                &format!("{} free", fmt_bytes(home.free)),
+            ));
+        }
+    } else if let Some(home) = data.df.as_ref() {
+        lines.push(String::new());
+        lines.push(row(
+            style,
+            "home",
+            Tone::Quiet,
+            "",
+            &format!("{} free", fmt_bytes(home.free)),
+        ));
+    }
+    finish(lines)
+}
+
+fn status_disk(w: &WatermarkView) -> Option<String> {
+    let free = w.free?;
+    let mut s = format!("{} free", fmt_bytes(free));
+    if let Some(min) = w.min_free
+        && min > 0
+        && free < min
+    {
+        s.push_str(&format!("    need {}", fmt_bytes(min)));
+    }
+    Some(s)
+}
+
+fn watermark_tight(w: &WatermarkView) -> Option<String> {
+    let free = w.free?;
+    let min = w.min_free.filter(|m| *m > 0)?;
+    (free < min).then(|| format!("{} free    need {}", fmt_bytes(free), fmt_bytes(min)))
+}
+
 fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
     match err.exit_code() {
         mediaops_core::ExitCode::Usage => AppError::Usage(err.to_string()),
@@ -494,19 +705,239 @@ mod tests {
 
     #[tokio::test]
     async fn why_invalid_title_is_usage() {
+        let dir = crate::test_support::scratch("why-bad-name");
+        let db = dir.join("state.db");
+        let _store = Store::open(&db).await.expect("store");
         let err = why(
             true,
             "not-a-title".into(),
+            Some(db),
             None,
             None,
-            None,
-            None,
+            Some(dir.clone()),
             None,
             None,
         )
         .await
         .expect_err("usage");
         assert!(matches!(err, AppError::Usage(_)), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn why_accepts_a_human_name() {
+        let dir = crate::test_support::scratch("why-name");
+        let library = crate::test_support::library_root(&dir);
+        let db = dir.join("state.db");
+        let store = Store::open(&db).await.expect("store");
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        store
+            .record_install(
+                &title,
+                &Blake3Hex::of_bytes(b"orig"),
+                crate::test_support::MOVIE_REL,
+            )
+            .await
+            .expect("index");
+        let movie = library.join(crate::test_support::MOVIE_REL);
+        std::fs::create_dir_all(movie.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&movie, b"orig").expect("file");
+        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
+        let json = why(
+            true,
+            "The Matrix".into(),
+            Some(db),
+            Some(ds),
+            Some(library),
+            Some(dir.clone()),
+            None,
+            None,
+        )
+        .await
+        .expect("why");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["data"]["title_id"], "movie:key:thematrix.1999");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn why_human_quiet_and_hold_are_exact_screens() {
+        let quiet = format_why(
+            &WhyData {
+                title_id: "series:key:foundation.2021".into(),
+                grab: None,
+                import: None,
+                hold: None,
+                want: None,
+                library: None,
+                pull: None,
+                encode: None,
+                watermark: WatermarkView {
+                    free: Some(744_189_419_520),
+                    min_free: Some(274_877_906_944),
+                },
+                df: None,
+                reclaim: None,
+                lock: None,
+            },
+            "Foundation (2021)",
+        );
+        assert_eq!(
+            quiet,
+            "\
+Foundation (2021)
+series:key:foundation.2021
+
+quiet"
+        );
+        let stuck = format_why(
+            &WhyData {
+                title_id: "movie:tmdb:4539".into(),
+                grab: None,
+                import: None,
+                hold: Some(HoldView {
+                    release_id: "deadbeef".into(),
+                    reason: "Manual Import required.".into(),
+                    size: 7_588_856_506,
+                }),
+                want: None,
+                library: Some(LibraryView {
+                    path: String::new(),
+                    install_b3: String::new(),
+                    current_b3: String::new(),
+                    present: false,
+                }),
+                pull: None,
+                encode: None,
+                watermark: WatermarkView {
+                    free: Some(744_189_419_520),
+                    min_free: Some(274_877_906_944),
+                },
+                df: None,
+                reclaim: None,
+                lock: None,
+            },
+            "Hearts of Darkness (1991)",
+        );
+        assert_eq!(
+            stuck,
+            "\
+Hearts of Darkness (1991)
+movie:tmdb:4539
+
+hold      Manual Import required.  7.1 GiB
+library   not here"
+        );
+        let waiting = format_why(
+            &WhyData {
+                title_id: "series:key:mrrobot.2015".into(),
+                grab: Some(GrabView {
+                    wanted_missing: Some(true),
+                    queue: None,
+                    error: None,
+                }),
+                import: Some(ImportView {
+                    path: "Mr.Robot.(2015)/Season.01/Mr.Robot.(2015).S01E02.eps1.1.mkv".into(),
+                }),
+                hold: None,
+                want: None,
+                library: None,
+                pull: None,
+                encode: None,
+                watermark: WatermarkView {
+                    free: Some(744_189_419_520),
+                    min_free: Some(274_877_906_944),
+                },
+                df: None,
+                reclaim: None,
+                lock: None,
+            },
+            "Mr Robot (2015)",
+        );
+        assert_eq!(
+            waiting,
+            "\
+Mr Robot (2015)
+series:key:mrrobot.2015
+
+grab      wanted, not on the box
+import    Mr Robot (2015) S01E02"
+        );
+    }
+
+    #[test]
+    fn status_human_quiet_and_work_are_exact_screens() {
+        let quiet = format_status(
+            &StatusData {
+                lock: None,
+                open_wants: Vec::new(),
+                in_flight: Vec::new(),
+                last_plan: Some("zzz.json".into()),
+                watermark: WatermarkView {
+                    free: Some(744_189_419_520),
+                    min_free: Some(274_877_906_944),
+                },
+                df: Some(DfView {
+                    free: 4_182_917_251_072,
+                }),
+            },
+            &[],
+        );
+        assert_eq!(
+            quiet,
+            "\
+nothing happening
+
+disk      693.1 GiB free
+home      3.8 TiB free"
+        );
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        let hints = hints_from_index(&[TitleIndexEntry::new(
+            title.clone(),
+            crate::test_support::MOVIE_REL,
+            Blake3Hex::of_bytes(b"a"),
+            Blake3Hex::of_bytes(b"a"),
+        )]);
+        let work = format_status(
+            &StatusData {
+                lock: None,
+                open_wants: vec![JobView {
+                    job_id: 1,
+                    title_id: title.render(),
+                    kind: "want".into(),
+                    state: "open".into(),
+                }],
+                in_flight: vec![
+                    JobView {
+                        job_id: 1,
+                        title_id: title.render(),
+                        kind: "want".into(),
+                        state: "open".into(),
+                    },
+                    JobView {
+                        job_id: 2,
+                        title_id: title.render(),
+                        kind: "pull".into(),
+                        state: "pulling".into(),
+                    },
+                ],
+                last_plan: None,
+                watermark: WatermarkView {
+                    free: Some(744_189_419_520),
+                    min_free: Some(0),
+                },
+                df: None,
+            },
+            &hints,
+        );
+        assert_eq!(
+            work,
+            "\
+want      The Matrix (1999)
+pull      The Matrix (1999)  pulling
+
+disk      693.1 GiB free"
+        );
     }
 
     #[tokio::test]
