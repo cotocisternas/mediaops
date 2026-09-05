@@ -410,6 +410,14 @@ pub async fn install_provider(
                 ],
             ))
             .await?;
+            // User units die with the last SSH session unless lingering is on.
+            // SeedIt4Me has passwordless sudo for this; without linger the
+            // daemon is gone the moment you disconnect.
+            exec.run(&ssh_exec(
+                ssh_config,
+                &["sh", "-c", "sudo -n loginctl enable-linger \"$(id -un)\""],
+            ))
+            .await?;
             // `enable --now` is a no-op for a unit that is already running on
             // the old binary or the old bind; a re-bootstrap must restart it.
             exec.run(&ssh_exec(
@@ -737,6 +745,13 @@ mod tests {
                 && c.args.iter().any(|a| a == "systemctl")
                 && c.args.iter().any(|a| a == "enable")
         }));
+        assert!(
+            calls.iter().any(|c| {
+                c.program_name() == "ssh"
+                    && c.args.iter().any(|a| a.contains("loginctl enable-linger"))
+            }),
+            "linger so mediaopsd survives logout: {calls:?}"
+        );
         assert!(!calls.iter().any(|c| reject_bulk_copy(c).is_err()));
         assert!(
             !calls
