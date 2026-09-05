@@ -11,11 +11,11 @@ make clippy
 
 `make test OFFLINE=1` after a fetch. `make musl` needs `musl-gcc` and is what CI runs for the static daemon.
 
+Read [docs/development.md](docs/development.md) and [AGENTS.md](AGENTS.md) before changing crate boundaries, PathSchema, or the JSON envelope.
+
 ## Commits
 
 [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`. Imperative, lowercase after the type.
-
-Story work puts the story key in the subject as `N-M` (hyphen, e.g. `2-1`) so `git_evidence.py --stories` can attribute. Do not rewrite published commits to backfill old subjects.
 
 ## Pull requests
 

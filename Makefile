@@ -37,7 +37,7 @@ check: ## Typecheck without producing binaries
 test: ## Default suite (no GPU, no seedbox, no live-box). OFFLINE=1 after fetch
 	$(CARGO) test --workspace $(CARGO_FLAGS)
 
-test-arch: ## AD-2 crate-graph and I/O-boundary tests
+test-arch: ## Crate-graph and I/O-boundary tests
 	$(CARGO) test -p mediaops-arch-tests $(CARGO_FLAGS)
 
 test-live: ## Compile the live-box gate (does not run it; does not SSH/encode)
