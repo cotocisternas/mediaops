@@ -32,6 +32,7 @@ mediaops get Job
 mediaops get Title movie:key:thematrix.1999 -o json
 mediaops reconcile
 mediaops why 'Mr Robot'
+mediaops sync --dry-run
 ```
 
 A new Want document can be TOML:
@@ -178,6 +179,31 @@ tv
 usenet_movies
    6.8 GiB  Hearts.of.Darkness-…WATCHABLE.mkv
 ```
+
+### `sync`
+
+Copies completed eligible files in allowlisted seedbox roots to home. It does
+not create a Want. `--dry-run` previews the same decisions without writing
+objects. `S` in the TUI schedules a fresh request, not watching.
+
+```bash
+mediaops sync --dry-run
+mediaops sync
+mediaops get Sync ID
+```
+
+```
+sync      sync-1
+          planned
+          generation 4
+          copy 1  reuse 0  present 0  blocked 0  ineligible 0
+copy       seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
+           movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
+```
+
+`-o json` is the raw Sync object. `--json` is one `{ok,data,error}` envelope.
+A transport error names the request ID so you can inspect or retry with
+`--request-id`. Dry-run and a no-queue result never print scheduled success.
 
 ### `watch`
 
