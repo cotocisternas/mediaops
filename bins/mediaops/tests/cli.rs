@@ -3,7 +3,11 @@ use std::process::Command;
 use serde_json::Value;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_mediaops"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mediaops"));
+    let runtime = std::env::temp_dir().join(format!("mediaops-cli-xdg-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&runtime);
+    cmd.env("XDG_RUNTIME_DIR", runtime);
+    cmd
 }
 
 fn stdout_json(output: &std::process::Output) -> Value {
@@ -103,6 +107,88 @@ fn usage_unknown_flag_json_anywhere_in_argv() {
     assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
 }
 
+fn assert_usage_before_connect(args: &[&str], json: bool) {
+    let output = bin().args(args).output().expect("cli");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if json {
+        let value = stdout_json(&output);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value.get("data"), Some(&Value::Null));
+        assert_eq!(value["error"]["code"], "usage");
+        assert_eq!(
+            stdout.matches('\n').count(),
+            1,
+            "one envelope line: {stdout}"
+        );
+        assert!(stdout.ends_with('\n'));
+    } else {
+        assert!(
+            stdout.trim().is_empty(),
+            "human usage must not print success stdout: {stdout}"
+        );
+    }
+    assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn reconcile_invalid_output_is_usage_before_connect() {
+    assert_usage_before_connect(&["reconcile", "-o", "yaml"], false);
+}
+
+#[test]
+fn reconcile_json_and_output_conflict_is_usage_before_connect() {
+    assert_usage_before_connect(&["--json", "reconcile", "-o", "json"], true);
+    assert_usage_before_connect(&["reconcile", "--json", "-o", "table"], true);
+}
+
+#[test]
+fn reconcile_legacy_json_error_is_one_envelope() {
+    let output = bin().args(["--json", "reconcile"]).output().expect("cli");
+    assert_ne!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value.get("data"), Some(&Value::Null));
+    assert!(value["error"]["code"].is_string());
+    assert_eq!(stdout.matches('\n').count(), 1, "one envelope: {stdout}");
+    assert!(stdout.ends_with('\n'));
+    assert_json_tracing_stderr(&String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn import_legacy_invalid_output_is_usage_before_connect() {
+    assert_usage_before_connect(&["import-legacy", "-o", "yaml"], false);
+}
+
+#[test]
+fn import_legacy_json_and_output_conflict_is_usage_before_connect() {
+    assert_usage_before_connect(&["--json", "import-legacy", "-o", "json"], true);
+    assert_usage_before_connect(&["import-legacy", "--json", "-o", "table"], true);
+}
+
+#[test]
+fn import_legacy_legacy_json_error_is_one_envelope() {
+    let output = bin()
+        .args(["--json", "import-legacy"])
+        .output()
+        .expect("cli");
+    assert_ne!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value = stdout_json(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value.get("data"), Some(&Value::Null));
+    assert!(value["error"]["code"].is_string());
+    assert_eq!(stdout.matches('\n').count(), 1, "one envelope: {stdout}");
+    assert!(stdout.ends_with('\n'));
+    assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
+}
+
 #[test]
 fn help_exits_ok() {
     let output = bin().arg("--help").output().expect("run mediaops --help");
@@ -117,8 +203,8 @@ fn help_exits_ok() {
         "help must mention seedbox: {stdout}"
     );
     for verb in [
-        "plan",
-        "run",
+        "get",
+        "apply",
         "watch",
         "why",
         "status",
@@ -351,32 +437,22 @@ fn library_bootstrap_creates_schema_dirs() {
     for name in ["movies", "series", "music", "_ops", "_incoming"] {
         assert!(lib.join(name).is_dir(), "{name}");
     }
-    assert!(units.join("mediaops-run.service").is_file());
-    assert!(units.join("mediaops-run.timer").is_file());
-    assert!(units.join("mediaopsd-home.service").is_file());
-    let home = std::fs::read_to_string(units.join("mediaopsd-home.service")).expect("home");
+    assert!(units.join("mediaops-home.service").is_file());
+    assert!(!units.join("mediaops-run.service").exists());
+    assert!(!units.join("mediaops-run.timer").exists());
+    let home = std::fs::read_to_string(units.join("mediaops-home.service")).expect("home");
     assert!(home.contains("Restart=on-failure"), "{home}");
     let exec = home
         .lines()
         .find(|l| l.starts_with("ExecStart="))
         .expect("ExecStart");
     assert!(
-        exec.contains("mediaopsd") && exec.contains("serve --role home"),
-        "ExecStart must run mediaopsd serve --role home, got {exec}"
+        exec.contains("mediaops-home"),
+        "ExecStart must run mediaops-home, got {exec}"
     );
-    let timer = std::fs::read_to_string(units.join("mediaops-run.timer")).expect("timer");
-    assert!(timer.contains("OnUnitInactiveSec="));
-    assert!(timer.contains("OnBootSec="));
-    assert!(!timer.contains("OnCalendar"));
-    let service = std::fs::read_to_string(units.join("mediaops-run.service")).expect("service");
     assert!(
-        service.contains(" run --state-db "),
-        "ExecStart must pin --state-db *after* the verb (clap scopes it to `run`), got {service}"
-    );
-    assert!(service.contains("TimeoutStartSec=infinity"));
-    assert!(
-        service.contains("Nice=10"),
-        "spinning-disk niceness: {service}"
+        home.contains("Type=simple"),
+        "home unit must be Type=simple: {home}"
     );
     let value = stdout_json(&output);
     assert_eq!(value["ok"], true);
@@ -398,9 +474,10 @@ fn version_exits_ok() {
         .expect("run mediaops --version");
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).expect("utf8");
-    assert!(
-        stdout.contains("mediaops") && stdout.contains(env!("CARGO_PKG_VERSION")),
-        "version must print clap version, got: {stdout}"
+    assert_eq!(
+        stdout,
+        format!("mediaops {}\n", env!("CARGO_PKG_VERSION")),
+        "version must print the exact package version"
     );
     assert!(
         serde_json::from_str::<Value>(stdout.trim()).is_err(),
@@ -459,12 +536,15 @@ fn lock_conflict_is_exit_3_never_silent_0() {
     let output = bin()
         .args([
             "--json",
-            "run",
+            "reclaim",
+            "apply",
             "--state-db",
             dir.join("state.db").to_str().unwrap(),
+            "--config-dir",
+            dir.to_str().unwrap(),
         ])
         .output()
-        .expect("run");
+        .expect("reclaim apply");
     drop(file);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
@@ -477,36 +557,6 @@ fn lock_conflict_is_exit_3_never_silent_0() {
     let value = stdout_json(&output);
     assert_eq!(value["ok"], false);
     assert_eq!(value["error"]["code"], "lock_conflict");
-}
-
-#[test]
-fn watch_is_lock_free_and_json_envelope() {
-    let dir = scratch("watch");
-    let lock_path = dir.join("mediaops.lock");
-    let file = std::fs::File::create(&lock_path).expect("lock file");
-    fs4::FileExt::try_lock(&file).expect("hold lock");
-    let output = bin()
-        .args([
-            "--json",
-            "watch",
-            "movie:tmdb:603",
-            "--state-db",
-            dir.join("state.db").to_str().unwrap(),
-        ])
-        .output()
-        .expect("watch");
-    drop(file);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "watch must be lock-free: {stderr}"
-    );
-    let value = stdout_json(&output);
-    assert_eq!(value["ok"], true);
-    assert_eq!(value["data"]["title_id"], "movie:tmdb:603");
-    assert_eq!(value["data"]["created"], true);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -584,21 +634,23 @@ fn reclaim_preview_rejects_max_and_desired_state() {
     }
 }
 
+fn seed_open_want(db: &std::path::Path, title: &str) {
+    let rt = tokio::runtime::Runtime::new().expect("rt");
+    rt.block_on(async {
+        let store = mediaops_store::Store::open(db).await.expect("store");
+        let tid = mediaops_core::TitleId::parse(title).expect("id");
+        store
+            .create_job(mediaops_core::JobKind::Want, &tid, None)
+            .await
+            .expect("want");
+    });
+}
+
 #[test]
 fn why_and_status_json_envelopes() {
     let dir = scratch("why-status");
     let db = dir.join("state.db");
-    let watch = bin()
-        .args([
-            "--json",
-            "watch",
-            "movie:tmdb:603",
-            "--state-db",
-            db.to_str().unwrap(),
-        ])
-        .output()
-        .expect("watch");
-    assert_eq!(watch.status.code(), Some(0));
+    seed_open_want(&db, "movie:tmdb:603");
     let why = bin()
         .args([
             "--json",
@@ -791,40 +843,6 @@ fn why_and_status_df_from_seedbox_on_loopback_lock_free() {
         drop(lb);
         let _ = std::fs::remove_dir_all(&dir);
     });
-}
-
-#[test]
-fn watch_second_call_reuses_open_want() {
-    let dir = scratch("watch-idem");
-    let db = dir.join("state.db");
-    let first = bin()
-        .args([
-            "--json",
-            "watch",
-            "movie:tmdb:603",
-            "--state-db",
-            db.to_str().unwrap(),
-        ])
-        .output()
-        .expect("watch");
-    assert_eq!(first.status.code(), Some(0));
-    let first_v = stdout_json(&first);
-    assert_eq!(first_v["data"]["created"], true);
-    let second = bin()
-        .args([
-            "--json",
-            "watch",
-            "movie:tmdb:603",
-            "--state-db",
-            db.to_str().unwrap(),
-        ])
-        .output()
-        .expect("watch2");
-    assert_eq!(second.status.code(), Some(0));
-    let second_v = stdout_json(&second);
-    assert_eq!(second_v["data"]["created"], false);
-    assert_eq!(second_v["data"]["job_id"], first_v["data"]["job_id"]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1182,11 +1200,9 @@ fn library_relocate_rewrites_root_and_units_without_copying_media() {
     }
     assert!(old.join(rel).is_file(), "must not move media");
     assert!(!neu.join(rel).exists(), "must not copy media");
-    let timer = std::fs::read_to_string(units.join("mediaops-run.timer")).expect("timer");
-    assert!(timer.contains("OnUnitInactiveSec="));
-    assert!(!timer.contains("OnCalendar"));
-    assert!(units.join("mediaops-run.service").is_file());
-    assert!(units.join("mediaopsd-home.service").is_file());
+    assert!(units.join("mediaops-home.service").is_file());
+    assert!(!units.join("mediaops-run.service").exists());
+    assert!(!units.join("mediaops-run.timer").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
