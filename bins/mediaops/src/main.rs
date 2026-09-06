@@ -7,6 +7,8 @@ use clap::{Args, Parser, Subcommand};
 use mediaops_core::{ExitCode, ProviderKind};
 use mediaops_ssh::SystemExec;
 
+mod api_cmd;
+mod api_legacy;
 mod apply_cmd;
 mod bootstrap;
 mod doctor;
@@ -18,7 +20,6 @@ mod new_machine;
 mod out;
 mod reclaim;
 mod repair;
-mod run;
 mod status;
 mod watch;
 
@@ -30,9 +31,12 @@ const BIN_NAME: &str = "mediaops";
 #[derive(Parser, Debug)]
 #[command(name = BIN_NAME, version)]
 struct Cli {
-    /// Emit a single JSON envelope on stdout.
+    /// Emit a single JSON envelope on stdout (legacy verbs).
     #[arg(long, global = true)]
     json: bool,
+    /// Home API output: table (default), wide, or json (raw object).
+    #[arg(short = 'o', long = "output", global = true)]
+    output: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -83,43 +87,11 @@ enum Command {
         episode: Option<u8>,
     },
     Library(LibraryArgs),
-    /// Plan Copy/Skip from listings and write the Plan artifact.
-    Plan {
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long = "config", value_name = "PATH")]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
-        library_root: Option<PathBuf>,
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
-        plans_dir: Option<PathBuf>,
-    },
-    /// Plan then apply that exact artifact in this locked process.
-    Run {
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long = "config", value_name = "PATH")]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
-        library_root: Option<PathBuf>,
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
-        plans_dir: Option<PathBuf>,
-    },
-    /// Record a per-title want and exit. Does not wait for playable.
+    /// Record a Want and exit. Does not wait for playable.
     Watch {
         title: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
         #[arg(long)]
         state_db: Option<PathBuf>,
     },
@@ -138,8 +110,10 @@ enum Command {
         socket: Option<PathBuf>,
         #[arg(long)]
         tls_dir: Option<PathBuf>,
+        #[arg(long = "api-socket")]
+        api_socket: Option<PathBuf>,
     },
-    /// Lock holder, open wants, in-flight jobs, last plan file, seedbox df.
+    /// Open Wants, bound Jobs, Node readiness. Home API when the apiserver is up.
     Status {
         #[arg(long)]
         state_db: Option<PathBuf>,
@@ -155,6 +129,8 @@ enum Command {
         socket: Option<PathBuf>,
         #[arg(long)]
         tls_dir: Option<PathBuf>,
+        #[arg(long = "api-socket")]
+        api_socket: Option<PathBuf>,
     },
     Encode(EncodeArgs),
     /// Ranked dry-run / exclusive unlink of surplus remotes after install_b3 proof.
@@ -181,8 +157,47 @@ enum Command {
         config_dir: Option<PathBuf>,
         #[arg(long)]
         state_db: Option<PathBuf>,
+        #[arg(long = "api-socket")]
+        api_socket: Option<PathBuf>,
     },
     Repair(RepairArgs),
+    /// Get one Home object or list a kind. `-o json` is the raw object.
+    Get {
+        kind: String,
+        name: Option<String>,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Apply a Cluster/Secret/Want/Title document (TOML or JSON).
+    Apply {
+        #[arg(short = 'f', long)]
+        file: PathBuf,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Delete one Home object.
+    Delete {
+        kind: String,
+        name: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Increment Cluster.status.reconcile_generation.
+    Reconcile {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Import old config.toml + state.db into the Home API.
+    ImportLegacy {
+        #[arg(long = "config", value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        state_db: Option<PathBuf>,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -317,8 +332,10 @@ enum HoldCommand {
         config_dir: Option<PathBuf>,
         #[arg(long)]
         state_db: Option<PathBuf>,
+        #[arg(long = "api-socket")]
+        api_socket: Option<PathBuf>,
     },
-    /// Persist Approved. Does not install; exclusive `run` copies later. Lock-free.
+    /// Persist Approved. Does not install; the next Pull Job copies. Lock-free.
     Approve {
         /// Title id from `hold list` (`movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…`).
         target: String,
@@ -332,6 +349,8 @@ enum HoldCommand {
         config_dir: Option<PathBuf>,
         #[arg(long)]
         state_db: Option<PathBuf>,
+        #[arg(long = "api-socket")]
+        api_socket: Option<PathBuf>,
     },
     /// Persist Rejected and tell *arr never-this-release. Lock-free.
     Reject {
@@ -347,6 +366,8 @@ enum HoldCommand {
         config_dir: Option<PathBuf>,
         #[arg(long)]
         state_db: Option<PathBuf>,
+        #[arg(long = "api-socket")]
+        api_socket: Option<PathBuf>,
     },
 }
 
@@ -836,53 +857,17 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             let line = library::reindex_library(cli.json, library_root, state_db).await?;
             write_stdout(&line)
         }
-        Some(Command::Plan {
-            state_db,
-            desired_state,
-            library_root,
+        Some(Command::Watch {
+            title,
             socket,
-            tls_dir,
-            config_dir,
-            plans_dir,
-        }) => {
-            let line = run::cmd_plan(
-                cli.json,
-                state_db,
-                desired_state,
-                library_root,
-                socket,
-                tls_dir,
-                config_dir,
-                plans_dir,
-            )
-            .await?;
-            write_stdout(&line)
-        }
-        Some(Command::Run {
             state_db,
-            desired_state,
-            library_root,
-            socket,
-            tls_dir,
-            config_dir,
-            plans_dir,
         }) => {
-            let line = run::cmd_run(
-                &SystemExec,
-                cli.json,
-                state_db,
-                desired_state,
-                library_root,
-                socket,
-                tls_dir,
-                config_dir,
-                plans_dir,
-            )
-            .await?;
-            write_stdout(&line)
-        }
-        Some(Command::Watch { title, state_db }) => {
-            let line = watch::watch(cli.json, title, state_db).await?;
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = if !api_legacy::use_home(&state_db) && socket.is_none() {
+                watch::watch(cli.json, title, state_db).await?
+            } else {
+                api_cmd::watch_title(title, output, socket).await?
+            };
             write_stdout(&line)
         }
         Some(Command::Why {
@@ -893,18 +878,24 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             config_dir,
             socket,
             tls_dir,
+            api_socket,
         }) => {
-            let line = status::why(
-                cli.json,
-                title,
-                state_db,
-                desired_state,
-                library_root,
-                config_dir,
-                socket,
-                tls_dir,
-            )
-            .await?;
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = if !api_legacy::use_home(&state_db) && api_socket.is_none() {
+                status::why(
+                    cli.json,
+                    title,
+                    state_db,
+                    desired_state,
+                    library_root,
+                    config_dir,
+                    socket,
+                    tls_dir,
+                )
+                .await?
+            } else {
+                api_cmd::why_pretty(title, output, api_socket).await?
+            };
             write_stdout(&line)
         }
         Some(Command::Status {
@@ -915,18 +906,24 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             config_dir,
             socket,
             tls_dir,
+            api_socket,
         }) => {
-            let line = status::status(
-                cli.json,
-                state_db,
-                plans_dir,
-                desired_state,
-                library_root,
-                config_dir,
-                socket,
-                tls_dir,
-            )
-            .await?;
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = if !api_legacy::use_home(&state_db) && api_socket.is_none() {
+                status::status(
+                    cli.json,
+                    state_db,
+                    plans_dir,
+                    desired_state,
+                    library_root,
+                    config_dir,
+                    socket,
+                    tls_dir,
+                )
+                .await?
+            } else {
+                api_cmd::status_pretty(output, api_socket).await?
+            };
             write_stdout(&line)
         }
         Some(Command::Encode(EncodeArgs {
@@ -1018,9 +1015,15 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     tls_dir,
                     config_dir,
                     state_db,
+                    api_socket,
                 },
         })) => {
-            let line = hold::list(cli.json, socket, tls_dir, config_dir, state_db).await?;
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = if !api_legacy::use_home(&state_db) && api_socket.is_none() {
+                hold::list(cli.json, socket, tls_dir, config_dir, state_db).await?
+            } else {
+                api_cmd::hold_list(output, api_socket).await?
+            };
             write_stdout(&line)
         }
         Some(Command::Hold(HoldArgs {
@@ -1032,19 +1035,32 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     tls_dir,
                     config_dir,
                     state_db,
+                    api_socket,
                 },
         })) => {
-            let line = hold::decide(
-                cli.json,
-                mediaops_core::HoldDecision::Approved,
-                title_id,
-                release_id,
-                socket,
-                tls_dir,
-                config_dir,
-                state_db,
-            )
-            .await?;
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = if api_legacy::use_home(&state_db) || api_socket.is_some() {
+                api_cmd::hold_decide(
+                    title_id,
+                    release_id,
+                    mediaops_core::HoldDecisionSpec::Approved,
+                    output,
+                    api_socket,
+                )
+                .await?
+            } else {
+                hold::decide(
+                    cli.json,
+                    mediaops_core::HoldDecision::Approved,
+                    title_id,
+                    release_id,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                    state_db,
+                )
+                .await?
+            };
             write_stdout(&line)
         }
         Some(Command::Hold(HoldArgs {
@@ -1056,19 +1072,32 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     tls_dir,
                     config_dir,
                     state_db,
+                    api_socket,
                 },
         })) => {
-            let line = hold::decide(
-                cli.json,
-                mediaops_core::HoldDecision::Rejected,
-                title_id,
-                release_id,
-                socket,
-                tls_dir,
-                config_dir,
-                state_db,
-            )
-            .await?;
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = if api_legacy::use_home(&state_db) || api_socket.is_some() {
+                api_cmd::hold_decide(
+                    title_id,
+                    release_id,
+                    mediaops_core::HoldDecisionSpec::Rejected,
+                    output,
+                    api_socket,
+                )
+                .await?
+            } else {
+                hold::decide(
+                    cli.json,
+                    mediaops_core::HoldDecision::Rejected,
+                    title_id,
+                    release_id,
+                    socket,
+                    tls_dir,
+                    config_dir,
+                    state_db,
+                )
+                .await?
+            };
             write_stdout(&line)
         }
         Some(Command::NewMachine(NewMachineArgs {
@@ -1124,9 +1153,14 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             tls_dir,
             config_dir,
             state_db,
+            api_socket,
         }) => {
-            let line = doctor::doctor(
-                cli.json,
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let check_nodes = api_socket.is_some() || state_db.is_none();
+            // Readiness supplements the edge/key/PEM checks; a running API
+            // cannot turn those security checks into a successful Node list.
+            let mut line = doctor::doctor(
+                cli.json || output == api_cmd::Output::Json,
                 repair,
                 confirm,
                 pin,
@@ -1137,6 +1171,15 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 state_db,
             )
             .await?;
+            if check_nodes {
+                api_cmd::doctor_nodes(api_socket).await?;
+            }
+            if output == api_cmd::Output::Json {
+                let envelope: serde_json::Value =
+                    serde_json::from_str(&line).map_err(|err| AppError::Runtime(err.into()))?;
+                line = serde_json::to_string(&envelope["data"])
+                    .map_err(|err| AppError::Runtime(err.into()))?;
+            }
             write_stdout(&line)
         }
         Some(Command::Repair(RepairArgs {
@@ -1167,6 +1210,47 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 &SystemExec,
             )
             .await?;
+            write_stdout(&line)
+        }
+        Some(Command::Get {
+            kind,
+            name,
+            watch,
+            socket,
+        }) => {
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            if watch {
+                return api_cmd::watch_kind(Some(kind), name, output, socket).await;
+            }
+            let line = if let Some(name) = name {
+                api_cmd::get(kind, name, output, socket).await?
+            } else {
+                api_cmd::list_kind(Some(kind), output, socket).await?
+            };
+            write_stdout(&line)
+        }
+        Some(Command::Apply { file, socket }) => {
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = api_cmd::apply_file(file, output, socket).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Delete { kind, name, socket }) => {
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = api_cmd::delete(kind, name, output, socket).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Reconcile { socket }) => {
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = api_cmd::reconcile(output, socket).await?;
+            write_stdout(&line)
+        }
+        Some(Command::ImportLegacy {
+            config,
+            state_db,
+            socket,
+        }) => {
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = api_cmd::import_legacy(config, state_db, output, socket).await?;
             write_stdout(&line)
         }
     }
