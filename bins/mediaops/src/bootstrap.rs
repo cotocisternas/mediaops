@@ -134,7 +134,10 @@ pub async fn bootstrap(
     let tls_dir = args.config_dir.join("tls");
     refuse_git_work_tree(&args.config_dir)
         .and_then(|_| refuse_git_work_tree(&tls_dir))
-        .map_err(BootstrapError::from_ssh)?;
+        .map_err(|err| match err {
+            mediaops_ssh::SshError::Other(message) => BootstrapError::Io(message),
+            other => BootstrapError::from_ssh(other),
+        })?;
 
     let address = resolve_grpc_address(args.address.as_deref(), &host)?;
     let steps = plan_steps(&args, &address);
@@ -656,35 +659,11 @@ pub fn render_needs_confirm(
 /// `~/.local/share/mediaops`. Every verb and every generated unit derives its
 /// paths from this one function, so the choice is consistent on a machine.
 pub fn default_config_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("MEDIAOPS_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    let Some(base) = directories::BaseDirs::new() else {
-        return PathBuf::from(".mediaops-config");
-    };
-    let xdg = base.config_dir().join("mediaops");
-    if refuse_git_work_tree(base.config_dir()).is_ok() {
-        return xdg;
-    }
-    let data = base.data_dir().join("mediaops");
-    tracing::debug!(
-        refused = %xdg.display(),
-        using = %data.display(),
-        "config dir is inside a git work tree; using the data dir instead"
-    );
-    data
+    mediaops_home_client::default_config_dir()
 }
 
 pub fn default_state_db() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|b| {
-            b.state_dir()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| b.home_dir().join(".local").join("state"))
-                .join("mediaops")
-                .join("state.db")
-        })
-        .unwrap_or_else(|| PathBuf::from(".mediaops-state").join("state.db"))
+    default_state_dir().join("state.db")
 }
 
 pub fn default_ssh_config() -> PathBuf {
@@ -704,20 +683,11 @@ pub fn default_tls_dir(config_dir: &Path) -> PathBuf {
 }
 
 pub fn default_state_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|b| {
-            b.state_dir()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| b.home_dir().join(".local").join("state"))
-                .join("mediaops")
-        })
-        .unwrap_or_else(|| PathBuf::from(".mediaops-state"))
+    mediaops_home_client::default_state_dir()
 }
 
 pub fn default_socket() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|dir| PathBuf::from(dir).join("mediaopsd.sock"))
-        .unwrap_or_else(|| default_state_dir().join("mediaopsd.sock"))
+    mediaops_home_client::default_gateway_socket()
 }
 
 pub fn default_unit_dir() -> PathBuf {
@@ -735,39 +705,6 @@ pub fn lock_path(state_db: &Path) -> PathBuf {
 
 pub fn default_plans_dir() -> PathBuf {
     default_state_dir().join("plans")
-}
-
-/// Compact UTC stamp `YYYYMMDDTHHMMSSZ` without a datetime crate.
-pub fn utc_compact() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    utc_compact_secs(secs)
-}
-
-pub(crate) fn utc_compact_secs(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let rem = secs % 86400;
-    let hour = rem / 3600;
-    let min = (rem % 3600) / 60;
-    let sec = rem % 60;
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}{m:02}{d:02}T{hour:02}{min:02}{sec:02}Z")
-}
-
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as u32, d as u32)
 }
 
 /// If another process holds the exclusive flock, return the lockfile JSON.
@@ -1198,12 +1135,6 @@ mod tests {
             !rendered.contains("/.local/share/"),
             "AD-7 is ~/.local/state not share: {rendered}"
         );
-    }
-
-    #[test]
-    fn utc_compact_epoch_is_1970() {
-        assert_eq!(utc_compact_secs(0), "19700101T000000Z");
-        assert_eq!(utc_compact_secs(86_400), "19700102T000000Z");
     }
 
     #[test]
