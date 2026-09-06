@@ -15,6 +15,7 @@ architecture or establish that a current release has passed verification.
 | Runtime settings, paths, identities, and file layout | [Config](config.md) |
 | Build and verification commands | [Development](development.md), the [Makefile](../Makefile), and [CI](../.github/workflows/ci.yml) |
 | Rules for agents working in this repository | [AGENTS.md](../AGENTS.md) |
+| Deferred work for the current product | [Backlog](backlog.md) |
 
 Check executable behavior against the source and `--help` when updating these
 pages. Runtime configuration is the Home API Cluster object, not a planning
@@ -24,7 +25,7 @@ document or a stale copy of `config.toml`.
 
 | Previous design | Current design |
 | --------------- | -------------- |
-| CLI `plan` / `run` and a periodic run timer | Wants and per-file Pull Jobs, reconciled by the always-on `mediaops-home` roles |
+| CLI `plan` / `run` and a periodic run timer | Explicit one-shot `sync` requests or persistent Wants, with per-file Pull Jobs executed by the always-on Home roles |
 | `mediaopsd --role home` | Separate `mediaops-api` and `mediaops-gateway` processes |
 | `state.db` as the home catalog | `api.db`, opened only by `mediaops-api`; `state.db` remains for supported legacy capabilities |
 | `config.toml` as the copy loop's live configuration | Cluster settings imported into the API and snapshotted when each Job is created |

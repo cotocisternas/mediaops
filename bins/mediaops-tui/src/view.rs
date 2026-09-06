@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Layout};
 use crate::disk::DiskObservation;
 use crate::model::{SyncState, UiModel};
 use crate::projection::Projection;
+use crate::report::render_report;
 use crate::view_chrome::{
     render_detail, render_footer, render_help, render_masthead, render_rule, render_status,
     render_table, render_undersize,
@@ -37,6 +38,8 @@ pub fn render(
     render_rule(frame, chunks[1]);
     if ui.help {
         render_help(frame, chunks[2], color);
+    } else if let Some(report) = ui.report.as_ref() {
+        render_report(frame, chunks[2], report, ui.report_offset);
     } else if ui.split_detail() {
         let panes = Layout::horizontal([
             Constraint::Percentage(58),

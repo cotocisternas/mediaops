@@ -41,6 +41,9 @@ as truecolor evidence):
 
 - [ ] seven screens, Tab / 1–7, j/k, Enter/Esc, `?`, `q`
 - [ ] W/D on a Want detail; A/X on one Hold when two share a TitleId
+- [ ] `p` produces a completed preview after the next fixture inventory; no Sync or copy objects are created
+- [ ] `S` submits a fresh one-shot request; its report names a durable Sync, and repeated requests reuse existing Jobs
+- [ ] Preview/report source paths, destinations and reasons wrap and scroll at 60 columns; End then Up remains usable
 - [ ] missing socket shows reconnecting, not a local DB
 - [ ] kill the fixture: `NOT CURRENT`, mutations off, then restart: Current
 - [ ] wait past inventory freshness: Holds/Box become unavailable

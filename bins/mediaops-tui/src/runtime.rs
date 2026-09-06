@@ -14,6 +14,7 @@ use crate::disk::DiskWatch;
 use crate::interaction::{can_submit, project_ui};
 use crate::keys::command_from_event;
 use crate::model::UiModel;
+use crate::report::SyncReport;
 use crate::session::Session;
 use crate::update::{Update, UpdateEffect, apply};
 
@@ -24,12 +25,18 @@ enum Work {
         result: Box<Result<PreparedWrite, MutationOutcome>>,
     },
     Finished(MutationOutcome),
+    SyncDone {
+        request_id: String,
+        dry_run: bool,
+        result: Result<Box<mediaops_core::HomeObject>, String>,
+    },
 }
 
 pub async fn run(socket: Option<&Path>, color: bool) -> anyhow::Result<i32> {
     crate::terminal::install_panic_hook();
+    let term_signal = signal(SignalKind::terminate()).context("sigterm")?;
     let (guard, mut terminal) = crate::terminal::TerminalGuard::enter().context("terminal")?;
-    let result = run_loop(&mut terminal, socket, color).await;
+    let result = run_loop(&mut terminal, socket, color, term_signal).await;
     drop(guard);
     result
 }
@@ -38,11 +45,14 @@ async fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     socket: Option<&Path>,
     color: bool,
+    mut term_signal: tokio::signal::unix::Signal,
 ) -> anyhow::Result<i32> {
     let mut session = Session::new(socket);
-    let mut ui = UiModel::default();
+    let mut ui = UiModel {
+        keyboard_event_types: crate::terminal::keyboard_event_types_enabled(),
+        ..UiModel::default()
+    };
     let mut events = EventStream::new();
-    let mut term_signal = signal(SignalKind::terminate()).context("sigterm")?;
     let mut work = JoinSet::new();
     let mut disk = DiskWatch::default();
     let mut redraw = tokio::time::interval(Duration::from_millis(100));
@@ -83,6 +93,33 @@ async fn run_loop<B: Backend>(
                             }
                         }
                     }
+                    UpdateEffect::RequestSync { dry_run } => {
+                        match session.api.clone() {
+                            Some(api) => {
+                                let request_id = mediaops_home_client::new_sync_request_id();
+                                ui.message = Some(if dry_run {
+                                    "previewing eligible copies".into()
+                                } else {
+                                    "planning a fresh sync".into()
+                                });
+                                work.spawn(async move {
+                                    Work::SyncDone {
+                                        request_id: request_id.clone(),
+                                        dry_run,
+                                        result: api
+                                            .sync(&request_id, dry_run)
+                                            .await
+                                            .map(Box::new)
+                                            .map_err(|err| format!("sync `{request_id}`: {err}")),
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.sync_pending = false;
+                                ui.message = Some("Home API unavailable".into());
+                            }
+                        }
+                    }
                 }
                 dirty = true;
             }
@@ -106,6 +143,29 @@ async fn run_loop<B: Backend>(
                         }
                     }
                     Work::Finished(outcome) => finish(&mut session, &mut ui, outcome).await,
+                    Work::SyncDone {
+                        request_id,
+                        dry_run,
+                        result,
+                    } => {
+                        ui.sync_pending = false;
+                        match result {
+                            Ok(obj) => {
+                                ui.report = Some(SyncReport::from_object(request_id, dry_run, &obj));
+                                ui.report_offset = 0;
+                                ui.message = None;
+                                if !dry_run && !ui.keyboard_event_types {
+                                    ui.message = Some("For another sync, restart TUI or use the CLI".into());
+                                }
+                                if !dry_run {
+                                    session.bootstrap().await;
+                                }
+                            }
+                            Err(message) => {
+                                ui.message = Some(message);
+                            }
+                        }
+                    }
                 }
                 dirty = true;
             }

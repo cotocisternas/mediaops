@@ -36,8 +36,9 @@ of guessing a name or making an external metadata request.
 
 Tab / Shift-Tab cycle screens. Arrows and `j`/`k`, PageUp/Down, Home/End move
 rows. In detail, those keys scroll facts instead. Enter opens detail; Esc goes
-back. `?` is read-only help. `q`, Ctrl-C, and
-SIGTERM exit 0 after restoring the terminal.
+back. `?` is read-only help. `p` previews eligible copies. `S` schedules a
+fresh sync (not permanent watching). `q`, Ctrl-C, and SIGTERM exit 0 after
+restoring the terminal.
 
 ## Mutations
 
@@ -53,7 +54,21 @@ at least 60×16, and the identity is not clipped:
 
 Enter never writes. Approve records a decision; it does not install. Want apply
 is not `mediaops watch` (that also writes Title). Hold A/X target the selected
-release, not merely its TitleId.
+release, not merely its TitleId. Repeat, paste, and help never queue a write.
+
+## Sync
+
+Global, not a Want/Hold mutation. Requires `Current`, at least 60×16, no help
+overlay, and no pending operation:
+
+| Key | Action |
+| --- | --- |
+| p | preview eligible copies (`dry_run`, no objects written) |
+| S | schedule a fresh sync request (not watching) |
+
+The report pane shows request id, captured generation, copy/reuse/present/
+blocked/ineligible counts, and scrollable source/destination/reason rows.
+Esc returns. There is no confirmation prompt and no automatic Hold decision.
 
 Writes check the displayed UID and resourceVersion against a fresh read and
 submit once. Conflicts refresh rather than retry; an uncertain response is shown
@@ -72,9 +87,14 @@ Known-empty baselines reuse the CLI English strings: `nothing happening`,
 
 ## Accessibility
 
+The TUI requests keyboard repeat/release reporting when the terminal supports
+it. A held `S` must not become repeated sync requests. On terminals without
+reliable release reporting, `S` is therefore available once per TUI launch;
+preview remains available. Use the CLI or restart the TUI for another sync.
+
 Meaning survives `NO_COLOR` and `--color never` via text, reverse, and bold.
 The TUI cannot offer a screen reader. Use the CLI (`mediaops status`, `why`,
-`hold`) as the unchanged alternative.
+`hold`, `sync`) as the unchanged alternative.
 
 See [tui-qa.md](tui-qa.md) for fixture and PTY checks. Design tokens live in
 [`DESIGN.md`](../DESIGN.md).

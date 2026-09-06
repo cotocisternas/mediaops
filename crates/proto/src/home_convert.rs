@@ -4,8 +4,9 @@ use mediaops_core::{
     Blake3Hex, Bytes, CLUSTER_NAME, ClusterSpec, ClusterStatus, EventStatus, ExitCode, Grabber,
     HOME_API_VERSION, HoldDecisionSpec, HoldSpec, HoldStatus, HomeError, HomeJobKind, HomeObject,
     JobPhase, JobSpec, JobStatus, Kind, NodeSpec, NodeStatus, ObjectMeta, PathRoot,
-    RemoteFileStatus, SECRET_NAME, SecretSpec, Spec, StatusBody, TitleFileStatus, TitleId,
-    TitleKind, TitleSpec, TitleStatus, WantPhase, WantSpec, WantStatus, WorkerKind,
+    RemoteFileStatus, SECRET_NAME, SecretSpec, Spec, StatusBody, SyncDisposition, SyncEntry,
+    SyncPhase, SyncScope, SyncSpec, SyncStatus, TitleFileStatus, TitleId, TitleKind, TitleSpec,
+    TitleStatus, WantPhase, WantSpec, WantStatus, WorkerKind,
 };
 
 use crate::home::{
@@ -14,6 +15,7 @@ use crate::home::{
     Job, JobSpec as WireJobSpec, JobStatus as WireJobStatus, Metadata, Node,
     NodeSpec as WireNodeSpec, NodeStatus as WireNodeStatus, Object, PathRoot as WirePathRoot,
     RemoteFile, RemoteFileStatus as WireRemoteFileStatus, Secret, SecretSpec as WireSecretSpec,
+    Sync, SyncEntry as WireSyncEntry, SyncSpec as WireSyncSpec, SyncStatus as WireSyncStatus,
     Title, TitleSpec as WireTitleSpec, TitleStatus as WireTitleStatus, Want,
     WantSpec as WireWantSpec, WantStatus as WireWantStatus, object::Body,
 };
@@ -143,22 +145,7 @@ pub fn home_object_to_wire(obj: &HomeObject) -> Object {
             }),
         })),
         (Spec::Job(spec), StatusBody::Job(status)) => Some(Body::Job(Job {
-            spec: Some(WireJobSpec {
-                hold_name: spec.hold_name.clone(),
-                library_root: spec.library_root.clone(),
-                range_concurrency: spec.range_concurrency,
-                kind: spec.kind.as_str().to_string(),
-                title_id: spec.title_id.clone(),
-                remote_root: spec.remote_root.clone(),
-                remote_path: spec.remote_path.clone(),
-                dest_rel: spec.dest_rel.clone(),
-                file_len: spec.file_len,
-                range_len: spec.range_len,
-                max_copy: spec.max_copy,
-                min_free: spec.min_free,
-                node_name: spec.node_name.clone(),
-                worker_kind: spec.worker_kind.clone(),
-            }),
+            spec: Some(job_spec_to_wire(spec)),
             status: Some(WireJobStatus {
                 started_unix: status.started_unix,
                 verified_b3: status
@@ -204,12 +191,13 @@ pub fn home_object_to_wire(obj: &HomeObject) -> Object {
             spec: Some(WireNodeSpec {
                 worker_kind: spec.worker_kind.as_str().to_string(),
             }),
-            status: Some(WireNodeStatus {
-                list_generation: status.list_generation,
-                list_completed_unix: status.list_completed_unix,
-                ready: status.ready,
-                last_heartbeat_unix: status.last_heartbeat_unix,
+            status: Some(node_status_to_wire(status)),
+        })),
+        (Spec::Sync(spec), StatusBody::Sync(status)) => Some(Body::Sync(Sync {
+            spec: Some(WireSyncSpec {
+                scope: spec.scope.as_str().to_string(),
             }),
+            status: Some(sync_status_to_wire(status)),
         })),
         (Spec::Event, StatusBody::Event(status)) => Some(Body::Event(Event {
             status: Some(WireEventStatus {
@@ -338,26 +326,7 @@ pub fn home_object_from_wire(obj: Object) -> Result<HomeObject, HomeError> {
             let spec = j.spec.unwrap_or_default();
             let st = j.status.unwrap_or_default();
             (
-                Spec::Job(JobSpec {
-                    hold_name: spec.hold_name,
-                    library_root: spec.library_root,
-                    range_concurrency: spec.range_concurrency,
-                    kind: if spec.kind.is_empty() {
-                        HomeJobKind::Pull
-                    } else {
-                        HomeJobKind::parse(&spec.kind)?
-                    },
-                    title_id: spec.title_id,
-                    remote_root: spec.remote_root,
-                    remote_path: spec.remote_path,
-                    dest_rel: spec.dest_rel,
-                    file_len: spec.file_len,
-                    range_len: spec.range_len,
-                    max_copy: spec.max_copy,
-                    min_free: spec.min_free,
-                    node_name: spec.node_name,
-                    worker_kind: spec.worker_kind,
-                }),
+                Spec::Job(job_spec_from_wire(spec)?),
                 StatusBody::Job(JobStatus {
                     started_unix: st.started_unix,
                     verified_b3: parse_digest_opt(&st.verified_b3)?,
@@ -422,12 +391,18 @@ pub fn home_object_from_wire(obj: Object) -> Result<HomeObject, HomeError> {
                 Spec::Node(NodeSpec {
                     worker_kind: WorkerKind::parse(&spec.worker_kind)?,
                 }),
-                StatusBody::Node(NodeStatus {
-                    list_generation: st.list_generation,
-                    list_completed_unix: st.list_completed_unix,
-                    ready: st.ready,
-                    last_heartbeat_unix: st.last_heartbeat_unix,
+                StatusBody::Node(node_status_from_wire(st)),
+            )
+        }
+        Some(Body::Sync(s)) => {
+            require_kind(kind, Kind::Sync)?;
+            let spec = s.spec.unwrap_or_default();
+            let st = s.status.unwrap_or_default();
+            (
+                Spec::Sync(SyncSpec {
+                    scope: SyncScope::parse(&spec.scope)?,
                 }),
+                StatusBody::Sync(sync_status_from_wire(st)?),
             )
         }
         Some(Body::Event(e)) => {
@@ -470,6 +445,188 @@ pub fn home_object_from_wire(obj: Object) -> Result<HomeObject, HomeError> {
         },
         spec,
         status,
+    })
+}
+
+fn job_spec_to_wire(spec: &JobSpec) -> WireJobSpec {
+    WireJobSpec {
+        hold_name: spec.hold_name.clone(),
+        sync_name: spec.sync_name.clone(),
+        library_root: spec.library_root.clone(),
+        range_concurrency: spec.range_concurrency,
+        kind: spec.kind.as_str().to_string(),
+        title_id: spec.title_id.clone(),
+        remote_root: spec.remote_root.clone(),
+        remote_path: spec.remote_path.clone(),
+        dest_rel: spec.dest_rel.clone(),
+        file_len: spec.file_len,
+        range_len: spec.range_len,
+        max_copy: spec.max_copy,
+        min_free: spec.min_free,
+        node_name: spec.node_name.clone(),
+        worker_kind: spec.worker_kind.clone(),
+    }
+}
+
+fn job_spec_from_wire(spec: WireJobSpec) -> Result<JobSpec, HomeError> {
+    Ok(JobSpec {
+        hold_name: spec.hold_name,
+        sync_name: spec.sync_name,
+        library_root: spec.library_root,
+        range_concurrency: spec.range_concurrency,
+        kind: if spec.kind.is_empty() {
+            HomeJobKind::Pull
+        } else {
+            HomeJobKind::parse(&spec.kind)?
+        },
+        title_id: spec.title_id,
+        remote_root: spec.remote_root,
+        remote_path: spec.remote_path,
+        dest_rel: spec.dest_rel,
+        file_len: spec.file_len,
+        range_len: spec.range_len,
+        max_copy: spec.max_copy,
+        min_free: spec.min_free,
+        node_name: spec.node_name,
+        worker_kind: spec.worker_kind,
+    })
+}
+
+fn node_status_to_wire(status: &NodeStatus) -> WireNodeStatus {
+    WireNodeStatus {
+        list_generation: status.list_generation,
+        list_completed_unix: status.list_completed_unix,
+        ready: status.ready,
+        last_heartbeat_unix: status.last_heartbeat_unix,
+        scan_started_rv: status.scan_started_rv,
+        scan_cluster_generation: status.scan_cluster_generation,
+        scan_secret_resource_version: status.scan_secret_resource_version,
+    }
+}
+
+fn node_status_from_wire(status: WireNodeStatus) -> NodeStatus {
+    NodeStatus {
+        list_generation: status.list_generation,
+        list_completed_unix: status.list_completed_unix,
+        ready: status.ready,
+        last_heartbeat_unix: status.last_heartbeat_unix,
+        scan_started_rv: status.scan_started_rv,
+        scan_cluster_generation: status.scan_cluster_generation,
+        scan_secret_resource_version: status.scan_secret_resource_version,
+    }
+}
+
+fn cluster_spec_to_wire(spec: &ClusterSpec) -> WireClusterSpec {
+    WireClusterSpec {
+        max_copy: spec.max_copy.get(),
+        min_free: spec.min_free.get(),
+        range_len: spec.range_len.get(),
+        range_concurrency: spec.range_concurrency.unwrap_or(0),
+        grabber: grabber_wire(spec.grabber),
+        lock: spec.lock,
+        encode_pause: spec.encode_pause,
+        library_root: spec.library_root.clone(),
+        roots: spec.roots.iter().map(path_root_to_wire).collect(),
+    }
+}
+
+fn cluster_spec_from_wire(spec: WireClusterSpec) -> Result<ClusterSpec, HomeError> {
+    Ok(ClusterSpec {
+        max_copy: Bytes::new(spec.max_copy),
+        min_free: Bytes::new(spec.min_free),
+        range_len: Bytes::new(spec.range_len),
+        range_concurrency: if spec.range_concurrency == 0 {
+            None
+        } else {
+            Some(spec.range_concurrency)
+        },
+        grabber: parse_grabber(&spec.grabber)?,
+        lock: spec.lock,
+        encode_pause: spec.encode_pause,
+        library_root: spec.library_root,
+        roots: spec
+            .roots
+            .into_iter()
+            .map(path_root_from_wire)
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn sync_status_to_wire(status: &SyncStatus) -> WireSyncStatus {
+    WireSyncStatus {
+        phase: status.phase.as_str().to_string(),
+        accepted_unix: status.accepted_unix,
+        deadline_unix: status.deadline_unix,
+        baseline_generation: status.baseline_generation,
+        acceptance_rv: status.acceptance_rv,
+        list_generation: status.list_generation,
+        cluster: status.cluster.as_ref().map(cluster_spec_to_wire),
+        cluster_generation: status.cluster_generation,
+        secret_resource_version: status.secret_resource_version,
+        entries: status.entries.iter().map(sync_entry_to_wire).collect(),
+        message: status.message.clone(),
+    }
+}
+
+fn sync_status_from_wire(status: WireSyncStatus) -> Result<SyncStatus, HomeError> {
+    Ok(SyncStatus {
+        phase: if status.phase.is_empty() {
+            SyncPhase::WaitingInventory
+        } else {
+            SyncPhase::parse(&status.phase)?
+        },
+        accepted_unix: status.accepted_unix,
+        deadline_unix: status.deadline_unix,
+        baseline_generation: status.baseline_generation,
+        acceptance_rv: status.acceptance_rv,
+        list_generation: status.list_generation,
+        cluster: status.cluster.map(cluster_spec_from_wire).transpose()?,
+        cluster_generation: status.cluster_generation,
+        secret_resource_version: status.secret_resource_version,
+        entries: status
+            .entries
+            .into_iter()
+            .map(sync_entry_from_wire)
+            .collect::<Result<Vec<_>, _>>()?,
+        message: status.message,
+    })
+}
+
+fn sync_entry_to_wire(entry: &SyncEntry) -> WireSyncEntry {
+    WireSyncEntry {
+        remote_root: entry.remote_root.clone(),
+        remote_path: entry.remote_path.clone(),
+        file_len: entry.file_len,
+        title_id: entry.title_id.clone(),
+        placement: entry.placement.as_ref().map(crate::Placement::from),
+        job: entry.job.as_ref().map(job_spec_to_wire),
+        disposition: entry.disposition.as_str().to_string(),
+        reason: entry.reason.clone(),
+        job_name: entry.job_name.clone(),
+        job_uid: entry.job_uid.clone(),
+    }
+}
+
+fn sync_entry_from_wire(entry: WireSyncEntry) -> Result<SyncEntry, HomeError> {
+    Ok(SyncEntry {
+        remote_root: entry.remote_root,
+        remote_path: entry.remote_path,
+        file_len: entry.file_len,
+        title_id: entry.title_id,
+        placement: entry
+            .placement
+            .map(mediaops_core::Placement::try_from)
+            .transpose()
+            .map_err(|e| HomeError::Invalid(e.to_string()))?,
+        job: entry.job.map(job_spec_from_wire).transpose()?,
+        disposition: if entry.disposition.is_empty() {
+            SyncDisposition::WouldQueue
+        } else {
+            SyncDisposition::parse(&entry.disposition)?
+        },
+        reason: entry.reason,
+        job_name: entry.job_name,
+        job_uid: entry.job_uid,
     })
 }
 
@@ -595,5 +752,69 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sync_and_scan_fields_round_trip() {
+        let obj = HomeObject::new(
+            Kind::Sync,
+            "req-1",
+            Spec::Sync(SyncSpec::default()),
+            StatusBody::Sync(SyncStatus {
+                phase: SyncPhase::Captured,
+                acceptance_rv: 9,
+                entries: vec![SyncEntry {
+                    remote_root: "movies".into(),
+                    disposition: SyncDisposition::WouldQueue,
+                    ..SyncEntry::default()
+                }],
+                ..SyncStatus::default()
+            }),
+        );
+        let back = home_object_from_wire(home_object_to_wire(&obj)).expect("sync");
+        assert_eq!(back.kind, Kind::Sync);
+        match back.status {
+            StatusBody::Sync(status) => {
+                assert_eq!(status.phase, SyncPhase::Captured);
+                assert_eq!(status.acceptance_rv, 9);
+                assert_eq!(status.entries[0].remote_root, "movies");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let node = HomeObject::new(
+            Kind::Node,
+            "inventory",
+            Spec::Node(NodeSpec {
+                worker_kind: WorkerKind::Inventory,
+            }),
+            StatusBody::Node(NodeStatus {
+                scan_started_rv: 4,
+                scan_cluster_generation: 2,
+                scan_secret_resource_version: 7,
+                ..NodeStatus::default()
+            }),
+        );
+        let back = home_object_from_wire(home_object_to_wire(&node)).expect("node");
+        match back.status {
+            StatusBody::Node(status) => {
+                assert_eq!(status.scan_started_rv, 4);
+                assert_eq!(status.scan_cluster_generation, 2);
+                assert_eq!(status.scan_secret_resource_version, 7);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_sync_name_on_wire_is_old_job_authorization() {
+        let spec = JobSpec {
+            title_id: "movie:key:thematrix.1999".into(),
+            ..JobSpec::default()
+        };
+        let wire = job_spec_to_wire(&spec);
+        assert!(wire.sync_name.is_empty());
+        let back = job_spec_from_wire(wire).expect("job");
+        assert!(back.sync_name.is_empty());
     }
 }

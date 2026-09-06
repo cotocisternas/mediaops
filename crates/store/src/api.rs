@@ -1,5 +1,9 @@
 //! Home API object store. Separate file (`api.db`), not `state.db`.
 
+mod sync;
+#[cfg(test)]
+mod sync_tests;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -12,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{StoreError, sqlite};
 
-const API_SCHEMA_VERSION: i64 = 3;
+const API_SCHEMA_VERSION: i64 = 4;
 const WATCH_HISTORY_LIMIT: i64 = 4096;
 
 /// sqlite owner of Home objects. Only `mediaops-api` opens this.
@@ -406,6 +410,9 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
              DELETE FROM history;",
         )
         .map_err(sqlite)?;
+    }
+    // Sync authority and scan tokens must not be opened by pre-Sync binaries.
+    if version < API_SCHEMA_VERSION {
         tx.pragma_update(None, "user_version", API_SCHEMA_VERSION)
             .map_err(sqlite)?;
     }
@@ -563,6 +570,7 @@ fn encode_spec(spec: &Spec) -> Result<String, StoreError> {
         Spec::Hold(s) => serde_json::to_value(s),
         Spec::RemoteFile | Spec::Event => serde_json::to_value(serde_json::Map::new()),
         Spec::Node(s) => serde_json::to_value(s),
+        Spec::Sync(s) => serde_json::to_value(s),
     }
     .map_err(|e| StoreError::Sqlite(e.to_string()))?;
     serde_json::to_string(&value).map_err(|e| StoreError::Sqlite(e.to_string()))
@@ -579,6 +587,7 @@ fn encode_status(status: &StatusBody) -> Result<String, StoreError> {
         StatusBody::RemoteFile(s) => serde_json::to_value(s),
         StatusBody::Node(s) => serde_json::to_value(s),
         StatusBody::Event(s) => serde_json::to_value(s),
+        StatusBody::Sync(s) => serde_json::to_value(s),
     }
     .map_err(|e| StoreError::Sqlite(e.to_string()))?;
     serde_json::to_string(&value).map_err(|e| StoreError::Sqlite(e.to_string()))
@@ -624,6 +633,9 @@ fn decode_spec(kind: Kind, spec_json: &str) -> Result<Spec, StoreError> {
         Kind::RemoteFile => Spec::RemoteFile,
         Kind::Node => Spec::Node(serde_json::from_str::<NodeSpec>(spec_json).map_err(err)?),
         Kind::Event => Spec::Event,
+        Kind::Sync => {
+            Spec::Sync(serde_json::from_str::<mediaops_core::SyncSpec>(spec_json).map_err(err)?)
+        }
     })
 }
 
@@ -653,6 +665,9 @@ fn decode_status(kind: Kind, status_json: &str) -> Result<StatusBody, StoreError
         Kind::Event => {
             StatusBody::Event(serde_json::from_str::<EventStatus>(status_json).map_err(err)?)
         }
+        Kind::Sync => StatusBody::Sync(
+            serde_json::from_str::<mediaops_core::SyncStatus>(status_json).map_err(err)?,
+        ),
     })
 }
 

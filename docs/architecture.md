@@ -44,6 +44,35 @@ Apply replaces spec. Status is a subresource (`Patch`). Creation requires resour
 
 Admission: CLI/import write Cluster, Secret, Want, Title.spec, Hold decision. Only inventory writes RemoteFile. Only controllers create Jobs. Only the scheduler sets `Job.spec.nodeName`. The bound worker advances its Job status; controllers can refuse revoked unbound work. Title observations require a verifying Job, or a maintenance import whose file digests are checked by the API.
 
+### One-shot sync
+
+`mediaops sync` requests all completed eligible files in the configured seedbox
+roots, independent of grabber monitoring. It does not create persistent Wants.
+The API records a durable Sync request, waits up to 60 seconds for a successful
+inventory scan that began after acceptance, and captures a finite source manifest.
+Inventory uses an API-assigned scan token and exact-version publication; partial,
+old or superseded scans cannot satisfy the request.
+
+The controller commits missing Title shells, per-file Pull Jobs, and the Sync's
+Job names/UIDs atomically. `Scheduled` means planning finished, not copying.
+The scheduler still enforces existing concurrency and disk budgets. Each Sync
+Job is authorized by its exact recorded identity/snapshot, current source and
+Hold eligibility, and compatible source configuration. New remote files are not
+added after capture; deleting a Job does not cause its old Sync to recreate it.
+
+`sync --dry-run` uses the same read-only planner without creating Sync, Want,
+Title, Job, Event, or decision objects. Existing background work and normal
+inventory publication continue independently. Neither mode deletes media,
+overwrites local files, approves Holds, or guesses among ambiguous sources.
+Continuous automatic sync is deferred in the [current backlog](backlog.md).
+
+Upgrade the Home API, inventory, CLI and TUI together for these additive Home
+RPCs. The API database marker advances from 3 to 4 without discarding objects or
+watch history; it prevents older binaries from opening records they cannot
+understand. Back up Home state before deployment; rollback to a pre-Sync API
+requires restoring the corresponding database backup. No seedbox wire or daemon
+upgrade is required for one-shot sync.
+
 Watches start with a consistent snapshot and replay a bounded durable event history. A cursor older than retained history fails explicitly; relist and watch from zero. Consumers must not treat a disconnected or expired watch as current state.
 
 For the Home control plane, `config.toml` is import/export. Runtime settings are

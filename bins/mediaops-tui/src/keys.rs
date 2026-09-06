@@ -19,6 +19,9 @@ pub enum Command {
     EnterDetail,
     Back,
     Mutate(Mutation),
+    PreviewSync,
+    RunSync,
+    ReleaseSync,
     Resize { cols: u16, rows: u16 },
     Ignore,
 }
@@ -40,6 +43,9 @@ pub fn command_from_event(event: &Event) -> Command {
 }
 
 fn command_from_key(key: KeyEvent) -> Command {
+    if key.kind == KeyEventKind::Release && matches!(key.code, KeyCode::Char('S' | 's')) {
+        return Command::ReleaseSync;
+    }
     if key.kind == KeyEventKind::Release || key.kind == KeyEventKind::Repeat {
         return Command::Ignore;
     }
@@ -72,6 +78,8 @@ fn command_from_key(key: KeyEvent) -> Command {
         KeyCode::Char('D') => Command::Mutate(Mutation::DeleteWant),
         KeyCode::Char('A') => Command::Mutate(Mutation::ApproveHold),
         KeyCode::Char('X') => Command::Mutate(Mutation::RejectHold),
+        KeyCode::Char('p') => Command::PreviewSync,
+        KeyCode::Char('S') => Command::RunSync,
         _ => Command::Ignore,
     }
 }
@@ -100,6 +108,22 @@ mod tests {
         assert_eq!(
             command_from_key(press(KeyCode::Enter)),
             Command::EnterDetail
+        );
+        assert_eq!(
+            command_from_key(press(KeyCode::Char('p'))),
+            Command::PreviewSync
+        );
+        assert_eq!(
+            command_from_key(press(KeyCode::Char('S'))),
+            Command::RunSync
+        );
+        assert_eq!(command_from_key(press(KeyCode::Char('s'))), Command::Ignore);
+        let mut sync_repeat = press(KeyCode::Char('S'));
+        sync_repeat.kind = KeyEventKind::Repeat;
+        assert_eq!(command_from_key(sync_repeat), Command::Ignore);
+        assert_eq!(
+            command_from_event(&Event::Paste("pS".into())),
+            Command::Ignore
         );
     }
 }

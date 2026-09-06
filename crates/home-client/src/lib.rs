@@ -42,8 +42,8 @@ use hyper_util::rt::TokioIo;
 use mediaops_core::{ACTOR_HEADER, Actor, HomeError, HomeObject, Kind};
 use mediaops_proto::home::home_service_client::HomeServiceClient;
 use mediaops_proto::home::{
-    ApplyRequest, DeleteRequest, GetRequest, ListRequest, PatchRequest, ReconcileRequest,
-    WatchRequest,
+    ApplyRequest, BeginInventoryRequest, DeleteRequest, GetRequest, ListRequest, PatchRequest,
+    ReconcileRequest, SyncRequest, WatchRequest,
 };
 use mediaops_proto::{home_object_from_wire, home_object_to_wire};
 use tokio::net::UnixStream;
@@ -337,6 +337,50 @@ impl HomeApi {
     ) -> Result<HomeWatch, ClientError> {
         Ok(HomeWatch::new(self.watch(kind, resource_version).await?))
     }
+
+    pub async fn sync(&self, request_id: &str, dry_run: bool) -> Result<HomeObject, ClientError> {
+        let mut request = self.attach(SyncRequest {
+            request_id: request_id.to_string(),
+            dry_run,
+        });
+        request.set_timeout(Duration::from_secs(75));
+        let resp = self
+            .inner
+            .clone()
+            .sync(request)
+            .await
+            .map_err(ClientError::from_status)?;
+        let obj = resp
+            .into_inner()
+            .object
+            .ok_or_else(|| ClientError::Home(HomeError::Invalid("empty sync response".into())))?;
+        home_object_from_wire(obj).map_err(ClientError::Home)
+    }
+
+    pub async fn begin_inventory(&self) -> Result<HomeObject, ClientError> {
+        let resp = self
+            .inner
+            .clone()
+            .begin_inventory(self.attach(BeginInventoryRequest {}))
+            .await
+            .map_err(ClientError::from_status)?;
+        let obj = resp.into_inner().object.ok_or_else(|| {
+            ClientError::Home(HomeError::Invalid("empty begin inventory response".into()))
+        })?;
+        home_object_from_wire(obj).map_err(ClientError::Home)
+    }
+}
+
+/// Time, process id, and a process-local counter. Stable for one client retry.
+pub fn new_sync_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}-{seq}", std::process::id())
 }
 
 fn update_node_heartbeat(
@@ -424,5 +468,37 @@ mod heartbeat_tests {
             (8, 103)
         );
         assert_eq!(status.last_heartbeat_unix, 104);
+        assert_eq!(status.scan_started_rv, 0);
+    }
+
+    #[test]
+    fn liveness_heartbeat_preserves_scan_start_token() {
+        let mut status = mediaops_core::NodeStatus {
+            scan_started_rv: 11,
+            scan_cluster_generation: 3,
+            scan_secret_resource_version: 8,
+            ..mediaops_core::NodeStatus::default()
+        };
+        update_node_heartbeat(&mut status, Some(false), None, 50);
+        update_node_heartbeat(&mut status, None, None, 51);
+        update_node_heartbeat(&mut status, Some(true), Some((4, 52)), 52);
+        assert_eq!(status.scan_started_rv, 11);
+        assert_eq!(status.scan_cluster_generation, 3);
+        assert_eq!(status.scan_secret_resource_version, 8);
+        assert!(status.ready);
+        assert_eq!(status.list_generation, 4);
+    }
+}
+
+#[cfg(test)]
+mod sync_id_tests {
+    use super::*;
+
+    #[test]
+    fn new_sync_request_id_is_unique_in_process() {
+        let a = new_sync_request_id();
+        let b = new_sync_request_id();
+        assert_ne!(a, b);
+        assert!(a.contains(&std::process::id().to_string()));
     }
 }

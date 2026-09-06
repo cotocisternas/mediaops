@@ -12,5 +12,6 @@ BMAD material is historical, not an alternative runbook or active backlog.
 | [TUI](tui.md) | Additive Home API terminal UI |
 | [Development](development.md) | Build, test, conventions |
 | [Documentation status](documentation-status.md) | Current sources of truth, superseded behavior, and BMAD history |
+| [Backlog](backlog.md) | Current deferred product work, including continuous automatic sync |
 
 Agent rules live in [AGENTS.md](../AGENTS.md). The GitHub landing page is [README.md](../README.md).

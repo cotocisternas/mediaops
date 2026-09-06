@@ -25,6 +25,7 @@ fn inventory(now: i64, generation: i64) -> HomeObject {
             list_completed_unix: now,
             ready: true,
             last_heartbeat_unix: now,
+            ..NodeStatus::default()
         }),
     )
 }

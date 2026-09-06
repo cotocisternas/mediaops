@@ -3,6 +3,15 @@
 mod admission;
 mod controllers;
 mod serve;
+mod sync;
+mod sync_authority;
+mod sync_controller;
+#[cfg(test)]
+mod sync_controller_tests;
+mod sync_disk;
+#[cfg(test)]
+mod sync_hold_tests;
+mod sync_plan;
 
 pub use serve::{ApiError, serve_api};
 

@@ -24,6 +24,10 @@ service HomeService {
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   // Increment Cluster.status.reconcile_generation.
   rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+  // One-shot copy of completed eligible files. Actor Cli only.
+  rpc Sync(SyncRequest) returns (SyncResponse);
+  // Record a scan start token on the inventory Node. Actor Inventory only.
+  rpc BeginInventory(BeginInventoryRequest) returns (BeginInventoryResponse);
 }
 
 // Identity and optimistic concurrency.
@@ -42,7 +46,7 @@ message Metadata {
 message Object {
   // Must be mediaops.home.v1.
   string api_version = 1;
-  // Kind string (Cluster, Secret, Title, Want, Job, Hold, RemoteFile, Node, Event).
+  // Kind string (Cluster, Secret, Title, Want, Job, Hold, RemoteFile, Node, Event, Sync).
   string kind = 2;
   // Name, uid, generation, resourceVersion.
   Metadata metadata = 3;
@@ -66,6 +70,8 @@ message Object {
     Node node = 17;
     // Progress / refuse / drift / bind event.
     Event event = 18;
+    // One-shot sync request and captured manifest.
+    Sync sync = 19;
   }
 }
 
@@ -235,6 +241,8 @@ message JobSpec {
   uint32 range_concurrency = 13;
   // Exact authorizing Hold object. Empty means the Title's Want.
   string hold_name = 14;
+  // Authorizing Sync object name. Empty keeps Want/Hold authorization.
+  string sync_name = 15;
 }
 
 // Observed Job.
@@ -339,6 +347,12 @@ message NodeStatus {
   int64 list_generation = 3;
   // Completion time for freshness independent of heartbeat.
   int64 list_completed_unix = 4;
+  // Store revision captured at BeginInventory. Zero means no start token.
+  int64 scan_started_rv = 5;
+  // Cluster generation captured at BeginInventory.
+  int64 scan_cluster_generation = 6;
+  // Secret resourceVersion captured at BeginInventory.
+  int64 scan_secret_resource_version = 7;
 }
 
 // Progress / refuse / drift / bind note.
@@ -464,4 +478,91 @@ message ReconcileRequest {}
 message ReconcileResponse {
   // New Cluster.status.reconcile_generation.
   int64 reconcile_generation = 1;
+}
+
+// One-shot Sync object.
+message Sync {
+  // Fixed copy scope.
+  SyncSpec spec = 1;
+  // Server-owned manifest and planning progress.
+  SyncStatus status = 2;
+}
+
+// Desired Sync intent.
+message SyncSpec {
+  // allEligibleCompleted.
+  string scope = 1;
+}
+
+// Observed Sync.
+message SyncStatus {
+  // waitingInventory, captured, scheduled, or failed.
+  string phase = 1;
+  // Acceptance time.
+  int64 accepted_unix = 2;
+  // Planning deadline.
+  int64 deadline_unix = 3;
+  // Inventory generation at acceptance.
+  int64 baseline_generation = 4;
+  // Store revision at acceptance.
+  int64 acceptance_rv = 5;
+  // Captured inventory generation.
+  int64 list_generation = 6;
+  // Cluster snapshot used for planning.
+  ClusterSpec cluster = 7;
+  // Cluster generation at acceptance.
+  int64 cluster_generation = 8;
+  // Secret resourceVersion at acceptance.
+  int64 secret_resource_version = 9;
+  // Captured files and decisions.
+  repeated SyncEntry entries = 10;
+  // Operator-facing text.
+  string message = 11;
+}
+
+// One captured source file.
+message SyncEntry {
+  // Allowlist root id.
+  string remote_root = 1;
+  // Path relative to that root.
+  string remote_path = 2;
+  // Remote file length.
+  uint64 file_len = 3;
+  // TitleId render.
+  string title_id = 4;
+  // Canonical placement when known.
+  mediaops.v1.Placement placement = 5;
+  // Job snapshot when queued.
+  JobSpec job = 6;
+  // wouldQueue, queued, alreadyQueued, present, blocked, or ineligible.
+  string disposition = 7;
+  // Blocked / ineligible reason.
+  string reason = 8;
+  // Created or reused Job name.
+  string job_name = 9;
+  // Created or reused Job uid.
+  string job_uid = 10;
+}
+
+// Cli Sync RPC.
+message SyncRequest {
+  // Client-generated stable request id.
+  string request_id = 1;
+  // Preview without writing objects.
+  bool dry_run = 2;
+}
+
+// Sync RPC result.
+message SyncResponse {
+  // The Sync object.
+  Object object = 1;
+}
+
+// Inventory scan start.
+message BeginInventoryRequest {}
+
+// BeginInventory result.
+message BeginInventoryResponse {
+  // The inventory Node with the start token.
+  Object object = 1;
 }

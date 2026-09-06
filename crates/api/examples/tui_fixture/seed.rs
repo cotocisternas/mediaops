@@ -55,6 +55,11 @@ async fn apply_cluster(cli: &HomeApi, library: &Path) -> Result<(), FixtureError
         CLUSTER_NAME,
         Spec::Cluster(ClusterSpec {
             library_root,
+            roots: vec![mediaops_core::PathRoot {
+                id: "movies".into(),
+                path: "/fixture/remote".into(),
+                kind: Some(mediaops_core::TitleKind::Movie),
+            }],
             ..ClusterSpec::default()
         }),
         StatusBody::Cluster(ClusterStatus::default()),
@@ -133,6 +138,7 @@ async fn apply_node(socket: &Path, seed: NodeSeed) -> Result<(), FixtureError> {
             list_completed_unix: listed,
             ready: seed.ready,
             last_heartbeat_unix: beat,
+            ..NodeStatus::default()
         }),
     ))
     .await?;

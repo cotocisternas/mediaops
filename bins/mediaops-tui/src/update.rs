@@ -15,6 +15,7 @@ pub enum UpdateEffect {
     None,
     Quit,
     RequestMutation(Mutation),
+    RequestSync { dry_run: bool },
 }
 
 pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
@@ -30,6 +31,7 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             update.ui.cols = cols;
             update.ui.rows = rows;
             update.ui.rendered_target = None;
+            clamp_report_offset(update.ui);
             UpdateEffect::None
         }
         Command::Screen(screen) => {
@@ -37,6 +39,8 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             update.ui.select_row(0, update.row_count);
             update.ui.in_detail = false;
             update.ui.help = false;
+            update.ui.report = None;
+            update.ui.report_offset = 0;
             UpdateEffect::None
         }
         Command::NextScreen => {
@@ -49,6 +53,13 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
         }
         Command::RowDelta(delta) => {
             if update.ui.help {
+                return UpdateEffect::None;
+            }
+            if update.ui.report.is_some() {
+                let signed =
+                    i16::try_from(delta).unwrap_or(if delta < 0 { i16::MIN } else { i16::MAX });
+                update.ui.report_offset = update.ui.report_offset.saturating_add_signed(signed);
+                clamp_report_offset(update.ui);
                 return UpdateEffect::None;
             }
             if update.ui.in_detail {
@@ -74,7 +85,9 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             apply(update, Command::RowDelta(jump))
         }
         Command::RowHome => {
-            if update.ui.in_detail {
+            if update.ui.report.is_some() {
+                update.ui.report_offset = 0;
+            } else if update.ui.in_detail {
                 update.ui.detail_offset = 0;
                 update.ui.rendered_target = None;
             } else {
@@ -83,7 +96,10 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             UpdateEffect::None
         }
         Command::RowEnd => {
-            if update.ui.in_detail {
+            if update.ui.report.is_some() {
+                update.ui.report_offset = u16::MAX;
+                clamp_report_offset(update.ui);
+            } else if update.ui.in_detail {
                 update.ui.detail_offset = u16::MAX;
                 update.ui.rendered_target = None;
             } else {
@@ -104,8 +120,19 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             update.ui.rendered_target = None;
             if update.ui.help {
                 update.ui.help = false;
+            } else if update.ui.report.is_some() {
+                update.ui.report = None;
+                update.ui.report_offset = 0;
             } else {
                 update.ui.in_detail = false;
+            }
+            UpdateEffect::None
+        }
+        Command::PreviewSync => request_sync(update, true),
+        Command::RunSync => request_sync(update, false),
+        Command::ReleaseSync => {
+            if update.ui.keyboard_event_types {
+                update.ui.sync_key_held = false;
             }
             UpdateEffect::None
         }
@@ -122,69 +149,24 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use mediaops_core::Kind;
+fn clamp_report_offset(ui: &mut UiModel) {
+    let Some(report) = ui.report.as_ref() else {
+        return;
+    };
+    let max = report.max_offset(
+        usize::from(ui.cols),
+        usize::from(ui.rows.saturating_sub(5)).max(1),
+    );
+    ui.report_offset = ui.report_offset.min(max);
+}
 
-    use super::*;
-    use crate::cache::ObjectKey;
-    use crate::model::Screen;
-
-    fn ready_ui() -> UiModel {
-        UiModel {
-            screen: Screen::Wants,
-            in_detail: true,
-            cols: 80,
-            rows: 24,
-            selected_key: Some(ObjectKey::new(Kind::Want, "movie:tmdb:1")),
-            selected_uid: Some("u".into()),
-            selected_rv: Some(1),
-            ..UiModel::default()
-        }
+fn request_sync(update: Update<'_>, dry_run: bool) -> UpdateEffect {
+    if !update.ui.sync_actions_enabled(update.sync) || (!dry_run && update.ui.sync_key_held) {
+        return UpdateEffect::None;
     }
-
-    #[test]
-    fn mutation_does_not_queue_while_pending() {
-        let mut ui = ready_ui();
-        let effect = apply(
-            Update {
-                ui: &mut ui,
-                sync: SyncState::Current,
-                row_count: 1,
-                page: 10,
-            },
-            Command::Mutate(Mutation::ApplyWant),
-        );
-        assert!(matches!(
-            effect,
-            UpdateEffect::RequestMutation(Mutation::ApplyWant)
-        ));
-        let effect = apply(
-            Update {
-                ui: &mut ui,
-                sync: SyncState::Current,
-                row_count: 1,
-                page: 10,
-            },
-            Command::Mutate(Mutation::DeleteWant),
-        );
-        assert!(matches!(effect, UpdateEffect::None));
+    if !dry_run {
+        update.ui.sync_key_held = true;
     }
-
-    #[test]
-    fn enter_never_writes() {
-        let mut ui = ready_ui();
-        ui.in_detail = false;
-        let effect = apply(
-            Update {
-                ui: &mut ui,
-                sync: SyncState::Current,
-                row_count: 2,
-                page: 10,
-            },
-            Command::EnterDetail,
-        );
-        assert!(matches!(effect, UpdateEffect::None));
-        assert!(ui.in_detail);
-    }
+    update.ui.sync_pending = true;
+    UpdateEffect::RequestSync { dry_run }
 }

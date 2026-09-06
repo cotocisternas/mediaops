@@ -21,6 +21,8 @@ mod out;
 mod reclaim;
 mod repair;
 mod status;
+mod sync_cmd;
+mod sync_format;
 mod watch;
 
 #[cfg(test)]
@@ -186,6 +188,15 @@ enum Command {
     },
     /// Increment Cluster.status.reconcileGeneration and request reconciliation.
     Reconcile {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Copy completed eligible seedbox files home. `--dry-run` previews without writing.
+    Sync {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        request_id: Option<String>,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -1242,6 +1253,15 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Some(Command::Reconcile { socket }) => {
             let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
             let line = api_cmd::reconcile(output, socket).await?;
+            write_stdout(&line)
+        }
+        Some(Command::Sync {
+            dry_run,
+            request_id,
+            socket,
+        }) => {
+            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
+            let line = sync_cmd::run(dry_run, request_id, output, socket).await?;
             write_stdout(&line)
         }
         Some(Command::ImportLegacy {

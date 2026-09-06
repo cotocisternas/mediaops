@@ -89,6 +89,7 @@ pub(crate) fn render_help(frame: &mut Frame<'_>, area: Rect, _color: bool) {
             Line::from("j k arrows  PageUp PageDown  Home End  rows"),
             Line::from("Enter  detail   Esc  back   ?  help   q  quit"),
             Line::from("W apply Want   D delete Want   A approve Hold   X reject Hold"),
+            Line::from("p preview copies   S fresh sync (not watching)"),
             Line::from("mutations only in selected detail; Enter never writes"),
         ]),
         area,
@@ -96,7 +97,8 @@ pub(crate) fn render_help(frame: &mut Frame<'_>, area: Rect, _color: bool) {
 }
 
 pub(crate) fn render_status(frame: &mut Frame<'_>, area: Rect, ui: &UiModel) {
-    let text = match (ui.mutation_pending, ui.message.as_deref()) {
+    let pending = ui.mutation_pending || ui.sync_pending;
+    let text = match (pending, ui.message.as_deref()) {
         (true, Some(msg)) => format!("pending  {msg}"),
         (true, None) => "pending".into(),
         (false, Some(msg)) => msg.to_string(),
@@ -114,6 +116,14 @@ pub(crate) fn render_footer(
 ) {
     let text = if ui.help {
         "Esc dismiss  ? help  q quit".to_string()
+    } else if ui.report.is_some() {
+        if ui.sync_actions_enabled(sync) && !ui.sync_key_held {
+            "p preview  S fresh sync  Esc back  ? help  q quit".to_string()
+        } else if ui.sync_actions_enabled(sync) {
+            "p preview  Esc back  j/k scroll  ? help  q quit".to_string()
+        } else {
+            "Esc back  j/k scroll  ? help  q quit".to_string()
+        }
     } else {
         footer_keys(ui, sync)
     };
@@ -122,6 +132,16 @@ pub(crate) fn render_footer(
 
 fn footer_keys(ui: &UiModel, sync: SyncState) -> String {
     let mut parts = vec!["1-7 screens", "j/k rows", "? help", "q quit"];
+    if ui.sync_actions_enabled(sync) {
+        parts.insert(
+            0,
+            if ui.sync_key_held {
+                "p preview"
+            } else {
+                "p preview  S sync"
+            },
+        );
+    }
     if ui.in_detail {
         parts.insert(0, "Esc back");
         if ui.mutations_enabled(sync) {
@@ -135,8 +155,27 @@ fn footer_keys(ui: &UiModel, sync: SyncState) -> String {
     } else {
         parts.insert(0, "Enter detail");
     }
-    if parts.join("  ").len() > usize::from(ui.cols) {
+    let fits = |parts: &[&str]| parts.join("  ").len() <= usize::from(ui.cols);
+    if !fits(&parts) {
         parts.retain(|part| !matches!(*part, "1-7 screens" | "j/k rows"));
+    }
+    for (long, short) in [
+        ("p preview  S sync", "p  S"),
+        ("Enter detail", "Enter"),
+        ("W apply  D delete", "W  D"),
+        ("A approve  X reject", "A  X"),
+        ("W apply", "W"),
+        ("Esc back", "Esc"),
+        ("? help", "?"),
+    ] {
+        if fits(&parts) {
+            break;
+        }
+        for part in &mut parts {
+            if *part == long {
+                *part = short;
+            }
+        }
     }
     parts.join("  ")
 }

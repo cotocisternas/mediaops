@@ -17,6 +17,7 @@ pub mod digest;
 pub mod exec;
 pub mod hold;
 pub mod home;
+pub mod home_sync;
 pub mod install;
 pub mod jobs;
 pub mod media;
@@ -52,8 +53,9 @@ pub use home::{
     HoldDecisionSpec, HoldSpec, HoldStatus, HomeError, HomeJobKind, HomeObject, HomeOp, JobPhase,
     JobSpec, JobStatus, Kind, NODE_HEARTBEAT_SECS, NODE_NOTREADY_SECS, NodeSpec, NodeStatus,
     ObjectMeta, PULL_DEADLINE_SECS, PULL_MAX_ATTEMPTS, RemoteFileStatus, SECRET_NAME, SecretSpec,
-    Spec, StatusBody, TitleFileStatus, TitleSpec, TitleStatus, WantPhase, WantSpec, WantStatus,
-    WorkerKind, admit, bind_priority, node_is_ready, pull_fits, remote_file_name,
+    Spec, StatusBody, SyncDisposition, SyncEntry, SyncPhase, SyncScope, SyncSpec, SyncStatus,
+    TitleFileStatus, TitleSpec, TitleStatus, WantPhase, WantSpec, WantStatus, WorkerKind, admit,
+    bind_priority, node_is_ready, pull_fits, remote_file_name,
 };
 pub use install::{
     InstallError, InstallOutcome, VerifiedConvertingHandle, VerifiedStagingHandle,

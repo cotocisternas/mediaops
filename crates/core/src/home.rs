@@ -7,6 +7,10 @@ use crate::desired_state::{Grabber, PathRoot};
 use crate::digest::Blake3Hex;
 use crate::title_id::{TitleId, TitleKind};
 
+pub use crate::home_sync::{
+    SyncDisposition, SyncEntry, SyncPhase, SyncScope, SyncSpec, SyncStatus,
+};
+
 /// Wire `apiVersion` for every Home object.
 pub const HOME_API_VERSION: &str = "mediaops.home.v1";
 
@@ -100,6 +104,7 @@ pub enum Kind {
     RemoteFile,
     Node,
     Event,
+    Sync,
 }
 
 impl Kind {
@@ -114,6 +119,7 @@ impl Kind {
             Self::RemoteFile => "RemoteFile",
             Self::Node => "Node",
             Self::Event => "Event",
+            Self::Sync => "Sync",
         }
     }
 
@@ -128,6 +134,7 @@ impl Kind {
             Self::RemoteFile => "remotefile",
             Self::Node => "node",
             Self::Event => "event",
+            Self::Sync => "sync",
         }
     }
 
@@ -142,6 +149,7 @@ impl Kind {
             "RemoteFile" | "remotefile" | "Remote_file" => Ok(Self::RemoteFile),
             "Node" | "node" => Ok(Self::Node),
             "Event" | "event" => Ok(Self::Event),
+            "Sync" | "sync" => Ok(Self::Sync),
             other => Err(HomeError::Invalid(format!("unknown kind `{other}`"))),
         }
     }
@@ -392,7 +400,7 @@ impl HomeObject {
                     return Err(invalid("Node name must equal workerKind"));
                 }
             }
-            Spec::RemoteFile | Spec::Event => {}
+            Spec::Sync(_) | Spec::RemoteFile | Spec::Event => {}
         }
         match &self.status {
             StatusBody::Title(s) => {
@@ -431,8 +439,26 @@ impl HomeObject {
                 }
             }
             StatusBody::Node(s) => {
-                if s.last_heartbeat_unix < 0 || s.list_generation < 0 || s.list_completed_unix < 0 {
+                if s.last_heartbeat_unix < 0
+                    || s.list_generation < 0
+                    || s.list_completed_unix < 0
+                    || s.scan_started_rv < 0
+                    || s.scan_cluster_generation < 0
+                    || s.scan_secret_resource_version < 0
+                {
                     return Err(invalid("invalid Node observation"));
+                }
+            }
+            StatusBody::Sync(s) => {
+                if s.accepted_unix < 0
+                    || s.deadline_unix < 0
+                    || s.baseline_generation < 0
+                    || s.acceptance_rv < 0
+                    || s.list_generation < 0
+                    || s.cluster_generation < 0
+                    || s.secret_resource_version < 0
+                {
+                    return Err(invalid("invalid Sync observation"));
                 }
             }
             StatusBody::Hold(s) => {
@@ -568,6 +594,7 @@ fn spec_from_value(kind: Kind, value: serde_json::Value) -> Result<Spec, HomeErr
         Kind::RemoteFile => Spec::RemoteFile,
         Kind::Node => Spec::Node(serde_json::from_value(value).map_err(err)?),
         Kind::Event => Spec::Event,
+        Kind::Sync => Spec::Sync(serde_json::from_value(value).map_err(err)?),
     })
 }
 
@@ -583,6 +610,7 @@ fn status_from_value(kind: Kind, value: serde_json::Value) -> Result<StatusBody,
         Kind::RemoteFile => StatusBody::RemoteFile(serde_json::from_value(value).map_err(err)?),
         Kind::Node => StatusBody::Node(serde_json::from_value(value).map_err(err)?),
         Kind::Event => StatusBody::Event(serde_json::from_value(value).map_err(err)?),
+        Kind::Sync => StatusBody::Sync(serde_json::from_value(value).map_err(err)?),
     })
 }
 
@@ -599,6 +627,7 @@ pub enum Spec {
     RemoteFile,
     Node(NodeSpec),
     Event,
+    Sync(SyncSpec),
 }
 
 /// Observed state. Match every variant with [`Kind`].
@@ -614,6 +643,7 @@ pub enum StatusBody {
     RemoteFile(RemoteFileStatus),
     Node(NodeStatus),
     Event(EventStatus),
+    Sync(SyncStatus),
 }
 
 impl Spec {
@@ -628,6 +658,7 @@ impl Spec {
             Self::RemoteFile => Kind::RemoteFile,
             Self::Node(_) => Kind::Node,
             Self::Event => Kind::Event,
+            Self::Sync(_) => Kind::Sync,
         }
     }
 
@@ -642,6 +673,7 @@ impl Spec {
             Kind::RemoteFile => Self::RemoteFile,
             Kind::Node => Self::Node(NodeSpec::default()),
             Kind::Event => Self::Event,
+            Kind::Sync => Self::Sync(SyncSpec::default()),
         }
     }
 
@@ -665,6 +697,7 @@ impl StatusBody {
             Self::RemoteFile(_) => Kind::RemoteFile,
             Self::Node(_) => Kind::Node,
             Self::Event(_) => Kind::Event,
+            Self::Sync(_) => Kind::Sync,
         }
     }
     pub fn empty(kind: Kind) -> Self {
@@ -678,6 +711,7 @@ impl StatusBody {
             Kind::RemoteFile => Self::RemoteFile(RemoteFileStatus::default()),
             Kind::Node => Self::Node(NodeStatus::default()),
             Kind::Event => Self::Event(EventStatus::default()),
+            Kind::Sync => Self::Sync(SyncStatus::default()),
         }
     }
 }
@@ -857,6 +891,9 @@ impl HomeJobKind {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JobSpec {
+    /// Exact Sync object that authorized this Job; empty keeps Want/Hold auth.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sync_name: String,
     /// Exact Hold object that authorized this Job; empty means its Title's Want.
     #[serde(default)]
     pub hold_name: String,
@@ -1078,6 +1115,17 @@ pub struct NodeStatus {
     pub ready: bool,
     #[serde(default)]
     pub last_heartbeat_unix: i64,
+    /// Store revision captured at BeginInventory. Zero means no start token.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub scan_started_rv: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub scan_cluster_generation: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub scan_secret_resource_version: i64,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1167,6 +1215,7 @@ pub fn admit(actor: Actor, op: HomeOp, kind: Kind) -> Result<(), HomeError> {
                 Kind::Want | Kind::Job | Kind::Hold | Kind::Event,
                 Actor::Cli | Actor::Import,
             )
+            | (HomeOp::Delete, Kind::Sync, Actor::Cli)
             | (HomeOp::Delete, Kind::RemoteFile, Actor::Inventory)
             | (
                 HomeOp::Delete,
@@ -1301,6 +1350,59 @@ mod tests {
         assert!(admit(Actor::Cli, HomeOp::Apply, Kind::Job).is_err());
         assert!(admit(Actor::Inventory, HomeOp::Apply, Kind::RemoteFile).is_ok());
         assert!(admit(Actor::Controller, HomeOp::Apply, Kind::Job).is_ok());
+    }
+
+    #[test]
+    fn sync_is_readable_and_cli_deletable_but_never_applied() {
+        assert!(admit(Actor::Cli, HomeOp::Get, Kind::Sync).is_ok());
+        assert!(admit(Actor::Cli, HomeOp::List, Kind::Sync).is_ok());
+        assert!(admit(Actor::Cli, HomeOp::Watch, Kind::Sync).is_ok());
+        assert!(admit(Actor::Cli, HomeOp::Delete, Kind::Sync).is_ok());
+        assert!(admit(Actor::Inventory, HomeOp::Delete, Kind::Sync).is_err());
+        for actor in [
+            Actor::Cli,
+            Actor::Import,
+            Actor::Controller,
+            Actor::Scheduler,
+            Actor::Inventory,
+            Actor::Pull,
+            Actor::Gateway,
+        ] {
+            assert!(admit(actor, HomeOp::Apply, Kind::Sync).is_err());
+            assert!(admit(actor, HomeOp::PatchSpec, Kind::Sync).is_err());
+            assert!(admit(actor, HomeOp::PatchStatus, Kind::Sync).is_err());
+        }
+    }
+
+    #[test]
+    fn old_job_and_node_json_omit_new_empty_fields() {
+        let job: JobSpec = serde_json::from_value(serde_json::json!({
+            "kind": "pull",
+            "titleId": "movie:key:thematrix.1999",
+            "holdName": ""
+        }))
+        .expect("old job");
+        assert!(job.sync_name.is_empty());
+        let job_json = serde_json::to_value(&job).expect("job json");
+        assert!(job_json.get("syncName").is_none());
+        assert_eq!(job_json["holdName"], "");
+
+        let node: NodeStatus = serde_json::from_value(serde_json::json!({
+            "ready": true,
+            "lastHeartbeatUnix": 10,
+            "listGeneration": 2,
+            "listCompletedUnix": 9
+        }))
+        .expect("old node");
+        assert_eq!(node.scan_started_rv, 0);
+        assert_eq!(node.scan_cluster_generation, 0);
+        assert_eq!(node.scan_secret_resource_version, 0);
+        let node_json = serde_json::to_value(&node).expect("node json");
+        assert_eq!(node_json["ready"], true);
+        assert_eq!(node_json["listGeneration"], 2);
+        assert!(node_json.get("scanStartedRv").is_none());
+        assert!(node_json.get("scanClusterGeneration").is_none());
+        assert!(node_json.get("scanSecretResourceVersion").is_none());
     }
 
     #[test]

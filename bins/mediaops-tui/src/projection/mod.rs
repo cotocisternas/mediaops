@@ -128,6 +128,7 @@ mod tests {
                 list_completed_unix: listed,
                 ready: true,
                 last_heartbeat_unix: listed,
+                ..NodeStatus::default()
             }),
         );
         cache.install_baseline(
@@ -170,6 +171,7 @@ mod tests {
                 list_completed_unix: now,
                 ready: true,
                 last_heartbeat_unix: now,
+                ..NodeStatus::default()
             }),
         );
         let a = hold_obj("movie:tmdb:1-one", "movie:tmdb:1", "one");
