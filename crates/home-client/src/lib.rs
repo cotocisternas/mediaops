@@ -1,10 +1,14 @@
 //! Typed Home API client. Sets `x-mediaops-actor`. Never opens sqlite.
 
 mod paths;
+mod watch;
+
+pub use mediaops_proto::WatchEvent;
 pub use paths::{
     default_api_socket, default_config_dir, default_gateway_socket, default_state_dir,
     default_tls_dir,
 };
+pub use watch::HomeWatch;
 
 /// Independent process ownership, separate from the legacy library flock.
 /// Keep the returned file alive for the role's entire lifetime.
@@ -58,7 +62,7 @@ pub enum ClientError {
 }
 
 impl ClientError {
-    fn from_status(status: tonic::Status) -> Self {
+    pub(crate) fn from_status(status: tonic::Status) -> Self {
         Self::Rpc {
             code: status.code(),
             message: mediaops_proto::error_detail_from_status(&status)
@@ -95,6 +99,20 @@ impl ClientError {
             Self::Home(HomeError::Denied(_))
                 | Self::Rpc {
                     code: tonic::Code::PermissionDenied,
+                    ..
+                }
+        )
+    }
+
+    /// Transport may have delivered the write; do not resend.
+    pub fn is_uncertain(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect(_)
+                | Self::Rpc {
+                    code: tonic::Code::DeadlineExceeded
+                        | tonic::Code::Unavailable
+                        | tonic::Code::Cancelled,
                     ..
                 }
         )
@@ -259,11 +277,20 @@ impl HomeApi {
 
     pub async fn delete(&self, kind: Kind, name: &str) -> Result<HomeObject, ClientError> {
         let version = self.get(kind, name).await?.metadata.resource_version;
+        self.delete_at_version(kind, name, version).await
+    }
+
+    pub async fn delete_at_version(
+        &self,
+        kind: Kind,
+        name: &str,
+        resource_version: i64,
+    ) -> Result<HomeObject, ClientError> {
         let resp = self
             .inner
             .clone()
             .delete(self.attach(DeleteRequest {
-                resource_version: version,
+                resource_version,
                 kind: kind.as_str().to_string(),
                 name: name.to_string(),
             }))
@@ -301,6 +328,14 @@ impl HomeApi {
             .await
             .map_err(ClientError::from_status)?;
         Ok(resp.into_inner())
+    }
+
+    pub async fn watch_home(
+        &self,
+        kind: Option<Kind>,
+        resource_version: i64,
+    ) -> Result<HomeWatch, ClientError> {
+        Ok(HomeWatch::new(self.watch(kind, resource_version).await?))
     }
 }
 
