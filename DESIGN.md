@@ -198,7 +198,8 @@ Breakpoints (character cells, not CSS):
 - **Structure**: scoped keys for this screen + global `?` `q`
 - **Variants**: list; Wants detail `W apply  D delete`; Titles detail
   `W apply`; Holds detail `A approve  X reject`; never Overview / Jobs /
-  Nodes / Box; help omits mutation hints
+  Nodes / Box; help omits mutation hints; global `p preview  S sync` when
+  Current and idle; report overlay `Esc back`
 - **Spacing**: `--space-cell`
 - **States**: mutations enabled / disabled (keys omitted when disabled)
 - **Accessibility**: keys are letters, not color
@@ -213,6 +214,21 @@ Breakpoints (character cells, not CSS):
 - **Motion**: none
 - **Layout**: body region; masthead + footer remain
 - **Scroll owner**: help body if it overflows
+
+### SyncReport
+
+- **Structure**: read-only overlay replacing the table body. Header is
+  `preview` or `sync` plus request id and captured generation; one counts
+  line (`copy` / `reuse` / `present` / `blocked` / `ineligible`); then
+  scrollable rows of source, destination, reason. Esc returns.
+- **Variants**: preview (`p`, dry-run, no objects written); sync (`S`,
+  schedules a fresh request, not permanent watching)
+- **Spacing**: `--space-cell` after labels; `--type-body` rows
+- **States**: default, pending (status row), error (status row, no pane)
+- **Accessibility**: counts and dispositions are words, not color
+- **Motion**: none
+- **Layout**: body region; masthead + footer remain
+- **Scroll owner**: report body
 
 ### ResizeNotice
 
@@ -240,6 +256,12 @@ the baseline is known empty: `nothing happening`, `nothing on hold`,
 
 ## 6. Motion & Interaction
 
+Sync-key safety: request keyboard event-type reporting in the alternate screen
+when supported, restore it on exit, and re-arm `S` only on a reported release.
+Without reliable releases, allow one `S` request per TUI launch; preview remains
+available and the status line directs the operator to the CLI or a fresh TUI.
+Never re-arm a sync request merely because an RPC completed.
+
 ### Timing
 
 | Type | Duration | Easing | Usage |
@@ -258,7 +280,9 @@ Keys (closed set):
 - Quit: `q` / Ctrl-C / SIGTERM
 - Mutations (selected detail only): `W` apply/reapply Want, `D` delete Want,
   `A` approve Hold, `X` reject Hold
-- Ignore repeat / release / pasted mutation input
+- Global (Current, normal size, no help/pending): `p` preview eligible
+  copies, `S` schedule a fresh sync (not watching)
+- Ignore repeat / release / pasted mutation or sync input
 
 ## 7. Depth & Surface
 
@@ -276,7 +300,7 @@ default vs dim, not painted surfaces.
 - Untrusted content sanitized of CSI / OSC / C0 controls.
 - Unicode width-aware clipping; CJK cells count as 2.
 - Minimum 60x16; below that, resize notice, mutations off.
-- CLI remains the unchanged alternative (`mediaops status` / `why` / `hold`).
+- CLI remains the unchanged alternative (`mediaops status` / `why` / `hold` / `sync`).
 - Hold caption always: `Approve records a decision; it does not install.`
 
 ### Accepted Debt
@@ -374,7 +398,22 @@ Tab / Shift-Tab  next/prev screen
 j k arrows  PageUp PageDown  Home End  rows
 Enter  detail   Esc  back   ?  help   q  quit
 W apply Want   D delete Want   A approve Hold   X reject Hold
+p preview copies   S fresh sync (not watching)
 mutations only in selected detail; Enter never writes
 --------------------------------------------------------------------------------
 Esc dismiss  ? help  q quit
+```
+
+### SyncReport (read-only overlay)
+
+```
+mediaops  Overview  Current                     disk  693.1 GiB free  2s
+--------------------------------------------------------------------------------
+preview  sync-1  generation 4
+copy 1  reuse 0  present 0  blocked 0  ineligible 0
+seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
+  movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
+  would queue
+--------------------------------------------------------------------------------
+Esc back  j/k rows  ? help  q quit
 ```
