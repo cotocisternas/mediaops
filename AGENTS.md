@@ -2,14 +2,14 @@
 
 Home-disk library of record plus a disposable seedbox. Rust 1.98 Cargo workspace. Operator docs: `docs/`. Read those before inventing a flow.
 
-Planning files under `_bmad-output/` are historical. Do not treat them as current docs, and do not mention epics or story keys in commits, comments, or new docs.
+Pre-rewrite files under `_bmad-output/` are historical, including session prompts and sprint/deferred-work queues. Do not dispatch them as current work. Read `docs/documentation-status.md` when using that history; scoped rules are in `_bmad-output/AGENTS.md`. Do not mention epics or story keys in commits, comments, or new docs.
 
 ## Do not
 
 - Put grabber HTTP (`reqwest`, *arr clients) in the CLI or in any crate except `crates/arr` (linked only into `mediaopsd`).
 - Put encode / sqlite in `mediaopsd`. `store` and `encode` must stay out of the daemon's workspace closure.
 - Add FTP, rsync, rclone, `ssh2`, `russh`, `ffmpeg-next`, or `native-tls` as a dependency. Pull is Range RPC only.
-- Use SSH for bulk copy. SSH is bootstrap exec only (`crates/ssh`).
+- Use SSH for bulk copy. Existing seedbox bootstrap/upgrade and confirmed edge repair use exec-only maintenance in `crates/ssh`, never a media-copy transport.
 - Format a library dest path by hand. `crates/core` PathSchema is the only writer (`parse` / `render`).
 - Treat a path string as identity. Use `TitleId` (`kind:source:id`).
 - Mint or write PEMs inside a git work tree. Bootstrap and `new-machine import` refuse; keep that.
@@ -21,7 +21,7 @@ Planning files under `_bmad-output/` are historical. Do not treat them as curren
 
 - Talk to the seedbox only through the home unix-socket gateway. The CLI never stores `seedbox_address` as something it dials.
 - Keep `grabber = "none"` a valid path: schema folder on the box, disk at home, no *arr HTTP.
-- Honor the exclusive flock on leftover `reclaim apply` / library / new-machine. Lock conflict is exit 3, never silent 0. Home API copy concurrency is Job bind + Job status, not that flock.
+- Honor the exclusive flock on explicit CLI maintenance (manual pull, encode run, reclaim apply, library, new-machine, seedbox apply, edge repair). Lock conflict is exit 3, never silent 0. Unattended Home API copy concurrency is Job bind + Job status, not that flock.
 - Home API `-o json` is the raw object. Legacy `--json` is one `{ok,data,error}` envelope on stdout; tracing on stderr. Human stdout is the operator UI — update the exact-screen test when you change a formatter.
 - Add a new workspace Cargo edge to `crates/arch-tests` first (`ALLOWED_WORKSPACE_EDGES`). `make test-arch` enforces it.
 - Keep `crates/core` free of tokio, tonic, and rusqlite. `std::fs` in that crate is legal only in `walker.rs` and `install.rs`.
@@ -57,6 +57,7 @@ Iterate on one crate with `cargo test -p <crate> --locked`. The live test (`carg
 - Library paths have no `{tmdb-…}` tokens. Identity from a path is `movie:key:…` / `series:key:…` / `album:key:…`.
 - Empty human states are fixed English strings: `nothing happening`, `nothing on hold`, `nothing on the box`, `nothing to reclaim`, `nothing to encode`.
 - systemd-user control plane is always-on `mediaops-home.service` (`ExecStart=mediaops-home`). There is no `mediaops-run.timer`.
+- Do not revive `mediaops plan` / `mediaops run` from leftover helpers or old docs. Use `watch` / `apply` to record Wants and `get Job` to inspect copying.
 
 ## Known pitfalls
 

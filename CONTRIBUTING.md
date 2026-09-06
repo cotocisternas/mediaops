@@ -14,6 +14,11 @@ make clippy
 
 Read [docs/development.md](docs/development.md) and [AGENTS.md](AGENTS.md) before changing crate boundaries, PathSchema, or either JSON contract.
 
+Use [docs/](docs/README.md) as the current product documentation. The generated
+pre-rewrite BMAD records are [historical](docs/documentation-status.md), not an
+active backlog or acceptance criteria for new changes. Update the current docs
+when behavior changes; do not rewrite old reports to describe the new release.
+
 ## Commits
 
 [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`. Imperative, lowercase after the type.
