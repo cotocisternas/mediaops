@@ -5,6 +5,9 @@ mod prune;
 mod pull;
 mod schedule;
 mod sidecar;
+mod staging;
+#[cfg(test)]
+mod staging_tests;
 
 pub use home::{
     GrpcRangeSource, HomeChannel, configure_pool, connect_home, grpc_source, list_entries,
@@ -18,6 +21,7 @@ pub use prune::{dir_is_sacred, prune_empty_incoming};
 pub use pull::{PullOutcome, PullSpec, RangeSource, pull_file, pull_file_with_progress};
 pub use schedule::{PendingFile, plan_ranges, take_slots};
 pub use sidecar::{SIDECAR_VERSION, Sidecar};
+pub use staging::cleanup_verified_staging;
 
 use std::io;
 use std::path::Path;
