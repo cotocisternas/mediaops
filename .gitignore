@@ -46,3 +46,4 @@ xcuserdata/
 *.xcscmblueprint
 *.xcuserstate
 .ionide/
+.omo/
