@@ -2,15 +2,17 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mediaops_core::{Blake3Hex, RemoteRef, TitleId, staging_path};
+use mediaops_core::{Blake3Hex, RemoteRef, TitleId};
 use tokio::task::JoinSet;
 
 use crate::TransferError;
 use crate::schedule::{PendingFile, plan_ranges, remaining, take_slots};
 use crate::sidecar::{self, Sidecar};
+use crate::staging::{self, StagingLayout};
 
 pub trait RangeSource: Send + Sync {
     fn get_range(
@@ -65,29 +67,60 @@ where
     if spec.file_len == 0 {
         return Err(TransferError::Sidecar("file_len must be > 0".into()));
     }
-    let rel = staging_path(&spec.title_id, &spec.final_name)
-        .map_err(|err| TransferError::Path(err.to_string()))?;
-    let staged = spec.library_root.join(&rel);
-    let partial = {
-        let mut p = staged.clone();
-        p.as_mut_os_string().push(".partial");
-        p
-    };
-    let sidecar_path = {
-        let mut p = staged.clone();
-        p.as_mut_os_string().push(".partial.b3");
-        p
-    };
-    if let Some(parent) = partial.parent() {
-        fs::create_dir_all(parent).map_err(|err| TransferError::io(parent, err))?;
+    if spec.range_len == 0
+        || spec.range_len > 64 * mediaops_core::Bytes::MIB
+        || spec.concurrency == 0
+        || spec.concurrency > 64
+    {
+        return Err(TransferError::Sidecar(
+            "range length or concurrency out of bounds".into(),
+        ));
     }
+    let layout = StagingLayout::from_spec(spec)?;
+    let staged = layout.staged.clone();
+    let partial = layout.partial.clone();
+    let sidecar_path = layout.sidecar.clone();
+    if let Some(parent) = partial.parent() {
+        ensure_staging_parent(&spec.library_root, parent)?;
+    }
+    let _lock = staging::acquire_writer_lock(&layout.lock, true)?;
     if let Ok(meta) = fs::symlink_metadata(&staged) {
         // A complete staged file with no `.partial` beside it is the crash
         // window after the final rename: the bytes are all here, only the job
         // row was not advanced. Hand it to the install gate instead of
         // refusing forever.
-        if meta.is_file() && !partial.exists() && meta.len() == spec.file_len {
-            let _ = fs::remove_file(&sidecar_path);
+        if meta.is_file() && meta.len() == spec.file_len {
+            let proof = sidecar::load(&sidecar_path)?.ok_or_else(|| {
+                TransferError::Sidecar("staged file has no durable range proof".into())
+            })?;
+            staging::check_source(&proof, spec)?;
+            if !staging::source_is_known(&proof) {
+                return Err(TransferError::Sidecar(
+                    "legacy staged file has no remote identity; refusing to adopt its bytes".into(),
+                ));
+            }
+            let proof = verify_recorded_ranges(proof, &staged)?;
+            if !remaining(&plan_ranges(spec.file_len, proof.range_len), &proof).is_empty() {
+                return Err(TransferError::Sidecar(
+                    "staged file no longer matches its range proof".into(),
+                ));
+            }
+            match fs::symlink_metadata(&partial) {
+                Ok(other)
+                    if other.is_file()
+                        && other.dev() == meta.dev()
+                        && other.ino() == meta.ino() =>
+                {
+                    fs::remove_file(&partial).map_err(|e| TransferError::io(&partial, e))?;
+                }
+                Ok(_) => {
+                    return Err(TransferError::Path(
+                        "staged and partial refer to different files".into(),
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(TransferError::io(&partial, err)),
+            }
             on_progress(spec.file_len, spec.file_len);
             return Ok(PullOutcome {
                 staged,
@@ -102,12 +135,19 @@ where
     }
 
     let mut sidecar = match sidecar::load(&sidecar_path)? {
-        Some(existing) => {
+        Some(mut existing) => {
+            staging::check_source(&existing, spec)?;
             if existing.file_len != spec.file_len {
                 return Err(TransferError::Sidecar(format!(
                     "sidecar file_len {} != {}",
                     existing.file_len, spec.file_len
                 )));
+            }
+            // Old sidecars prove only local bytes, not which remote supplied
+            // them. Preserve their range geometry but fetch every range before
+            // attaching the requested source identity.
+            if !staging::source_is_known(&existing) {
+                existing.ranges.clear();
             }
             verify_recorded_ranges(existing, &partial)?
         }
@@ -118,6 +158,9 @@ where
             Sidecar::new(spec.file_len, spec.range_len)
         }
     };
+    sidecar.remote_root = spec.remote.root_id().to_string();
+    sidecar.remote_path = spec.remote.rel_path().to_string_lossy().into_owned();
+    sidecar::save(&sidecar_path, &sidecar)?;
     let range_len = sidecar.range_len;
     let planned = plan_ranges(spec.file_len, range_len);
     let mut todo = remaining(&planned, &sidecar);
@@ -130,6 +173,7 @@ where
             .create(true)
             .write(true)
             .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&partial)
             .map_err(|err| TransferError::io(&partial, err))?;
         file.set_len(spec.file_len)
@@ -175,8 +219,13 @@ where
     // Every range is on disk and recorded: this is where the file becomes a
     // whole. Rename first; a crash before the sidecar is removed leaves
     // (staged, sidecar, no partial), which the check at the top recognises.
-    fs::rename(&partial, &staged).map_err(|err| TransferError::io(&staged, err))?;
-    fs::remove_file(&sidecar_path).map_err(|err| TransferError::io(&sidecar_path, err))?;
+    fs::hard_link(&partial, &staged).map_err(|err| TransferError::io(&staged, err))?;
+    fs::remove_file(&partial).map_err(|err| TransferError::io(&partial, err))?;
+    if let Some(parent) = staged.parent() {
+        File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|err| TransferError::io(parent, err))?;
+    }
     Ok(PullOutcome {
         staged,
         resumed_ranges,
@@ -184,14 +233,46 @@ where
     })
 }
 
+fn ensure_staging_parent(root: &Path, parent: &Path) -> Result<(), TransferError> {
+    let rel = parent
+        .strip_prefix(root)
+        .map_err(|e| TransferError::Path(e.to_string()))?;
+    let mut path = root.to_path_buf();
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(TransferError::Path("invalid staging parent".into()));
+        }
+        path.push(component);
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(TransferError::io(&path, err)),
+        }
+        if !fs::symlink_metadata(&path)
+            .map_err(|e| TransferError::io(&path, e))?
+            .is_dir()
+        {
+            return Err(TransferError::Path(
+                "staging directories must not be symlinks".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn sidecar_done(sidecar: &Sidecar) -> u64 {
     sidecar.ranges.iter().map(|r| r.len).sum()
 }
 
 fn verify_recorded_ranges(mut sidecar: Sidecar, partial: &Path) -> Result<Sidecar, TransferError> {
-    if !partial.exists() {
-        sidecar.ranges.clear();
-        return Ok(sidecar);
+    match fs::symlink_metadata(partial) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(TransferError::Path("partial must be a regular file".into())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            sidecar.ranges.clear();
+            return Ok(sidecar);
+        }
+        Err(err) => return Err(TransferError::io(partial, err)),
     }
     let mut file = File::open(partial).map_err(|err| TransferError::io(partial, err))?;
     let mut kept = Vec::new();
@@ -215,6 +296,7 @@ fn verify_recorded_ranges(mut sidecar: Sidecar, partial: &Path) -> Result<Sideca
 fn write_range(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), TransferError> {
     let mut file = OpenOptions::new()
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|err| TransferError::io(path, err))?;
     file.seek(SeekFrom::Start(offset))
@@ -229,7 +311,7 @@ fn write_range(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), TransferErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mediaops_core::TitleId;
+    use mediaops_core::{TitleId, staging_path};
     use std::sync::Mutex;
 
     struct Mem {
@@ -307,12 +389,14 @@ mod tests {
         assert!(!leftover.exists());
         let mut sidecar = out.staged.clone();
         sidecar.as_mut_os_string().push(".partial.b3");
-        assert!(!sidecar.exists());
+        assert!(
+            sidecar.exists(),
+            "proof retained until durable installation"
+        );
 
         // Crash window: the file is fully staged but the job row never moved.
         // The next pull must hand it on, not refuse, and must not fetch.
         let hits_before = src.hits.lock().expect("hits").len();
-        fs::write(&sidecar, b"{}").expect("stale sidecar");
         let again = pull_file(src.clone(), &spec).await.expect("already staged");
         assert!(again.already_staged);
         assert_eq!(again.staged, out.staged);
@@ -321,7 +405,10 @@ mod tests {
             hits_before,
             "no refetch"
         );
-        assert!(!sidecar.exists(), "stale sidecar is cleaned up");
+        assert!(
+            sidecar.exists(),
+            "range proof remains available for restart verification"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -348,6 +435,53 @@ mod tests {
         };
         let err = pull_file(src, &spec).await.expect_err("wrong shape");
         assert!(matches!(err, TransferError::Path(_)), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn staged_corruption_or_another_same_size_remote_cannot_reuse_proof() {
+        let root = scratch("proof-binding");
+        let body = b"12345678".to_vec();
+        let src = Arc::new(Mem {
+            body: body.clone(),
+            hits: Mutex::new(Vec::new()),
+        });
+        let mut spec = PullSpec {
+            library_root: root.clone(),
+            title_id: TitleId::movie("603").expect("id"),
+            final_name: "The.Matrix.(1999).mkv".into(),
+            remote: remote(),
+            file_len: 8,
+            range_len: 4,
+            concurrency: 1,
+        };
+        let out = pull_file(src.clone(), &spec).await.expect("pull");
+        let old_remote = spec.remote.clone();
+        spec.remote = RemoteRef::from_wire_parts("different-root".into(), "other.mkv".into())
+            .expect("other remote");
+        assert!(
+            pull_file(src.clone(), &spec).await.is_err(),
+            "remote identity is part of durable proof"
+        );
+        spec.remote = old_remote;
+        fs::write(&out.staged, b"87654321").expect("changed staged bytes");
+        assert!(
+            pull_file(src.clone(), &spec).await.is_err(),
+            "same length cannot pass a digest check"
+        );
+        assert_eq!(fs::read(&out.staged).expect("preserved"), b"87654321");
+        fs::write(&out.staged, &body).expect("original bytes");
+        let mut path = out.staged.clone();
+        path.as_mut_os_string().push(".partial.b3");
+        let mut proof = sidecar::load(&path).expect("proof").expect("present");
+        proof.remote_root.clear();
+        proof.remote_path.clear();
+        sidecar::save(&path, &proof).expect("legacy proof");
+        let err = pull_file(src, &spec)
+            .await
+            .expect_err("unbound full staging");
+        assert!(err.to_string().contains("no remote identity"), "{err}");
+        assert_eq!(fs::read(&out.staged).expect("legacy bytes preserved"), body);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -422,6 +556,8 @@ mod tests {
             f.sync_all().expect("sync");
         }
         let mut sc = Sidecar::new(body.len() as u64, 4);
+        sc.remote_root = remote().root_id().into();
+        sc.remote_path = remote().rel_path().to_string_lossy().into_owned();
         sc.record(0, 4, Blake3Hex::of_bytes(&body[..4]).to_string());
         sidecar::save(&sidecar_path, &sc).expect("sidecar");
 
@@ -452,6 +588,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_sidecar_refetches_same_size_different_source_with_old_range_length() {
+        let root = scratch("legacy-source");
+        let title = TitleId::movie("603").expect("id");
+        let staged = root.join(staging_path(&title, "The.Matrix.(1999).mkv").expect("stage"));
+        let mut partial = staged.clone();
+        partial.as_mut_os_string().push(".partial");
+        let mut proof_path = staged.clone();
+        proof_path.as_mut_os_string().push(".partial.b3");
+        fs::create_dir_all(partial.parent().expect("parent")).expect("mkdir");
+        let source_a = b"AAAAaaaaaa";
+        let source_b = b"BBBBbbbbbb";
+        fs::write(&partial, source_a).expect("old partial");
+        let mut proof = Sidecar::new(10, 4);
+        proof.record(0, 4, Blake3Hex::of_bytes(&source_a[..4]).to_string());
+        sidecar::save(&proof_path, &proof).expect("legacy proof");
+        let src = Arc::new(Mem {
+            body: source_b.to_vec(),
+            hits: Mutex::new(Vec::new()),
+        });
+        let spec = PullSpec {
+            library_root: root.clone(),
+            title_id: title,
+            final_name: "The.Matrix.(1999).mkv".into(),
+            remote: remote(),
+            file_len: 10,
+            range_len: 64,
+            concurrency: 1,
+        };
+        let out = pull_file(src.clone(), &spec).await.expect("safe migration");
+        assert_eq!(fs::read(out.staged).expect("staged"), source_b);
+        assert!(out.resumed_ranges.is_empty());
+        assert_eq!(
+            *src.hits.lock().expect("hits"),
+            vec![(0, 4), (4, 4), (8, 2)]
+        );
+        let proof = sidecar::load(&proof_path).expect("proof").expect("present");
+        assert_eq!(proof.range_len, 4);
+        assert_eq!(proof.remote_root, spec.remote.root_id());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn resume_refetches_when_sidecar_hash_does_not_match_partial() {
         let root = scratch("corrupt");
         let title = TitleId::movie("603").expect("id");
@@ -470,6 +648,8 @@ mod tests {
             f.sync_all().expect("sync");
         }
         let mut sc = Sidecar::new(body.len() as u64, 4);
+        sc.remote_root = remote().root_id().into();
+        sc.remote_path = remote().rel_path().to_string_lossy().into_owned();
         sc.record(0, 4, Blake3Hex::of_bytes(&body[..4]).to_string());
         sidecar::save(&sidecar_path, &sc).expect("sidecar");
 

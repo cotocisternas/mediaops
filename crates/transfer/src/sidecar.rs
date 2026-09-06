@@ -12,6 +12,10 @@ pub const SIDECAR_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sidecar {
+    #[serde(default)]
+    pub remote_root: String,
+    #[serde(default)]
+    pub remote_path: String,
     pub version: u32,
     pub file_len: u64,
     pub range_len: u64,
@@ -28,6 +32,8 @@ pub struct SidecarRange {
 impl Sidecar {
     pub fn new(file_len: u64, range_len: u64) -> Self {
         Self {
+            remote_root: String::new(),
+            remote_path: String::new(),
             version: SIDECAR_VERSION,
             file_len,
             range_len,
@@ -53,8 +59,15 @@ impl Sidecar {
 }
 
 pub fn load(path: &Path) -> Result<Option<Sidecar>, TransferError> {
-    if !path.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(TransferError::Sidecar(
+                "sidecar must be a regular file".into(),
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(TransferError::io(path, err)),
     }
     let text = fs::read_to_string(path).map_err(|err| TransferError::io(path, err))?;
     let sidecar: Sidecar =
@@ -65,8 +78,10 @@ pub fn load(path: &Path) -> Result<Option<Sidecar>, TransferError> {
             sidecar.version
         )));
     }
-    if sidecar.range_len == 0 {
-        return Err(TransferError::Sidecar("range_len must be > 0".into()));
+    if sidecar.range_len == 0 || sidecar.range_len > 64 * mediaops_core::Bytes::MIB {
+        return Err(TransferError::Sidecar(
+            "range_len must be > 0 and at most 64 MiB".into(),
+        ));
     }
     for range in &sidecar.ranges {
         range_buf_len(sidecar.file_len, range.offset, range.len)?;
@@ -84,6 +99,9 @@ pub(crate) fn range_buf_len(file_len: u64, offset: u64, len: u64) -> Result<usiz
             "range offset {offset} + len {len} exceeds file_len {file_len}"
         )));
     }
+    if len == 0 || len > 64 * mediaops_core::Bytes::MIB {
+        return Err(TransferError::Sidecar("range must be 1..64 MiB".into()));
+    }
     usize::try_from(len)
         .map_err(|_| TransferError::Sidecar(format!("range len {len} overflows usize")))
 }
@@ -95,12 +113,24 @@ pub fn save(path: &Path, sidecar: &Sidecar) -> Result<(), TransferError> {
     let tmp = path.with_extension("b3.tmp");
     let json = serde_json::to_vec_pretty(sidecar)
         .map_err(|err| TransferError::Sidecar(err.to_string()))?;
-    let mut file = File::create(&tmp).map_err(|err| TransferError::io(&tmp, err))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|err| TransferError::io(&tmp, err))?;
     file.write_all(&json)
         .map_err(|err| TransferError::io(&tmp, err))?;
     file.sync_all()
         .map_err(|err| TransferError::io(&tmp, err))?;
     fs::rename(&tmp, path).map_err(|err| TransferError::io(path, err))?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|err| TransferError::io(parent, err))?;
+    }
     Ok(())
 }
 
