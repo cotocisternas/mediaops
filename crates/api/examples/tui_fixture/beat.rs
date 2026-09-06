@@ -24,7 +24,31 @@ pub async fn wait_connect(socket: &Path, actor: Actor) -> Result<HomeApi, Fixtur
 }
 
 pub async fn heartbeat_all(socket: &Path, now: i64) -> Result<(), FixtureError> {
-    heartbeat_kind(socket, WorkerKind::Inventory, now).await?;
+    let inventory = wait_connect(socket, Actor::Inventory).await?;
+    let mut node = inventory.begin_inventory().await?;
+    let generation = match &node.status {
+        mediaops_core::StatusBody::Node(status) => status.list_generation + 1,
+        _ => return Err(FixtureError::Invalid("inventory status missing".into())),
+    };
+    for kind in [mediaops_core::Kind::RemoteFile, mediaops_core::Kind::Hold] {
+        for mut obj in inventory.list(Some(kind)).await? {
+            match &mut obj.status {
+                mediaops_core::StatusBody::RemoteFile(status) => {
+                    status.list_generation = generation
+                }
+                mediaops_core::StatusBody::Hold(status) => status.list_generation = generation,
+                _ => continue,
+            }
+            inventory.patch(obj, "status").await?;
+        }
+    }
+    if let mediaops_core::StatusBody::Node(status) = &mut node.status {
+        status.ready = true;
+        status.list_generation = generation;
+        status.list_completed_unix = now;
+        status.last_heartbeat_unix = now;
+    }
+    inventory.patch(node, "status").await?;
     heartbeat_kind(socket, WorkerKind::Pull, now).await?;
     heartbeat_kind(socket, WorkerKind::Scheduler, now).await?;
     Ok(())

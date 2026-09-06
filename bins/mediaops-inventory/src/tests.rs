@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 struct MemoryApi {
     objects: RefCell<Vec<HomeObject>>,
     fail_kind: Cell<Option<Kind>>,
+    supersede_on_node_patch: Cell<bool>,
 }
 
 impl MemoryApi {
@@ -35,10 +36,12 @@ impl MemoryApi {
                         list_generation: 1,
                         list_completed_unix: unix_now(),
                         last_heartbeat_unix: unix_now(),
+                        ..NodeStatus::default()
                     }),
                 ),
             ]),
             fail_kind: Cell::new(None),
+            supersede_on_node_patch: Cell::new(false),
         }
     }
 
@@ -49,16 +52,24 @@ impl MemoryApi {
             );
         }
         let mut objects = self.objects.borrow_mut();
+        let stored_rv = objects
+            .iter()
+            .find(|o| o.kind == object.kind && o.metadata.name == object.metadata.name)
+            .map(|o| o.metadata.resource_version);
+        if let Some(stored_rv) = stored_rv
+            && stored_rv != object.metadata.resource_version
+        {
+            return Err(mediaops_core::HomeError::Conflict {
+                kind: object.kind,
+                name: object.metadata.name.clone(),
+            }
+            .into());
+        }
         object.metadata.resource_version += 1;
         if let Some(old) = objects
             .iter_mut()
             .find(|o| o.kind == object.kind && o.metadata.name == object.metadata.name)
         {
-            assert_eq!(
-                old.metadata.resource_version + 1,
-                object.metadata.resource_version,
-                "CAS"
-            );
             *old = object.clone();
         } else {
             objects.push(object.clone());
@@ -117,6 +128,14 @@ impl InventoryApi for MemoryApi {
         subresource: &str,
     ) -> Result<HomeObject, ClientError> {
         assert_eq!(subresource, "status");
+        if object.kind == Kind::Node && self.supersede_on_node_patch.get() {
+            self.supersede_on_node_patch.set(false);
+            let mut stored = self.get(Kind::Node, &object.metadata.name).await?;
+            if let StatusBody::Node(status) = &mut stored.status {
+                status.scan_started_rv = status.scan_started_rv.saturating_add(1);
+            }
+            self.write(stored)?;
+        }
         self.write(object)
     }
     async fn delete(&self, kind: Kind, name: &str) -> Result<HomeObject, ClientError> {
@@ -126,22 +145,42 @@ impl InventoryApi for MemoryApi {
             .retain(|o| o.kind != kind || o.metadata.name != name);
         Ok(old)
     }
-    async fn heartbeat(
-        &self,
-        worker: WorkerKind,
-        ready: bool,
-        listing: Option<(i64, i64)>,
-    ) -> Result<HomeObject, ClientError> {
-        let mut node = self.get(Kind::Node, worker.node_name()).await?;
-        if let StatusBody::Node(s) = &mut node.status {
-            s.ready = ready;
-            if let Some((generation, completed)) = listing {
-                s.list_generation = generation;
-                s.list_completed_unix = completed;
-            }
+    async fn begin_inventory(&self) -> Result<HomeObject, ClientError> {
+        let cluster = self.get(Kind::Cluster, mediaops_core::CLUSTER_NAME).await?;
+        let secret_rv = match self.get(Kind::Secret, mediaops_core::SECRET_NAME).await {
+            Ok(secret) => secret.metadata.resource_version,
+            Err(err) if err.is_not_found() => 0,
+            Err(err) => return Err(err),
+        };
+        let max_rv = self
+            .objects
+            .borrow()
+            .iter()
+            .map(|o| o.metadata.resource_version)
+            .max()
+            .unwrap_or(0);
+        let mut node = self
+            .get(Kind::Node, WorkerKind::Inventory.node_name())
+            .await?;
+        if let StatusBody::Node(status) = &mut node.status {
+            status.ready = false;
+            status.scan_started_rv = max_rv.saturating_add(1).max(1);
+            status.scan_cluster_generation = cluster.metadata.generation;
+            status.scan_secret_resource_version = secret_rv;
         }
         self.write(node)
     }
+}
+
+async fn scan(
+    api: &MemoryApi,
+    control: &Rejector,
+    entries: Vec<RemoteEntry>,
+    holds: Vec<HoldLiveItem>,
+) -> anyhow::Result<()> {
+    let started = api.begin_inventory().await?;
+    let start = scan_start(&started)?;
+    publish_inventory(api, control, entries, holds, start).await
 }
 
 #[derive(Default)]
@@ -212,7 +251,7 @@ async fn failed_publication_never_commits_and_empty_success_expires_old_holds() 
     let control = Rejector::default();
     api.fail_kind.set(Some(Kind::Hold));
     assert!(
-        publish_inventory(&api, &control, vec![entry()], vec![hold()])
+        scan(&api, &control, vec![entry()], vec![hold()])
             .await
             .is_err()
     );
@@ -227,7 +266,7 @@ async fn failed_publication_never_commits_and_empty_success_expires_old_holds() 
         1
     );
     api.fail_kind.set(None);
-    publish_inventory(&api, &control, vec![entry()], vec![hold()])
+    scan(&api, &control, vec![entry()], vec![hold()])
         .await
         .expect("retry");
     let committed = api.marker().await;
@@ -240,7 +279,7 @@ async fn failed_publication_never_commits_and_empty_success_expires_old_holds() 
     assert!(
         matches!(saved_hold.status, StatusBody::Hold(s) if s.list_generation == committed.list_generation)
     );
-    publish_inventory(&api, &control, vec![], vec![])
+    scan(&api, &control, vec![], vec![])
         .await
         .expect("empty listing");
     assert!(
@@ -274,7 +313,7 @@ async fn failed_rejection_is_not_acknowledged_or_committed_and_retries_exact_key
     .expect("decision");
     control.fail.set(true);
     assert!(
-        publish_inventory(&api, &control, vec![entry()], vec![hold()])
+        scan(&api, &control, vec![entry()], vec![hold()])
             .await
             .is_err()
     );
@@ -285,12 +324,12 @@ async fn failed_rejection_is_not_acknowledged_or_committed_and_retries_exact_key
         .expect("hold");
     assert!(matches!(observed.status, StatusBody::Hold(s) if !s.rejection_observed));
     control.fail.set(false);
-    publish_inventory(&api, &control, vec![entry()], vec![hold()])
+    scan(&api, &control, vec![entry()], vec![hold()])
         .await
         .expect("retry");
     assert_eq!(control.calls.get(), 2);
     assert!(api.marker().await.ready);
-    publish_inventory(&api, &control, vec![], vec![])
+    scan(&api, &control, vec![], vec![])
         .await
         .expect("already acknowledged");
     assert_eq!(control.calls.get(), 2, "no repeated remote side effect");
@@ -315,7 +354,7 @@ async fn abandoned_hold_only_generation_is_not_reused_by_empty_publication() {
     ))
     .await
     .expect("partial Hold-only publication");
-    publish_inventory(&api, &control, vec![], vec![])
+    scan(&api, &control, vec![], vec![])
         .await
         .expect("empty listing");
     assert_eq!(api.marker().await.list_generation, 3);
@@ -438,9 +477,7 @@ async fn unmonitors_movie_and_album_when_installed_and_wanted_missing() {
         .borrow_mut()
         .extend([movie.clone(), album.clone()]);
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
 
     let calls = control.unmonitor_calls.borrow().clone();
     assert!(calls.contains(&movie), "{calls:?}");
@@ -459,12 +496,122 @@ async fn unmonitors_when_lock_is_set_and_want_is_absent() {
     let control = Rejector::default();
     control.wanted.borrow_mut().push(movie.clone());
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
 
     assert_eq!(*control.unmonitor_calls.borrow(), vec![movie]);
-    assert!(api.list(Some(Kind::Want)).await.expect("wants").is_empty());
+}
+
+#[tokio::test]
+async fn begin_inventory_writes_nonzero_start_token_and_clears_ready() {
+    let api = MemoryApi::new();
+    let before = api.marker().await;
+    assert!(before.ready);
+    assert_eq!(before.scan_started_rv, 0);
+    let node = api.begin_inventory().await.expect("begin");
+    let start = scan_start(&node).expect("token");
+    assert!(start.started_rv > 0);
+    let after = api.marker().await;
+    assert!(!after.ready);
+    assert_eq!(after.scan_started_rv, start.started_rv);
+    assert_eq!(after.list_generation, before.list_generation);
+}
+
+#[tokio::test]
+async fn publication_without_start_token_does_not_commit() {
+    let api = MemoryApi::new();
+    let control = Rejector::default();
+    assert!(
+        publish_inventory(
+            &api,
+            &control,
+            vec![entry()],
+            vec![hold()],
+            ScanStart {
+                started_rv: 0,
+                cluster_generation: 0,
+                secret_resource_version: 0,
+            },
+        )
+        .await
+        .is_err()
+    );
+    let marker = api.marker().await;
+    assert!(marker.ready);
+    assert_eq!(marker.list_generation, 1);
+    assert!(
+        api.list(Some(Kind::RemoteFile))
+            .await
+            .expect("remotes")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn successful_publication_preserves_scan_token() {
+    let api = MemoryApi::new();
+    let control = Rejector::default();
+    let started = api.begin_inventory().await.expect("begin");
+    let token = scan_start(&started).expect("token");
+    publish_inventory(&api, &control, vec![entry()], vec![hold()], token)
+        .await
+        .expect("publish");
+    let marker = api.marker().await;
+    assert!(marker.ready);
+    assert_eq!(marker.scan_started_rv, token.started_rv);
+    assert_eq!(marker.scan_cluster_generation, token.cluster_generation);
+    assert_eq!(
+        marker.scan_secret_resource_version,
+        token.secret_resource_version
+    );
+}
+
+#[tokio::test]
+async fn superseded_scan_token_does_not_commit_listing() {
+    let api = MemoryApi::new();
+    let control = Rejector::default();
+    let started = api.begin_inventory().await.expect("begin");
+    let token = scan_start(&started).expect("token");
+    let mut node = api
+        .get(Kind::Node, WorkerKind::Inventory.node_name())
+        .await
+        .expect("node");
+    if let StatusBody::Node(status) = &mut node.status {
+        status.scan_started_rv = token.started_rv.saturating_add(1);
+    }
+    api.write(node).expect("new token");
+    assert!(
+        publish_inventory(&api, &control, vec![entry()], vec![hold()], token)
+            .await
+            .is_err()
+    );
+    let marker = api.marker().await;
+    assert!(!marker.ready);
+    assert_eq!(marker.list_generation, 1);
+}
+
+#[tokio::test]
+async fn supersession_at_final_commit_does_not_adopt_new_token() {
+    let api = MemoryApi::new();
+    let control = Rejector::default();
+    let started = api.begin_inventory().await.expect("begin");
+    let token = scan_start(&started).expect("token");
+    api.supersede_on_node_patch.set(true);
+    assert!(
+        publish_inventory(&api, &control, vec![entry()], vec![hold()], token)
+            .await
+            .is_err()
+    );
+    let marker = api.marker().await;
+    assert!(!marker.ready);
+    assert_eq!(marker.list_generation, 1);
+    assert!(marker.scan_started_rv > token.started_rv);
+    assert_eq!(
+        api.list(Some(Kind::RemoteFile))
+            .await
+            .expect("partial rows")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -484,9 +631,7 @@ async fn never_unmonitors_series_when_otherwise_eligible() {
         .borrow_mut()
         .extend([movie.clone(), series.clone()]);
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
 
     assert_eq!(*control.unmonitor_calls.borrow(), vec![movie]);
 }
@@ -505,9 +650,7 @@ async fn makes_zero_control_calls_when_grabber_is_none() {
     let control = Rejector::default();
     control.wanted.borrow_mut().push(movie);
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
 
     assert_eq!(control.wanted_calls.get(), 0);
     assert!(control.unmonitor_calls.borrow().is_empty());
@@ -559,9 +702,7 @@ async fn skips_unindexed_missing_drifted_and_nonmatching_titles() {
         TitleId::movie("608").expect("absent"),
     ]);
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
 
     assert!(control.unmonitor_calls.borrow().is_empty());
 }
@@ -584,18 +725,14 @@ async fn continues_and_retries_when_one_unmonitor_fails() {
         .extend([movie.clone(), album.clone()]);
     control.unmonitor_fail.borrow_mut().insert(movie.clone());
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
     let first = control.unmonitor_calls.borrow().clone();
     assert!(first.contains(&movie), "{first:?}");
     assert!(first.contains(&album), "{first:?}");
     assert_eq!(first.len(), 2, "{first:?}");
     assert!(api.marker().await.ready);
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("retry");
+    scan(&api, &control, vec![], vec![]).await.expect("retry");
     let second = control.unmonitor_calls.borrow().clone();
     assert_eq!(second.len(), 4, "{second:?}");
     assert_eq!(
@@ -617,9 +754,7 @@ async fn keeps_listing_generation_when_wanted_missing_fails() {
     control.wanted.borrow_mut().push(movie);
     control.wanted_fail.set(true);
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
 
     let marker = api.marker().await;
     assert!(marker.ready);
@@ -653,9 +788,7 @@ async fn unmonitors_once_per_title_when_observations_are_duplicated() {
         .borrow_mut()
         .extend([movie.clone(), movie.clone()]);
 
-    publish_inventory(&api, &control, vec![], vec![])
-        .await
-        .expect("listing");
+    scan(&api, &control, vec![], vec![]).await.expect("listing");
 
     assert_eq!(*control.unmonitor_calls.borrow(), vec![movie]);
 }

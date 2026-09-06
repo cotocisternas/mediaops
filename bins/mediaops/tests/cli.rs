@@ -148,6 +148,17 @@ fn reconcile_json_and_output_conflict_is_usage_before_connect() {
 }
 
 #[test]
+fn sync_invalid_output_is_usage_before_connect() {
+    assert_usage_before_connect(&["sync", "-o", "yaml"], false);
+}
+
+#[test]
+fn sync_json_and_output_conflict_is_usage_before_connect() {
+    assert_usage_before_connect(&["--json", "sync", "-o", "json"], true);
+    assert_usage_before_connect(&["sync", "--json", "-o", "table"], true);
+}
+
+#[test]
 fn reconcile_legacy_json_error_is_one_envelope() {
     let output = bin().args(["--json", "reconcile"]).output().expect("cli");
     assert_ne!(output.status.code(), Some(0));
@@ -213,6 +224,7 @@ fn help_exits_ok() {
         "reclaim",
         "doctor",
         "new-machine",
+        "sync",
     ] {
         assert!(stdout.contains(verb), "help must mention {verb}: {stdout}");
     }

@@ -67,6 +67,7 @@ mod tests {
                 list_completed_unix: listed,
                 ready,
                 last_heartbeat_unix: beat,
+                ..NodeStatus::default()
             }),
         )
     }

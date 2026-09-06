@@ -27,6 +27,7 @@ pub(crate) fn spawn(inner: Arc<Inner>) -> tokio::task::JoinHandle<()> {
 }
 
 async fn reconcile_once(inner: &Inner) -> Result<(), StoreError> {
+    crate::sync_controller::reconcile(inner).await?;
     {
         let _guard = inner.mutation.lock().await;
         refuse_revoked_jobs(&inner.store).await?;
@@ -168,7 +169,11 @@ async fn reconcile_once(inner: &Inner) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn held_remote(holds: &[&HomeObject], remote: &RemoteFileStatus, title_id: &str) -> bool {
+pub(crate) fn held_remote(
+    holds: &[&HomeObject],
+    remote: &RemoteFileStatus,
+    title_id: &str,
+) -> bool {
     holds.iter().any(|h| match (&h.spec, &h.status) {
         (Spec::Hold(spec), StatusBody::Hold(status)) => {
             (status.remote_root == remote.root_id && status.remote_path == remote.rel_path)
@@ -308,12 +313,7 @@ async fn create_pull_job(
         .map_err(|e| StoreError::Sqlite(e.to_string()))?
         .to_string_lossy()
         .into_owned();
-    let key = match placement.file_key() {
-        FileKey::Whole => "whole".into(),
-        FileKey::Episode { season, episode } => format!("s{season}-e{episode}"),
-        FileKey::Track { disc, track } => format!("d{disc}-t{track}"),
-    };
-    let name = format!("pull-{}-{key}", id.staging_token());
+    let name = crate::sync_plan::job_name(id, placement);
     if inner.store.get(Kind::Job, &name).await?.is_some() {
         return Ok(());
     }
@@ -374,6 +374,14 @@ pub(crate) fn authorization_refusal(
     job: &JobSpec,
     now: i64,
 ) -> Option<&'static str> {
+    if !job.sync_name.is_empty()
+        && !objects.iter().any(|obj| {
+            matches!(&obj.spec,
+        Spec::Cluster(config) if config.roots.iter().any(|root| root.id == job.remote_root))
+        })
+    {
+        return Some("Sync source root is no longer allowlisted");
+    }
     let Some(inventory) = objects.iter().find_map(|o| match &o.status {
         StatusBody::Node(s) if o.metadata.name == WorkerKind::Inventory.node_name() => Some(s),
         _ => None,
@@ -407,10 +415,12 @@ pub(crate) fn authorization_refusal(
         })
         .collect();
     if job.hold_name.is_empty() {
-        if !objects.iter().any(|o| {
-            matches!((&o.spec, &o.status), (Spec::Want(s), StatusBody::Want(st))
+        if job.sync_name.is_empty()
+            && !objects.iter().any(|o| {
+                matches!((&o.spec, &o.status), (Spec::Want(s), StatusBody::Want(st))
             if s.title_id == job.title_id && st.phase != WantPhase::Dropped)
-        }) {
+            })
+        {
             return Some("Job Want is absent or dropped");
         }
         if !remote.parse_ok
@@ -434,6 +444,9 @@ pub(crate) fn authorization_refusal(
         let (Spec::Hold(spec), StatusBody::Hold(status)) = (&hold.spec, &hold.status) else {
             return Some("invalid Hold");
         };
+        if !job.sync_name.is_empty() && crate::sync_authority::hold_conflict(&holds, job, hold) {
+            return Some("conflicting Hold records refer to this source or unresolved placement");
+        }
         if spec.decision != HoldDecisionSpec::Approved
             || status.remote_root != job.remote_root
             || status.remote_path != job.remote_path
@@ -473,7 +486,18 @@ pub(crate) async fn refuse_revoked_jobs(store: &ApiStore) -> Result<(), StoreErr
         if !spec.node_name.is_empty() || status.phase != JobPhase::Pending {
             continue;
         }
-        let message = if spec.hold_name.is_empty() {
+        let message = if !spec.sync_name.is_empty() {
+            match crate::sync_authority::identity_refusal(&objects, job) {
+                Some(reason) => reason,
+                None if crate::sync_controller::inventory_generation(&objects).is_none() => {
+                    continue;
+                }
+                None => match authorization_refusal(&objects, spec, unix_now()) {
+                    Some(reason) => reason,
+                    None => continue,
+                },
+            }
+        } else if spec.hold_name.is_empty() {
             let live_want = objects.iter().any(|o| {
                 matches!((&o.spec, &o.status), (Spec::Want(s), StatusBody::Want(st))
                     if s.title_id == spec.title_id && st.phase != WantPhase::Dropped)
@@ -1332,6 +1356,7 @@ mod tests {
                 last_heartbeat_unix: unix_now(),
                 list_generation: 1,
                 list_completed_unix: unix_now(),
+                ..NodeStatus::default()
             }),
         )
     }

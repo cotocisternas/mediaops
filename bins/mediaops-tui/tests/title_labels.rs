@@ -20,6 +20,7 @@ fn cache() -> ObjectCache {
                 list_generation: 1,
                 last_heartbeat_unix: 100,
                 list_completed_unix: 100,
+                ..NodeStatus::default()
             }),
         )],
     );

@@ -1018,6 +1018,7 @@ fn render_wide(items: &[HomeObject]) -> String {
 
 fn phase_of(obj: &HomeObject) -> String {
     match &obj.status {
+        StatusBody::Sync(s) => s.phase.as_str().to_string(),
         StatusBody::Job(s) => s.phase.as_str().to_string(),
         StatusBody::Want(s) => s.phase.as_str().to_string(),
         StatusBody::Node(s) => {
@@ -1072,6 +1073,20 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_sync_table_reports_its_planning_phase() {
+        let obj = HomeObject::new(
+            Kind::Sync,
+            "sync-123",
+            Spec::Sync(mediaops_core::SyncSpec::default()),
+            StatusBody::Sync(mediaops_core::SyncStatus {
+                phase: mediaops_core::SyncPhase::Scheduled,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(format_row(&obj), "sync-123\tSync\tscheduled");
+    }
     use std::path::Path;
     use std::time::Duration;
 
@@ -1446,6 +1461,7 @@ mod tests {
                 last_heartbeat_unix: unix_now(),
                 list_generation: 1,
                 list_completed_unix: unix_now(),
+                ..NodeStatus::default()
             }),
         ))
         .await

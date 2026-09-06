@@ -67,12 +67,7 @@ async fn run(api_socket: &Path, gw: &Path, tls: &Path) -> anyhow::Result<()> {
         }
     });
     loop {
-        let result = async {
-            // Invalidate before replacing any row. The final Node write is the commit marker.
-            api.heartbeat(WorkerKind::Inventory, false, None).await?;
-            refresh(&api, gw, tls).await
-        }
-        .await;
+        let result = refresh(&api, gw, tls).await;
         if let Err(err) = result {
             tracing::warn!(error = %err, "inventory refresh failed");
         }
@@ -95,12 +90,18 @@ async fn wait_api(socket: &Path) -> anyhow::Result<HomeApi> {
     }
 }
 
+async fn start_scan(api: &impl InventoryApi) -> anyhow::Result<ScanStart> {
+    let started = api.begin_inventory().await?;
+    scan_start(&started)
+}
+
 async fn refresh(api: &HomeApi, gw: &Path, tls: &Path) -> anyhow::Result<()> {
+    let start = start_scan(api).await?;
     let channel = connect_home(gw, tls).await?;
     let entries = list_entries(channel.clone()).await?;
     let control = ControlPortClient::new(ControlServiceClient::new(channel));
     let holds = control.hold_list().await?;
-    publish_inventory(api, &control, entries, holds).await
+    publish_inventory(api, &control, entries, holds, start).await
 }
 
 /// Small persistence port: publication failures are testable without WAN or sqlite.
@@ -128,12 +129,7 @@ trait InventoryApi {
         kind: Kind,
         name: &str,
     ) -> Result<HomeObject, mediaops_home_client::ClientError>;
-    async fn heartbeat(
-        &self,
-        worker: WorkerKind,
-        ready: bool,
-        listing: Option<(i64, i64)>,
-    ) -> Result<HomeObject, mediaops_home_client::ClientError>;
+    async fn begin_inventory(&self) -> Result<HomeObject, mediaops_home_client::ClientError>;
 }
 
 impl InventoryApi for HomeApi {
@@ -170,13 +166,8 @@ impl InventoryApi for HomeApi {
     ) -> Result<HomeObject, mediaops_home_client::ClientError> {
         HomeApi::delete(self, kind, name).await
     }
-    async fn heartbeat(
-        &self,
-        worker: WorkerKind,
-        ready: bool,
-        listing: Option<(i64, i64)>,
-    ) -> Result<HomeObject, mediaops_home_client::ClientError> {
-        HomeApi::heartbeat(self, worker, ready, listing).await
+    async fn begin_inventory(&self) -> Result<HomeObject, mediaops_home_client::ClientError> {
+        HomeApi::begin_inventory(self).await
     }
 }
 
@@ -191,13 +182,40 @@ impl<C: ControlPort> RejectRelease for C {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanStart {
+    started_rv: i64,
+    cluster_generation: i64,
+    secret_resource_version: i64,
+}
+
+fn scan_start(node: &HomeObject) -> anyhow::Result<ScanStart> {
+    match &node.status {
+        StatusBody::Node(status) => Ok(ScanStart {
+            started_rv: status.scan_started_rv,
+            cluster_generation: status.scan_cluster_generation,
+            secret_resource_version: status.scan_secret_resource_version,
+        }),
+        _ => anyhow::bail!("inventory Node status missing"),
+    }
+}
+
 async fn publish_inventory(
     api: &impl InventoryApi,
     control: &(impl RejectRelease + unmonitor::UnmonitorPort),
     entries: Vec<mediaops_core::RemoteEntry>,
     holds: Vec<mediaops_core::HoldLiveItem>,
+    start: ScanStart,
 ) -> anyhow::Result<()> {
-    api.heartbeat(WorkerKind::Inventory, false, None).await?;
+    if start.started_rv == 0 {
+        anyhow::bail!("inventory scan token is zero");
+    }
+    let node = api
+        .get(Kind::Node, WorkerKind::Inventory.node_name())
+        .await?;
+    if scan_start(&node)? != start {
+        anyhow::bail!("superseded inventory scan token");
+    }
     reconcile_rejections(api, control, &holds).await?;
     let cluster = api.get(Kind::Cluster, mediaops_core::CLUSTER_NAME).await?;
     let Spec::Cluster(cs) = cluster.spec else {
@@ -205,10 +223,7 @@ async fn publish_inventory(
     };
     let existing = api.list(Some(Kind::RemoteFile)).await?;
     let existing_holds = api.list(Some(Kind::Hold)).await?;
-    let node = api
-        .get(Kind::Node, WorkerKind::Inventory.node_name())
-        .await?;
-    let previous = match node.status {
+    let previous = match &node.status {
         StatusBody::Node(st) => st.list_generation,
         _ => 0,
     };
@@ -314,10 +329,43 @@ async fn publish_inventory(
             Err(err) => return Err(err.into()),
         }
     }
-    api.heartbeat(WorkerKind::Inventory, true, Some((list_gen, unix_now())))
+    let committed = api
+        .get(Kind::Node, WorkerKind::Inventory.node_name())
         .await?;
+    commit_listing(api, committed, start, list_gen).await?;
     unmonitor::after_successful_listing(api, control, &cs).await;
     Ok(())
+}
+
+async fn commit_listing(
+    api: &impl InventoryApi,
+    mut node: HomeObject,
+    start: ScanStart,
+    list_gen: i64,
+) -> anyhow::Result<()> {
+    for attempt in 0..3 {
+        if scan_start(&node)? != start {
+            anyhow::bail!("superseded inventory scan token");
+        }
+        let now = unix_now();
+        let StatusBody::Node(status) = &mut node.status else {
+            anyhow::bail!("inventory Node status missing");
+        };
+        status.ready = true;
+        status.last_heartbeat_unix = now;
+        status.list_generation = list_gen;
+        status.list_completed_unix = now;
+        match api.patch(node.clone(), "status").await {
+            Ok(_) => return Ok(()),
+            Err(err) if err.is_conflict() && attempt < 2 => {
+                node = api
+                    .get(Kind::Node, WorkerKind::Inventory.node_name())
+                    .await?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    anyhow::bail!("superseded inventory scan token")
 }
 
 async fn reconcile_rejections(

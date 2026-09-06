@@ -28,6 +28,12 @@ pub(super) async fn seed_rich(
     apply_title(cli, TITLE_ORPHAN).await?;
     apply_remote(socket, &matrix, FILE_LEN).await?;
     apply_remote(socket, &fight, FAIL_LEN).await?;
+    let long = movie_file(
+        "movie:key:averylongmovietitlewithmultiplesections映画の世界forterminalwrappingandscrolling.2020",
+        "A.Very.Long.Movie.Title.With.Multiple.Sections.映画の世界.For.Terminal.Wrapping.And.Scrolling",
+        2020,
+    )?;
+    apply_remote(socket, &long, 4).await?;
     seed_job(
         socket,
         library,

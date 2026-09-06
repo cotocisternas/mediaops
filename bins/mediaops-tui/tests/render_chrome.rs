@@ -2,7 +2,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use mediaops_core::{
-    HoldSpec, HoldStatus, HomeObject, Kind, Spec, StatusBody, WantSpec, WantStatus,
+    HoldSpec, HoldStatus, HomeObject, JobSpec, Kind, Spec, StatusBody, SyncDisposition, SyncEntry,
+    SyncPhase, SyncSpec, SyncStatus, WantSpec, WantStatus,
 };
 use mediaops_tui::SyncState;
 use mediaops_tui::cache::ObjectCache;
@@ -103,6 +104,12 @@ fn footer_allowlist_and_help_omits_mutations() {
     let footer = help.last().expect("footer");
     assert!(footer.contains("Esc dismiss"), "{footer}");
     assert!(!footer.contains("W apply"), "{footer}");
+    let help_body = help.join("\n");
+    assert!(help_body.contains("p preview copies"), "{help_body}");
+    assert!(
+        help_body.contains("S fresh sync (not watching)"),
+        "{help_body}"
+    );
 }
 
 #[test]
@@ -166,6 +173,7 @@ fn hold_caption_reserved_while_scrolled() {
                     list_completed_unix: 1,
                     ready: true,
                     last_heartbeat_unix: 1,
+                    ..mediaops_core::NodeStatus::default()
                 }),
             ),
             HomeObject::new(
@@ -239,4 +247,129 @@ fn hold_caption_reserved_while_scrolled() {
         "{text}"
     );
     assert!(text.contains(HOLD_CAPTION), "{text}");
+}
+
+#[test]
+fn sync_report_overlay_shows_counts_and_esc_footer() {
+    let obj = HomeObject::new(
+        Kind::Sync,
+        "sync-1",
+        Spec::Sync(SyncSpec::default()),
+        StatusBody::Sync(SyncStatus {
+            phase: SyncPhase::Scheduled,
+            list_generation: 4,
+            entries: vec![SyncEntry {
+                remote_root: "seedbox".into(),
+                remote_path: "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv".into(),
+                job: Some(JobSpec {
+                    dest_rel: "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv".into(),
+                    ..JobSpec::default()
+                }),
+                disposition: SyncDisposition::WouldQueue,
+                reason: "would queue".into(),
+                ..SyncEntry::default()
+            }],
+            ..SyncStatus::default()
+        }),
+    );
+    let ui = UiModel {
+        screen: Screen::Overview,
+        cols: 80,
+        rows: 24,
+        report: Some(mediaops_tui::report::SyncReport::from_object(
+            "sync-1".into(),
+            true,
+            &obj,
+        )),
+        ..UiModel::default()
+    };
+    let rows = paint(ui, Screen::Overview, SyncState::Current);
+    let text = rows.join("\n");
+    assert!(text.contains("preview"), "{text}");
+    assert!(text.contains("generation 4"), "{text}");
+    assert!(text.contains("copy 1"), "{text}");
+    assert!(
+        text.contains("seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"),
+        "{text}"
+    );
+    let footer = rows.last().expect("footer");
+    assert!(footer.contains("Esc back"), "{footer}");
+    assert!(!footer.contains("W apply"), "{footer}");
+}
+
+#[test]
+fn narrow_sync_report_wraps_and_keeps_source() {
+    let obj = HomeObject::new(
+        Kind::Sync,
+        "sync-1",
+        Spec::Sync(SyncSpec::default()),
+        StatusBody::Sync(SyncStatus {
+            phase: SyncPhase::Captured,
+            list_generation: 4,
+            entries: vec![SyncEntry {
+                remote_root: "seedbox".into(),
+                remote_path: "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv".into(),
+                job: Some(JobSpec {
+                    dest_rel: "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv".into(),
+                    ..JobSpec::default()
+                }),
+                disposition: SyncDisposition::WouldQueue,
+                ..SyncEntry::default()
+            }],
+            ..SyncStatus::default()
+        }),
+    );
+    let ui = UiModel {
+        screen: Screen::Overview,
+        cols: 60,
+        rows: 16,
+        report: Some(mediaops_tui::report::SyncReport::from_object(
+            "sync-1".into(),
+            true,
+            &obj,
+        )),
+        report_offset: u16::MAX,
+        ..UiModel::default()
+    };
+    let rows = paint(ui, Screen::Overview, SyncState::Current);
+    let body = rows[2..rows.len().saturating_sub(3)].join("\n");
+    assert!(!body.trim().is_empty(), "{body}");
+    assert!(!body.contains("pending"), "{body}");
+    let text = rows.join("\n");
+    assert!(text.contains("seedbox") || text.contains("copy"), "{text}");
+}
+
+#[test]
+fn footer_at_60_keeps_quit_and_sync_keys() {
+    for (screen, detail) in [
+        (Screen::Overview, false),
+        (Screen::Wants, true),
+        (Screen::Jobs, false),
+    ] {
+        let ui = UiModel {
+            screen,
+            cols: 60,
+            rows: 16,
+            in_detail: detail,
+            selected_key: Some(mediaops_tui::cache::ObjectKey::new(
+                Kind::Want,
+                "movie:tmdb:603",
+            )),
+            ..UiModel::default()
+        };
+        let output = paint(ui, screen, SyncState::Current);
+        let footer = output.last().expect("footer");
+        assert!(
+            footer.contains("q quit") || footer.ends_with('q') || footer.contains(" q"),
+            "{screen:?}: {footer}"
+        );
+        assert!(
+            footer.contains("p preview") || footer.contains("p  S") || footer.contains(" p "),
+            "{screen:?}: {footer}"
+        );
+        assert!(
+            footer.contains("S sync") || footer.contains("p  S") || footer.contains(" S"),
+            "{screen:?}: {footer}"
+        );
+    }
 }

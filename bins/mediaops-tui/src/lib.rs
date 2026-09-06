@@ -11,6 +11,7 @@ pub mod inventory;
 pub mod keys;
 pub mod model;
 pub mod projection;
+pub mod report;
 pub mod runtime;
 pub mod sanitize;
 pub mod session;

@@ -105,6 +105,43 @@ fn maybe_redact(actor: Actor, mut obj: HomeObject) -> HomeObject {
 
 #[tonic::async_trait]
 impl HomeService for HomeSvc {
+    async fn sync(
+        &self,
+        req: Request<mediaops_proto::home::SyncRequest>,
+    ) -> Result<Response<mediaops_proto::home::SyncResponse>, Status> {
+        if actor_of(&req)? != Actor::Cli {
+            return Err(home_status(HomeError::Denied(
+                "only CLI clients may request one-shot sync".into(),
+            )));
+        }
+        let request = req.into_inner();
+        let obj = crate::sync::start(&self.inner, request.request_id, request.dry_run)
+            .await
+            .map_err(home_status)?;
+        Ok(Response::new(mediaops_proto::home::SyncResponse {
+            object: Some(home_object_to_wire(&obj)),
+        }))
+    }
+
+    async fn begin_inventory(
+        &self,
+        req: Request<mediaops_proto::home::BeginInventoryRequest>,
+    ) -> Result<Response<mediaops_proto::home::BeginInventoryResponse>, Status> {
+        if actor_of(&req)? != Actor::Inventory {
+            return Err(home_status(HomeError::Denied(
+                "only inventory may begin a scan".into(),
+            )));
+        }
+        let obj = crate::sync::begin_inventory(&self.inner)
+            .await
+            .map_err(home_status)?;
+        Ok(Response::new(
+            mediaops_proto::home::BeginInventoryResponse {
+                object: Some(home_object_to_wire(&obj)),
+            },
+        ))
+    }
+
     async fn get(&self, req: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         let actor = actor_of(&req)?;
         let inner = req.into_inner();
@@ -632,6 +669,7 @@ mod tests {
                     last_heartbeat_unix: now(),
                     list_generation: 1,
                     list_completed_unix: now(),
+                    ..NodeStatus::default()
                 }),
             ),
         )

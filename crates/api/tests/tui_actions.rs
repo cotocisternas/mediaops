@@ -162,6 +162,7 @@ async fn publish_inventory(home: &TestApi, now: i64, generation: i64) {
             list_completed_unix: now,
             ready: true,
             last_heartbeat_unix: now,
+            ..NodeStatus::default()
         }),
     ))
     .await

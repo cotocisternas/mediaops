@@ -1,6 +1,7 @@
 //! UI navigation state. Mutations are a closed enum.
 
 use crate::cache::ObjectKey;
+use crate::report::SyncReport;
 
 pub const MIN_COLS: u16 = 60;
 pub const MIN_ROWS: u16 = 16;
@@ -100,6 +101,11 @@ pub struct UiModel {
     pub cols: u16,
     pub rows: u16,
     pub mutation_pending: bool,
+    pub sync_pending: bool,
+    pub sync_key_held: bool,
+    pub keyboard_event_types: bool,
+    pub report: Option<SyncReport>,
+    pub report_offset: u16,
     pub message: Option<String>,
     pub selected_key: Option<ObjectKey>,
     pub selected_uid: Option<String>,
@@ -120,6 +126,11 @@ impl Default for UiModel {
             cols: 80,
             rows: 24,
             mutation_pending: false,
+            sync_pending: false,
+            sync_key_held: false,
+            keyboard_event_types: false,
+            report: None,
+            report_offset: 0,
             message: None,
             selected_key: None,
             selected_uid: None,
@@ -146,7 +157,17 @@ impl UiModel {
             && !self.undersize()
             && !self.identity_clipped
             && !self.mutation_pending
+            && !self.sync_pending
+            && self.report.is_none()
             && self.selected_key.is_some()
+    }
+
+    pub fn sync_actions_enabled(&self, sync: SyncState) -> bool {
+        sync.writes_allowed()
+            && !self.help
+            && !self.undersize()
+            && !self.mutation_pending
+            && !self.sync_pending
     }
 
     pub fn clear_action_selection(&mut self) {

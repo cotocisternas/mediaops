@@ -75,6 +75,17 @@ pub(crate) async fn validate_apply(
             ));
         }
     } else {
+        if matches!(&obj.spec, Spec::Job(spec) if !spec.sync_name.is_empty()) {
+            return Err(denied(
+                "Sync Jobs must be created by the atomic Sync scheduler",
+            ));
+        }
+        if matches!(&obj.status, StatusBody::Node(status) if status.scan_started_rv != 0 || status.scan_cluster_generation != 0 || status.scan_secret_resource_version != 0)
+        {
+            return Err(denied(
+                "inventory scan metadata is assigned by BeginInventory",
+            ));
+        }
         if obj.metadata.resource_version != 0 {
             return Err(HomeError::Conflict {
                 kind: obj.kind,
@@ -119,6 +130,15 @@ pub(crate) async fn validate_patch(
             next.status = obj.status.clone();
             next.validate()?;
             owns_node(actor, &next)?;
+            if let (StatusBody::Node(before), StatusBody::Node(after)) = (&old.status, &next.status)
+                && (before.scan_started_rv != after.scan_started_rv
+                    || before.scan_cluster_generation != after.scan_cluster_generation
+                    || before.scan_secret_resource_version != after.scan_secret_resource_version)
+            {
+                return Err(denied(
+                    "inventory scan metadata is assigned by BeginInventory",
+                ));
+            }
             match (&old.spec, &old.status, &next.status) {
                 (Spec::Job(spec), StatusBody::Job(before), StatusBody::Job(after)) => {
                     if spec.node_name != WorkerKind::Pull.node_name() || actor != Actor::Pull {
@@ -231,6 +251,9 @@ pub(crate) async fn validate_patch(
                 .snapshot(None)
                 .await
                 .map_err(|e| invalid(e.to_string()))?;
+            if let Some(reason) = crate::sync_authority::identity_refusal(&objects, &old) {
+                return Err(denied(reason));
+            }
             if let Some(reason) =
                 crate::controllers::authorization_refusal(&objects, before, unix_now())
             {
@@ -502,6 +525,18 @@ pub(crate) async fn validate_delete(
 ) -> Result<(), HomeError> {
     if kind == Kind::Hold {
         refuse_active_hold_change(store, name).await?;
+    }
+    if kind == Kind::Sync {
+        let jobs = store
+            .list(Some(Kind::Job))
+            .await
+            .map_err(|err| invalid(err.to_string()))?;
+        if jobs.iter().any(|job| {
+            matches!((&job.spec, &job.status), (Spec::Job(spec), StatusBody::Job(status))
+            if spec.sync_name == name && !status.phase.is_terminal())
+        }) {
+            return Err(denied("cannot delete Sync while its Jobs are nonterminal"));
+        }
     }
     if let Some(obj) = store
         .get(kind, name)

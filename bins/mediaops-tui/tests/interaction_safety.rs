@@ -27,6 +27,28 @@ fn help_blocks_hidden_detail_mutation() {
 }
 
 #[test]
+fn global_sync_keys_are_not_object_mutations() {
+    assert!(!matches!(
+        mediaops_tui::keys::command_from_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('p'),
+                crossterm::event::KeyModifiers::NONE
+            )
+        )),
+        Command::Mutate(_)
+    ));
+    assert!(!matches!(
+        mediaops_tui::keys::command_from_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('S'),
+                crossterm::event::KeyModifiers::NONE
+            )
+        )),
+        Command::Mutate(_)
+    ));
+}
+
+#[test]
 fn write_bindings_are_exactly_the_approved_screen_allowlist() {
     for screen in Screen::ALL {
         assert_eq!(
