@@ -30,6 +30,28 @@ const ALLOWED_WORKSPACE_EDGES: &[(&str, &str)] = &[
     ("mediaops", "mediaops-ssh"),
     ("mediaops", "mediaops-sync"),
     ("mediaops", "mediaops-encode"),
+    ("mediaops-home-client", "mediaops-core"),
+    ("mediaops-home-client", "mediaops-proto"),
+    ("mediaops-apiserver", "mediaops-core"),
+    ("mediaops-apiserver", "mediaops-proto"),
+    ("mediaops-apiserver", "mediaops-store"),
+    ("mediaops-api", "mediaops-apiserver"),
+    ("mediaops-api", "mediaops-core"),
+    ("mediaops-api", "mediaops-home-client"),
+    ("mediaops-scheduler", "mediaops-core"),
+    ("mediaops-scheduler", "mediaops-home-client"),
+    ("mediaops-gateway", "mediaops-core"),
+    ("mediaops-gateway", "mediaops-home-client"),
+    ("mediaops-gateway", "mediaops-net"),
+    ("mediaops-inventory", "mediaops-core"),
+    ("mediaops-inventory", "mediaops-home-client"),
+    ("mediaops-inventory", "mediaops-proto"),
+    ("mediaops-inventory", "mediaops-transfer"),
+    ("mediaops-pull", "mediaops-core"),
+    ("mediaops-pull", "mediaops-home-client"),
+    ("mediaops-pull", "mediaops-transfer"),
+    ("mediaops", "mediaops-home-client"),
+    ("mediaops", "mediaops-apiserver"),
 ];
 
 const BANNED_DIRECT_CRATES: &[&str] = &[
@@ -97,13 +119,22 @@ pub fn violations(metadata: &Metadata) -> Vec<Violation> {
         workspace_graph.insert(from, tos);
     }
 
-    for forbidden in ["mediaops-store", "mediaops-encode"] {
-        if closure_contains(&workspace_graph, "mediaopsd", forbidden) {
-            found.push(Violation {
-                message: format!(
-                    "{forbidden} is in mediaopsd's workspace-internal transitive closure"
-                ),
-            });
+    for start in [
+        "mediaopsd",
+        "mediaops-home",
+        "mediaops-gateway",
+        "mediaops-scheduler",
+        "mediaops-inventory",
+        "mediaops-pull",
+    ] {
+        for forbidden in ["mediaops-store", "mediaops-encode"] {
+            if closure_contains(&workspace_graph, start, forbidden) {
+                found.push(Violation {
+                    message: format!(
+                        "{forbidden} is in {start}'s workspace-internal transitive closure"
+                    ),
+                });
+            }
         }
     }
 
@@ -351,6 +382,14 @@ mod tests {
         "mediaops-sync",
         "mediaops-encode",
         "mediaops-arch-tests",
+        "mediaops-home-client",
+        "mediaops-apiserver",
+        "mediaops-api",
+        "mediaops-scheduler",
+        "mediaops-gateway",
+        "mediaops-inventory",
+        "mediaops-pull",
+        "mediaops-home",
         "mediaops",
         "mediaopsd",
     ];
