@@ -57,7 +57,7 @@ Iterate on one crate with `cargo test -p <crate> --locked`. The live test (`carg
 - Library paths have no `{tmdb-…}` tokens. Identity from a path is `movie:key:…` / `series:key:…` / `album:key:…`.
 - Empty human states are fixed English strings: `nothing happening`, `nothing on hold`, `nothing on the box`, `nothing to reclaim`, `nothing to encode`.
 - systemd-user control plane is always-on `mediaops-home.service` (`ExecStart=mediaops-home`). There is no `mediaops-run.timer`.
-- Do not revive `mediaops plan` / `mediaops run` from leftover helpers or old docs. Use `watch` / `apply` to record Wants and `get Job` to inspect copying.
+- Do not revive `mediaops plan` / `mediaops run` from leftover helpers or old docs. Use `sync` for one-shot completed-file copying, `watch` / `apply` for persistent Wants, and `get Job` / `get Sync` to inspect work. Continuous automatic sync is deferred in `docs/backlog.md`.
 
 ## Known pitfalls
 
