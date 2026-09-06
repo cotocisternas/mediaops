@@ -35,7 +35,8 @@ struct PullData {
     staged: String,
     whole_file_b3: String,
     installed: Option<String>,
-    job_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<i64>,
     resumed_ranges: Vec<ResumedRange>,
 }
 
@@ -129,15 +130,43 @@ pub async fn pull(
     season: Option<u8>,
     episode: Option<u8>,
 ) -> Result<String, AppError> {
+    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
     let socket = socket.unwrap_or_else(bootstrap::default_socket);
-    let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
+    let state_db = crate::api_legacy::state_db_path(state_db);
     let lock_path = state_db
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("mediaops.lock");
     let _lock = bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?;
+    if use_home {
+        let home = crate::api_legacy::HomeLibrary::load().await?;
+        let id = TitleId::parse(&title_id).map_err(|err| AppError::Usage(err.to_string()))?;
+        let placement = if do_install {
+            Some(placement_for(
+                &id, &path, &name, title, year, season, episode,
+            )?)
+        } else {
+            None
+        };
+        let remote = RemoteRef::from_wire_parts(root, path)
+            .map_err(|err| AppError::Usage(err.to_string()))?;
+        return pull_home(
+            json,
+            home,
+            ManualPull {
+                title_id: id,
+                remote,
+                name,
+                placement,
+                library_root,
+                socket,
+                tls_dir,
+            },
+        )
+        .await;
+    }
     let desired_state =
         desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
     let store = Store::open(&state_db)
@@ -322,7 +351,7 @@ pub async fn pull(
         staged: outcome.staged.display().to_string(),
         whole_file_b3: whole_file_b3.to_string(),
         installed,
-        job_id: job.id().get(),
+        job_id: Some(job.id().get()),
         resumed_ranges: outcome
             .resumed_ranges
             .into_iter()
@@ -334,6 +363,242 @@ pub async fn pull(
     } else {
         Ok(format_pull(&data, &pull_label))
     }
+}
+
+struct ManualPull {
+    title_id: TitleId,
+    remote: RemoteRef,
+    name: String,
+    placement: Option<Placement>,
+    library_root: Option<PathBuf>,
+    socket: PathBuf,
+    tls_dir: PathBuf,
+}
+
+async fn pull_home(
+    json: bool,
+    mut home: crate::api_legacy::HomeLibrary,
+    request: ManualPull,
+) -> Result<String, AppError> {
+    let root = home.root(request.library_root)?;
+    let cluster = home.spec()?.clone();
+    if cluster.lock {
+        return Err(AppError::Policy(
+            "Cluster lock is set; pull is frozen".into(),
+        ));
+    }
+    if let Some(placement) = &request.placement {
+        let destination = root.join(
+            mediaops_core::render(&request.title_id, placement)
+                .map_err(crate::api_legacy::error)?,
+        );
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(AppError::Policy(format!(
+                    "destination already exists: {}; use library reindex to recover a missing proof",
+                    destination.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(crate::api_legacy::error(err)),
+        }
+    }
+    let channel = connect_home(&request.socket, &request.tls_dir)
+        .await
+        .map_err(crate::api_legacy::error)?;
+    let entry = stat_entry(channel.clone(), &request.remote)
+        .await
+        .map_err(crate::api_legacy::error)?;
+    let label = request
+        .placement
+        .as_ref()
+        .map(crate::out::human_placement)
+        .unwrap_or_else(|| request.name.clone());
+    let spec = PullSpec {
+        library_root: root.clone(),
+        title_id: request.title_id.clone(),
+        final_name: request.name,
+        remote: request.remote,
+        file_len: entry.len(),
+        range_len: cluster.range_len.get(),
+        concurrency: cluster.range_concurrency.unwrap_or(1) as usize,
+    };
+    check_manual_budget(&spec, &cluster)?;
+    let was_locked = home.begin_maintenance().await?;
+    let staged = async {
+        check_manual_budget(&spec, &cluster)?;
+        configure_pool(channel.clone(), spec.concurrency as u32)
+            .await
+            .map_err(crate::api_legacy::error)?;
+        let mut meter = (!json).then(|| PullMeter::new(label.clone()));
+        let copied = pull_file_with_progress(grpc_source(channel), &spec, |done, total| {
+            if let Some(meter) = meter.as_mut() {
+                meter.update(done, total);
+            }
+        })
+        .await
+        .map_err(crate::api_legacy::error)?;
+        if let Some(meter) = meter.as_mut() {
+            meter.finish();
+        }
+        let digest = mediaops_core::Blake3Hex::of_reader(
+            std::fs::File::open(&copied.staged).map_err(crate::api_legacy::error)?,
+        )
+        .map_err(crate::api_legacy::error)?;
+        Ok::<_, AppError>((copied, digest))
+    }
+    .await;
+    let (copied, digest) = match staged {
+        Ok(copied) => copied,
+        Err(err) => return Err(crate::api_legacy::maintenance_failure(err)),
+    };
+    let installed = if let Some(placement) = request.placement {
+        let handle = match VerifiedStagingHandle::verify(
+            &root,
+            &request.title_id,
+            copied.staged.clone(),
+            &placement,
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                return Err(crate::api_legacy::maintenance_failure(
+                    crate::api_legacy::error(err),
+                ));
+            }
+        };
+        if let Err(err) = check_manual_install(&spec, &cluster, handle.dest_rel()) {
+            home.finish_maintenance(was_locked).await?;
+            return Err(err);
+        }
+        let placed = match install(&root, &request.title_id, &handle) {
+            Ok(placed) => placed,
+            Err(err) => {
+                return Err(crate::api_legacy::maintenance_failure(
+                    crate::api_legacy::error(err),
+                ));
+            }
+        };
+        if let Err(err) = home
+            .publish_rows(
+                &[mediaops_core::TitleIndexEntry::new(
+                    request.title_id,
+                    handle.dest_rel().display().to_string(),
+                    placed.whole_file_b3.clone(),
+                    placed.whole_file_b3,
+                )],
+                false,
+            )
+            .await
+        {
+            return Err(crate::api_legacy::maintenance_failure(
+                crate::api_legacy::error(format!(
+                    "installed file retained at {}; Home proof publication failed: {err}; run library reindex to recover its proof",
+                    placed.path.display(),
+                )),
+            ));
+        }
+        Some(placed.path.display().to_string())
+    } else {
+        None
+    };
+    home.finish_maintenance(was_locked).await?;
+    let data = PullData {
+        staged: copied.staged.display().to_string(),
+        whole_file_b3: digest.to_string(),
+        installed,
+        job_id: None,
+        resumed_ranges: copied
+            .resumed_ranges
+            .into_iter()
+            .map(|(offset, len)| ResumedRange { offset, len })
+            .collect(),
+    };
+    if json {
+        serde_json::to_string(&Envelope::ok(data)).map_err(crate::api_legacy::error)
+    } else {
+        Ok(format_pull(&data, &label))
+    }
+}
+
+fn manual_install_job(
+    library_root: &std::path::Path,
+    title_id: &TitleId,
+    dest_rel: &std::path::Path,
+    file_len: u64,
+    min_free: u64,
+) -> mediaops_core::JobSpec {
+    mediaops_core::JobSpec {
+        library_root: library_root.display().to_string(),
+        title_id: title_id.render(),
+        dest_rel: dest_rel.display().to_string(),
+        file_len,
+        min_free,
+        ..mediaops_core::JobSpec::default()
+    }
+}
+
+fn check_manual_install(
+    spec: &PullSpec,
+    cluster: &mediaops_core::ClusterSpec,
+    dest_rel: &std::path::Path,
+) -> Result<(), AppError> {
+    let job = manual_install_job(
+        &spec.library_root,
+        &spec.title_id,
+        dest_rel,
+        spec.file_len,
+        cluster.min_free.get(),
+    );
+    if !mediaops_core::install_fits(&job).map_err(crate::api_legacy::error)? {
+        return Err(AppError::Policy(
+            "manual install would exceed destination filesystem free-space reserve".into(),
+        ));
+    }
+    check_manual_budget(spec, cluster)
+}
+
+fn check_manual_budget(
+    spec: &PullSpec,
+    cluster: &mediaops_core::ClusterSpec,
+) -> Result<(), AppError> {
+    let free = mediaops_core::free_bytes(&spec.library_root).map_err(crate::api_legacy::error)?;
+    let remaining = remaining_staging_bytes(spec)?;
+    if (cluster.max_copy.get() > 0 && spec.file_len > cluster.max_copy.get())
+        || !mediaops_core::pull_fits(free, cluster.min_free.get(), 0, 0, remaining)
+    {
+        return Err(AppError::Policy(
+            "manual pull would exceed Cluster copy budget or free-space reserve".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remaining_staging_bytes(spec: &PullSpec) -> Result<u64, AppError> {
+    use std::os::unix::fs::MetadataExt;
+    let staged = spec.library_root.join(
+        mediaops_core::staging_path(&spec.title_id, &spec.final_name)
+            .map_err(crate::api_legacy::error)?,
+    );
+    let mut partial = staged.clone();
+    partial.as_mut_os_string().push(".partial");
+    let allocated =
+        [staged, partial].iter().try_fold(
+            0u64,
+            |largest, path| match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_file() => Ok(if meta.len() == spec.file_len {
+                    largest.max(meta.blocks().saturating_mul(512))
+                } else {
+                    largest
+                }),
+                Ok(_) => Err(AppError::Policy(format!(
+                    "staging path is not a regular file: {}",
+                    path.display()
+                ))),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(largest),
+                Err(err) => Err(crate::api_legacy::error(err)),
+            },
+        )?;
+    Ok(spec.file_len.saturating_sub(allocated))
 }
 
 fn format_pull(data: &PullData, label: &str) -> String {
@@ -428,6 +693,296 @@ fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn manual_home_pull_publishes_proof_and_restores_scheduling() {
+        let _serial = crate::test_support::serial_net();
+        let (home, dir, server) = crate::api_legacy::test_home("manual-home-pull").await;
+        let api = home.api.clone();
+        let library_root = home.root(None).expect("root");
+        let pair =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"original")
+                .await;
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
+        let json = pull_home(
+            true,
+            home,
+            ManualPull {
+                title_id: title.clone(),
+                remote: RemoteRef::from_wire_parts(
+                    "seedbox".into(),
+                    PathBuf::from(crate::test_support::MOVIE_REL),
+                )
+                .expect("remote"),
+                name: "The.Matrix.(1999).mkv".into(),
+                placement: Some(Placement::movie("The.Matrix", 1999, "mkv")),
+                library_root: None,
+                socket: pair.sock.clone(),
+                tls_dir: pair.tls_dir.clone(),
+            },
+        )
+        .await
+        .expect("manual pull");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        assert!(
+            value["data"].get("job_id").is_none(),
+            "manual Home pull must not invent a legacy Job"
+        );
+        let object = api
+            .get(mediaops_core::Kind::Title, &title.render())
+            .await
+            .expect("title");
+        let mediaops_core::StatusBody::Title(status) = object.status else {
+            panic!("Title status");
+        };
+        let files = status.observed_files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, crate::test_support::MOVIE_REL);
+        assert_eq!(
+            std::fs::read(library_root.join(&files[0].path)).expect("installed"),
+            b"original"
+        );
+        let cluster = api
+            .get(mediaops_core::Kind::Cluster, mediaops_core::CLUSTER_NAME)
+            .await
+            .expect("cluster");
+        let mediaops_core::Spec::Cluster(spec) = cluster.spec else {
+            panic!("Cluster spec");
+        };
+        assert!(!spec.lock);
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn fs_info(path: &std::path::Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        Some((
+            std::fs::metadata(path).ok()?.dev(),
+            mediaops_core::free_bytes(path).ok()?,
+        ))
+    }
+
+    fn dest_watermark_bases() -> Vec<std::path::PathBuf> {
+        let mut bases = Vec::new();
+        if let Some(path) = std::env::var_os("MEDIAOPS_TEST_INSTALL_FS") {
+            bases.push(std::path::PathBuf::from(path));
+        }
+        for path in ["/tmp", "/dev/shm", "/var/tmp"] {
+            bases.push(std::path::PathBuf::from(path));
+        }
+        bases.into_iter().filter(|path| path.is_dir()).collect()
+    }
+
+    struct DestFixture {
+        extra: Vec<std::path::PathBuf>,
+    }
+    impl Drop for DestFixture {
+        fn drop(&mut self) {
+            for path in self.extra.iter().rev() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+
+    fn unique_dir(base: &std::path::Path, tag: &str) -> std::path::PathBuf {
+        base.join(format!(
+            "mediaops-home-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    async fn prepare_dest_watermark(
+        home: &mut crate::api_legacy::HomeLibrary,
+    ) -> Option<DestFixture> {
+        let original = home.root(None).expect("root");
+        let (orig_dev, orig_free) = fs_info(&original)?;
+        let mut tighter = None;
+        let mut roomier = None;
+        for base in dest_watermark_bases() {
+            let Some((dev, free)) = fs_info(&base) else {
+                continue;
+            };
+            if dev != orig_dev && free < orig_free {
+                tighter = Some(base);
+                break;
+            }
+            if dev != orig_dev && free > orig_free {
+                roomier = Some(base);
+            }
+        }
+        let mut extra = Vec::new();
+        let (library_root, dest_fs) = if let Some(dest_base) = tighter {
+            let dest_fs = unique_dir(&dest_base, "dest");
+            std::fs::create_dir_all(&dest_fs).expect("dest fs");
+            extra.push(dest_fs.clone());
+            (original, dest_fs)
+        } else {
+            let lib_base = roomier?;
+            let library_root = unique_dir(&lib_base, "lib");
+            mediaops_sync::ensure_layout(&library_root).expect("layout");
+            extra.push(library_root.clone());
+            let dest_fs = unique_dir(&original, "dest");
+            std::fs::create_dir_all(&dest_fs).expect("dest fs");
+            extra.push(dest_fs.clone());
+            (library_root, dest_fs)
+        };
+        let dest_free = mediaops_core::free_bytes(&dest_fs).expect("dest free");
+        let root_free = mediaops_core::free_bytes(&library_root).expect("root free");
+        if root_free <= dest_free {
+            eprintln!("skipping dest-watermark fixture: library root is not roomier than dest fs");
+            return None;
+        }
+        let movies = library_root.join("movies");
+        let _ = std::fs::remove_dir_all(&movies);
+        std::os::unix::fs::symlink(&dest_fs, &movies).expect("movies symlink");
+        let mut cluster = home.cluster.clone();
+        let mediaops_core::Spec::Cluster(spec) = &mut cluster.spec else {
+            panic!("Cluster");
+        };
+        spec.library_root = library_root.display().to_string();
+        spec.min_free = mediaops_core::Bytes::new(dest_free);
+        home.cluster = home.api.patch(cluster, "spec").await.expect("cluster");
+        Some(DestFixture { extra })
+    }
+
+    #[tokio::test]
+    async fn manual_install_dest_watermark_refuses_before_publication() {
+        let _serial = crate::test_support::serial_net();
+        let (mut home, dir, server) = crate::api_legacy::test_home("manual-dest-watermark").await;
+        let api = home.api.clone();
+        let Some(_dest) = prepare_dest_watermark(&mut home).await else {
+            server.abort();
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        };
+        let library_root = home.root(None).expect("root");
+        let pair =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"original")
+                .await;
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
+        let err = pull_home(
+            true,
+            home,
+            ManualPull {
+                title_id: title.clone(),
+                remote: RemoteRef::from_wire_parts(
+                    "seedbox".into(),
+                    PathBuf::from(crate::test_support::MOVIE_REL),
+                )
+                .expect("remote"),
+                name: "The.Matrix.(1999).mkv".into(),
+                placement: Some(Placement::movie("The.Matrix", 1999, "mkv")),
+                library_root: None,
+                socket: pair.sock.clone(),
+                tls_dir: pair.tls_dir.clone(),
+            },
+        )
+        .await
+        .expect_err("dest watermark");
+        assert!(matches!(err, AppError::Policy(_)), "{err}");
+        let staged = library_root
+            .join(mediaops_core::staging_path(&title, "The.Matrix.(1999).mkv").expect("stage"));
+        assert!(staged.is_file(), "staging retained at {}", staged.display());
+        assert!(
+            std::fs::symlink_metadata(library_root.join(crate::test_support::MOVIE_REL)).is_err(),
+            "dest must stay absent"
+        );
+        let title_get = api.get(mediaops_core::Kind::Title, &title.render()).await;
+        assert!(
+            title_get.as_ref().is_err_and(|e| e.is_not_found()),
+            "no Title proof: {title_get:?}"
+        );
+        let cluster = api
+            .get(mediaops_core::Kind::Cluster, mediaops_core::CLUSTER_NAME)
+            .await
+            .expect("cluster");
+        let mediaops_core::Spec::Cluster(spec) = cluster.spec else {
+            panic!("Cluster spec");
+        };
+        assert!(!spec.lock, "maintenance lock restored");
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn manual_staging_only_pull_does_not_consult_dest_fs() {
+        let _serial = crate::test_support::serial_net();
+        let (mut home, dir, server) = crate::api_legacy::test_home("manual-stage-only-dest").await;
+        let Some(_dest) = prepare_dest_watermark(&mut home).await else {
+            server.abort();
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        };
+        let library_root = home.root(None).expect("root");
+        let pair =
+            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"original")
+                .await;
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
+        let json = pull_home(
+            true,
+            home,
+            ManualPull {
+                title_id: title.clone(),
+                remote: RemoteRef::from_wire_parts(
+                    "seedbox".into(),
+                    PathBuf::from(crate::test_support::MOVIE_REL),
+                )
+                .expect("remote"),
+                name: "The.Matrix.(1999).mkv".into(),
+                placement: None,
+                library_root: None,
+                socket: pair.sock.clone(),
+                tls_dir: pair.tls_dir.clone(),
+            },
+        )
+        .await
+        .expect("staging-only");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(value["ok"], true);
+        assert!(value["data"]["installed"].is_null());
+        let staged = library_root
+            .join(mediaops_core::staging_path(&title, "The.Matrix.(1999).mkv").expect("stage"));
+        assert!(staged.is_file(), "{}", staged.display());
+        assert!(
+            std::fs::symlink_metadata(library_root.join(crate::test_support::MOVIE_REL)).is_err()
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manual_install_job_spec_uses_dest_rel_and_cluster_min_free() {
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        let dest_rel = std::path::Path::new(crate::test_support::MOVIE_REL);
+        let job = manual_install_job(std::path::Path::new("/library"), &title, dest_rel, 10, 42);
+        assert_eq!(job.library_root, "/library");
+        assert_eq!(job.title_id, title.render());
+        assert_eq!(job.dest_rel, dest_rel.display().to_string());
+        assert_eq!(job.file_len, 10);
+        assert_eq!(job.min_free, 42);
+    }
+
+    #[test]
+    fn same_filesystem_install_fits_even_when_min_free_exceeds_capacity() {
+        let dir = crate::test_support::scratch("same-fs-fits");
+        let library = crate::test_support::library_root(&dir);
+        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
+        let job = manual_install_job(
+            &library,
+            &title,
+            std::path::Path::new(crate::test_support::MOVIE_REL),
+            10,
+            u64::MAX,
+        );
+        assert!(mediaops_core::install_fits(&job).expect("same-fs dest is root-covered"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use std::path::Path;
 
     #[test]
