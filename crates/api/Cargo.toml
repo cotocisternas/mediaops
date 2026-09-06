@@ -1,0 +1,20 @@
+[package]
+name = "mediaops-apiserver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mediaops-core.workspace = true
+mediaops-proto.workspace = true
+mediaops-store.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["net", "sync"] }
+tonic = { workspace = true, features = ["codegen", "router", "transport"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "net", "time"] }
