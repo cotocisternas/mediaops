@@ -7,6 +7,15 @@
 
 tonic::include_proto!("mediaops.v1");
 
+/// Generated `mediaops.home.v1` types and the Home service.
+pub mod home {
+    include!(concat!(env!("OUT_DIR"), "/home/mediaops.home.v1.rs"));
+}
+
+mod home_convert;
+
+pub use home_convert::{home_object_from_wire, home_object_to_wire, home_status};
+
 use std::path::PathBuf;
 
 use mediaops_core::{
