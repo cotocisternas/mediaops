@@ -1,7 +1,10 @@
 # First demo on this box — Epic 4 runbook
 
-**Status:** live execution pending operator confirm.  
-This file is the gate. Do **not** run the destructive / live list until the operator says yes. Default CI does not execute any of this.
+**Status:** historical; superseded by the Home API rewrite.
+Do **not** execute this old runbook, even as the current live-test gate. Use
+[Setup](../../docs/setup.md) and [Development](../../docs/development.md) for
+current instructions. The original demonstration steps below are retained as
+history; default CI does not execute them.
 
 **Grabber:** `none` (a schema-valid folder on the seedbox, a disk at home).
 

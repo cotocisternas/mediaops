@@ -1,3 +1,7 @@
+# HISTORICAL: pre-Home-API delivery status, not the current sprint or backlog.
+# Do not resume its pending actions automatically or treat its done labels as
+# verification of the rewrite. See docs/documentation-status.md.
+# Historical dates and status values below are intentionally preserved.
 # STATUS DEFINITIONS:
 # ==================
 # Epic Status:
