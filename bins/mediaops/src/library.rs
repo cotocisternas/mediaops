@@ -6,7 +6,7 @@ use mediaops_ssh::SystemExec;
 use mediaops_store::Store;
 use mediaops_sync::{
     ensure_layout, media_server_warnings, refuse_below_watermark, reindex_schema,
-    systemd_exec_start, write_home_unit, write_user_units,
+    systemd_exec_start, write_home_unit,
 };
 use serde::Serialize;
 
@@ -30,12 +30,18 @@ pub async fn bootstrap_library(
     enable_timer: bool,
     unit_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
+    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let desired_state =
         desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
-    let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
+    let state_db = crate::api_legacy::state_db_path(state_db);
     let _lock =
         bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
+    if use_home && !enable_timer {
+        crate::api_legacy::connect().await.map_err(|err| {
+            AppError::Runtime(anyhow::anyhow!("Home API must be running for library bootstrap; use --enable-timer to start mediaops-home: {err}"))
+        })?;
+    }
     let ds_text =
         std::fs::read_to_string(&desired_state).map_err(|err| AppError::Runtime(err.into()))?;
     let ds = DesiredState::from_toml(&ds_text).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
@@ -65,9 +71,20 @@ pub async fn bootstrap_library(
     }
 
     let unit_dir = unit_dir.unwrap_or_else(bootstrap::default_unit_dir);
-    write_library_units(&unit_dir, &state_db, &config_dir, &desired_state)?;
+    write_library_units(&unit_dir)?;
     if enable_timer {
         enable_user_timer(&SystemExec).await?;
+    }
+    if use_home {
+        let encode_pause = store
+            .get_machine("encode_pause")
+            .await
+            .map_err(crate::api_legacy::error)?
+            .as_deref()
+            == Some("1");
+        bootstrap_home(&ds, &library_root, enable_timer, encode_pause).await.map_err(|err| {
+            AppError::Runtime(anyhow::anyhow!("library layout and service unit are prepared, but Home state publication failed: {err}; after restoring API availability, rerun library bootstrap{}", if enable_timer { " --enable-timer" } else { "" }))
+        })?;
     }
 
     let mut search = Vec::new();
@@ -116,10 +133,13 @@ pub async fn relocate_library(
     enable_timer: bool,
     unit_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
+    if crate::api_legacy::use_home(&state_db) {
+        return relocate_home(json, library_root, state_db, enable_timer, unit_dir).await;
+    }
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let desired_state =
         desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
-    let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
+    let state_db = crate::api_legacy::state_db_path(state_db);
     let lock_path = bootstrap::lock_path(&state_db);
     let _lock = bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?;
     let ds_text =
@@ -149,7 +169,7 @@ pub async fn relocate_library(
         .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
 
     let unit_dir = unit_dir.unwrap_or_else(bootstrap::default_unit_dir);
-    write_library_units(&unit_dir, &state_db, &config_dir, &desired_state)?;
+    write_library_units(&unit_dir)?;
     if enable_timer {
         enable_user_timer(&SystemExec).await?;
     }
@@ -179,7 +199,23 @@ pub async fn reindex_library(
     library_root: Option<PathBuf>,
     state_db: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
+    if crate::api_legacy::use_home(&state_db) {
+        let state_db = crate::api_legacy::state_db_path(state_db);
+        let _lock =
+            bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
+        let mut home = crate::api_legacy::HomeLibrary::load().await?;
+        home.root(library_root)?;
+        let was_locked = home.begin_maintenance().await?;
+        let indexed = home.reindex().await.map_err(maintenance_error)?;
+        home.finish_maintenance(was_locked).await?;
+        return if json {
+            serde_json::to_string(&Envelope::ok(ReindexData { indexed }))
+                .map_err(|err| AppError::Runtime(err.into()))
+        } else {
+            Ok(format!("reindex {indexed}"))
+        };
+    }
+    let state_db = crate::api_legacy::state_db_path(state_db);
     let lock_path = bootstrap::lock_path(&state_db);
     let _lock = bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?;
     let store = Store::open(&state_db)
@@ -206,6 +242,125 @@ pub async fn reindex_library(
         serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
     } else {
         Ok(format!("reindex {}", data.indexed))
+    }
+}
+
+fn maintenance_error(err: AppError) -> AppError {
+    crate::api_legacy::maintenance_failure(err)
+}
+
+async fn bootstrap_home(
+    ds: &DesiredState,
+    root: &Path,
+    wait: bool,
+    encode_pause: bool,
+) -> Result<(), AppError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let api = loop {
+        match crate::api_legacy::connect().await {
+            Ok(api) => break api,
+            Err(_) if wait && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let mut cluster = match api
+        .get(mediaops_core::Kind::Cluster, mediaops_core::CLUSTER_NAME)
+        .await
+    {
+        Ok(cluster) => cluster,
+        Err(err) if err.is_not_found() => {
+            let mut cluster = crate::api_legacy::cluster_from_config(ds, root);
+            if let mediaops_core::Spec::Cluster(spec) = &mut cluster.spec {
+                spec.encode_pause = encode_pause;
+            }
+            cluster
+        }
+        Err(err) => return Err(crate::api_legacy::error(err)),
+    };
+    if let mediaops_core::Spec::Cluster(spec) = &mut cluster.spec {
+        if !spec.library_root.is_empty() && Path::new(&spec.library_root) != root {
+            return Err(AppError::Usage(
+                "Cluster already has another library root; use library relocate".into(),
+            ));
+        }
+        spec.library_root = root.display().to_string();
+    }
+    crate::api_legacy::apply_spec(&api, cluster).await?;
+    if let Some(address) = ds.seedbox_address() {
+        match api
+            .get(mediaops_core::Kind::Secret, mediaops_core::SECRET_NAME)
+            .await
+        {
+            Ok(_) => {}
+            Err(err) if err.is_not_found() => {
+                let mut secret = mediaops_core::SecretSpec {
+                    seedbox_address: address.to_owned(),
+                    ..Default::default()
+                };
+                if let Some(tls) = ds.tls() {
+                    secret.ca_sha256 = tls.ca_sha256.clone();
+                    secret.server_sha256 = tls.server_sha256.clone();
+                    secret.client_sha256 = tls.client_sha256.clone();
+                }
+                api.apply(mediaops_core::HomeObject::new(
+                    mediaops_core::Kind::Secret,
+                    mediaops_core::SECRET_NAME,
+                    mediaops_core::Spec::Secret(secret),
+                    mediaops_core::StatusBody::Secret,
+                ))
+                .await
+                .map_err(crate::api_legacy::error)?;
+            }
+            Err(err) => return Err(crate::api_legacy::error(err)),
+        }
+    }
+    Ok(())
+}
+
+async fn relocate_home(
+    json: bool,
+    root: PathBuf,
+    state_db: Option<PathBuf>,
+    enable_timer: bool,
+    unit_dir: Option<PathBuf>,
+) -> Result<String, AppError> {
+    let state_db = crate::api_legacy::state_db_path(state_db);
+    let _lock =
+        bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
+    let mut home = crate::api_legacy::HomeLibrary::load().await?;
+    let root = layout_canonical_root(root, home.spec()?.min_free)?;
+    let was_locked = home.begin_maintenance().await?;
+    if let mediaops_core::Spec::Cluster(spec) = &mut home.cluster.spec {
+        spec.library_root = root.display().to_string();
+    }
+    home.cluster = home
+        .api
+        .patch(home.cluster.clone(), "spec")
+        .await
+        .map_err(crate::api_legacy::error)
+        .map_err(maintenance_error)?;
+    write_library_units(&unit_dir.unwrap_or_else(bootstrap::default_unit_dir))
+        .map_err(maintenance_error)?;
+    if enable_timer {
+        enable_user_timer(&SystemExec)
+            .await
+            .map_err(maintenance_error)?;
+    }
+    home.finish_maintenance(was_locked).await?;
+    let data = RelocateData {
+        library_root: root.display().to_string(),
+        dirs: mediaops_sync::SCHEMA_DIRS
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+        rewritten_absolute: 0,
+    };
+    if json {
+        serde_json::to_string(&Envelope::ok(data)).map_err(|err| AppError::Runtime(err.into()))
+    } else {
+        Ok(format!("library {}", data.library_root))
     }
 }
 
@@ -256,39 +411,27 @@ fn layout_canonical_root(
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("canonicalize library-root: {err}")))
 }
 
-fn write_library_units(
-    unit_dir: &Path,
-    state_db: &std::path::Path,
-    config_dir: &std::path::Path,
-    desired_state: &std::path::Path,
-) -> Result<(), AppError> {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mediaops"));
-    let state_db_arg = state_db.display().to_string();
-    // `--state-db` is a `run` option, not a global one: it must follow the verb.
-    let exec_start = systemd_exec_start(&exe, &["run", "--state-db", &state_db_arg]);
-    write_user_units(unit_dir, &exec_start).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
+/// Units this layout no longer writes. Left in place on an upgraded box they
+/// stay enabled and fail: the timer fires a `run` verb that no longer exists,
+/// and the old home unit execs `mediaopsd serve --role home`, which now
+/// refuses.
+const RETIRED_UNITS: &[&str] = &[
+    "mediaops-run.service",
+    "mediaops-run.timer",
+    "mediaopsd-home.service",
+];
 
-    let mut daemon = exe;
-    daemon.set_file_name("mediaopsd");
-    let tls_dir = bootstrap::default_tls_dir(config_dir);
-    let socket = bootstrap::default_socket();
-    let tls_arg = tls_dir.display().to_string();
-    let ds_arg = desired_state.display().to_string();
-    let sock_arg = socket.display().to_string();
-    let home_exec = systemd_exec_start(
-        &daemon,
-        &[
-            "serve",
-            "--role",
-            "home",
-            "--tls-dir",
-            &tls_arg,
-            "--config",
-            &ds_arg,
-            "--socket",
-            &sock_arg,
-        ],
-    );
+fn write_library_units(unit_dir: &Path) -> Result<(), AppError> {
+    for name in RETIRED_UNITS {
+        let path = unit_dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|err| AppError::Runtime(err.into()))?;
+        }
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mediaops"));
+    let mut supervisor = exe;
+    supervisor.set_file_name("mediaops-home");
+    let home_exec = systemd_exec_start(&supervisor, &[]);
     write_home_unit(unit_dir, &home_exec).map_err(|err| AppError::Runtime(anyhow_err(err)))
 }
 
@@ -317,19 +460,10 @@ async fn enable_user_timer(exec: &impl ExecPort) -> Result<(), AppError> {
             "--user".into(),
             "enable".into(),
             "--now".into(),
-            "mediaopsd-home.service".into(),
+            "mediaops-home.service".into(),
         ],
     );
-    let enable = ExecCommand::new(
-        "systemctl",
-        vec![
-            "--user".into(),
-            "enable".into(),
-            "--now".into(),
-            "mediaops-run.timer".into(),
-        ],
-    );
-    for cmd in [reload, enable_home, enable] {
+    for cmd in [reload, enable_home] {
         let out = exec
             .run(&cmd)
             .await
@@ -384,12 +518,9 @@ mod tests {
         assert_eq!(calls[0].1, vec!["--user", "daemon-reload"]);
         assert_eq!(
             calls[1].1,
-            vec!["--user", "enable", "--now", "mediaopsd-home.service"]
+            vec!["--user", "enable", "--now", "mediaops-home.service"]
         );
-        assert_eq!(
-            calls[2].1,
-            vec!["--user", "enable", "--now", "mediaops-run.timer"]
-        );
+        assert_eq!(calls.len(), 2);
     }
 
     #[tokio::test]
@@ -481,12 +612,12 @@ mod tests {
         }
         assert!(media.is_file(), "relocate must not move media");
         assert!(!neu.join(rel).exists(), "relocate must not copy media");
-        assert!(units.join("mediaops-run.service").is_file());
-        assert!(units.join("mediaops-run.timer").is_file());
-        assert!(units.join("mediaopsd-home.service").is_file());
-        let timer = std::fs::read_to_string(units.join("mediaops-run.timer")).expect("timer");
-        assert!(timer.contains("OnUnitInactiveSec="));
-        assert!(!timer.contains("OnCalendar"));
+        assert!(units.join("mediaops-home.service").is_file());
+        assert!(!units.join("mediaops-run.service").exists());
+        assert!(!units.join("mediaops-run.timer").exists());
+        let home = std::fs::read_to_string(units.join("mediaops-home.service")).expect("home");
+        assert!(home.contains("ExecStart="));
+        assert!(home.contains("mediaops-home"));
         let store = Store::open(&db).await.expect("reopen");
         assert_eq!(
             store
