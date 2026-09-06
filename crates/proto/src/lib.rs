@@ -13,8 +13,10 @@ pub mod home {
 }
 
 mod home_convert;
+mod home_watch;
 
 pub use home_convert::{home_object_from_wire, home_object_to_wire, home_status};
+pub use home_watch::{WatchEvent, watch_event_from_wire};
 
 use std::path::PathBuf;
 
