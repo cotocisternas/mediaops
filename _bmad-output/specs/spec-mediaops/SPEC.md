@@ -13,7 +13,11 @@ sources:
   - _bmad-output/brainstorming/brainstorm-rust-seedbox-media-app-2026-08-28/modules.md
 ---
 
-> **Canonical contract.** This SPEC and the files in `companions:` are the complete, preservation-validated contract for what to build, test, and validate. Source documents listed in frontmatter are for traceability — consult them only if you need narrative rationale or prose color this contract intentionally omits.
+> **Historical contract, superseded by the Home API rewrite.** This SPEC and its
+> companions describe the pre-rewrite product, not current implementation
+> requirements. Use the [current architecture](../../../docs/architecture.md) and
+> [documentation status](../../../docs/documentation-status.md). The original
+> capabilities below are preserved for traceability, not as a current backlog.
 
 # mediaops
 
