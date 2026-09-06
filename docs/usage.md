@@ -4,14 +4,21 @@ After [setup](setup.md), `mediaops-home` keeps the control plane up. You apply a
 
 `why` and `watch` take a spoken name (`Hearts`, `Mr Robot`) or a title id. A name only resolves when the library, a job, the hold inbox, or a listing already knows it. Prefer a `TitleId` in scripts. `hold approve` / `reject` take the id from `hold list` (`movie:tmdb:4539`).
 
-Home API verbs (`get`, `apply`, `delete`) print a tab-separated pipeline table by default (`TitleId` in `$1`). `-o json` is the **raw object** (no `{ok,data,error}` envelope). `-o wide` adds columns, aligned with spaces for terminal reading. Legacy verbs still accept `--json` as one `{ok,data,error}` envelope. Tracing goes to stderr.
+Home API verbs (`get`, `apply`, `delete`) print a tab-separated pipeline table by default (TitleId when available, otherwise object name, in `$1`). `-o json` is the **raw object** (no `{ok,data,error}` envelope). `-o wide` adds columns, aligned with spaces for terminal reading. Legacy verbs still accept `--json` as one `{ok,data,error}` envelope. Tracing goes to stderr.
 
-Default commands require the Home API. An outage is an error, not an implicit switch to `state.db`. An isolated custom `--state-db` retains the offline legacy workflow; the default state file or a file beside `api.db` uses Home. `--socket` on `get` / `apply` / `watch` addresses the API; older gateway commands use `--api-socket` to override their Home API address separately.
+The default Home-backed workflows require the Home API. An outage is an error,
+not an implicit switch to `state.db`. An isolated custom `--state-db` selects the
+supported legacy path; commands that need the gateway still need it. The default
+state file or a file beside `api.db` uses Home. Object commands use `--socket` for
+the API. `list` / `pull` use `--socket` for the gateway and do not accept
+`--api-socket`; manual pull uses the default Home API address. Home-backed
+`status` / `why` / `hold` use `--api-socket` and do not use `--socket` to select
+their API. `doctor` uses both endpoints for different checks. See the
+[socket-routing table](config.md#default-paths).
 
 ## Daily
 
 ```bash
-mediaops apply -f cluster.toml
 mediaops watch movie:key:thematrix.1999
 mediaops get Job
 mediaops get Title movie:key:thematrix.1999 -o json
@@ -30,6 +37,9 @@ title_id = "movie:key:thematrix.1999"
 ```
 
 Updates require the current `metadata.resourceVersion`. Retrieve the object with `get -o json`, edit its spec, and apply it; a stale version is refused. `watch TITLE` is idempotent. `get Job --watch -o json` streams one object per line until interrupted; an optional object name filters that stream.
+
+`apply -f` takes a Home object document, not the bootstrap `config.toml` format.
+See [editing Cluster settings](config.md#config-files-versus-home-objects).
 
 ### `status`
 
@@ -86,9 +96,18 @@ watching  The Matrix (1999)
           movie:key:thematrix.1999
 ```
 
-Music copies before video, under the same `max_copy` cap. A copy that would breach `min_free` is refused on the Job, not partial-written onto a full disk. Already-installed titles are skipped; there is no auto-upgrade from 1080p to a 4K remux.
+Music copies before video, under the same `max_copy` cap. Work that does not fit
+the scheduler's budget stays Pending; the worker rechecks capacity and can refuse
+a Job if the reserve is no longer available. Manual installation also checks the
+destination filesystem before publication. Recorded placements are not silently
+replaced; there is no auto-upgrade from 1080p to a 4K remux.
 
 Failed or refused Jobs remain visible. Inspect `why TITLE` or `get Job NAME -o wide`, fix the cause, then delete that terminal Job to let the still-open Want create a fresh attempt. Completed ranges can resume; existing library content is never overwritten by this retry. Deleting a bound active Job is refused.
+
+Revoking a Want refuses its unbound work. A temporarily absent source can remain
+Pending and bind when it returns without blocking other Jobs. After destination
+publication, verification, cleanup, or API I/O failures leave the Job Verifying
+for recovery rather than declaring an unproved live file complete.
 
 ### `why`
 
@@ -196,7 +215,16 @@ The live file is replaced only after the convert succeeds. The original moves to
 
 ### `doctor` / `repair edge`
 
-`doctor` is read-only: edge invariant, key presence, PEM-in-git scan. Prints `ok` when the invariant holds. `repair edge` is a confirmed nginx + API write.
+`doctor` is read-only: edge invariant, key presence, and PEM-in-git scan. By
+default it also requires the Home API and Ready scheduler, inventory, and pull
+Nodes. `ok` means all checks passed. An explicit `--state-db` skips the additional
+Home readiness check unless `--api-socket` is also supplied; it does not skip the
+gateway's edge and credential checks.
+
+`mediaops repair edge --repair --confirm` performs nginx maintenance over SSH and
+edge apply/verification through the gateway Control API. Bare `repair edge`
+refuses with usage exit 2. `doctor --repair` is not a repair shortcut. Only run the
+explicit repair command when intending a write.
 
 ## Command map
 
@@ -218,7 +246,7 @@ The live file is replaced only after the convert succeeds. The original moves to
 | `reclaim preview\|apply` | Ranked surplus dry-run; exclusive unlink after local proof. |
 | `hold list\|approve\|reject` | Lock-free import-blocked inbox. |
 | `encode scan\|run\|pause` | Home GPU only. |
-| `doctor` / `repair edge` | Read-only check vs confirmed edge write. |
+| `doctor` / `repair edge --repair --confirm` | Read-only edge/credential/Home-readiness check vs explicit SSH + Control API edge repair. |
 | `new-machine export\|import` | Private bundle with config, credentials, runtime objects and every file's installation proof. |
 
 Relocation refuses incompatible nonterminal Jobs, including unbound Pending Jobs: their library root is an immutable snapshot. Let that work finish before relocating. A failed maintenance command can leave `Cluster.spec.lock` set; inspect and resolve the cause, then unlock explicitly with `get` / edit / `apply`. Do not treat a leftover lock as auto-cleared.
@@ -229,8 +257,8 @@ Relocation refuses incompatible nonterminal Jobs, including unbound Pending Jobs
 
 | Mode | What stdout is |
 | ---- | -------------- |
-| default table | TSV pipeline (`TitleId` in `$1`). Empty Job list is a blank table. |
-| `-o wide` | Space-aligned columns for a terminal. |
+| default table | TSV pipeline (TitleId when available, otherwise object name, in `$1`). Empty Job list is a blank table. |
+| `-o wide` | Space-aligned object columns for a terminal; maintenance counters retain their TSV output. |
 | `-o json` | Raw object or `{items:[…]}` list. No `{ok,data,error}` envelope. |
 | `--json` | One `{ok,data,error}` envelope. Do not combine with `-o`. |
 
@@ -249,7 +277,7 @@ English, no decoration: `nothing happening`, `nothing on hold`, `nothing on the 
 | 0 | ok | |
 | 1 | runtime | I/O, RPC, unexpected failure |
 | 2 | usage | bad flags or args |
-| 3 | lock_conflict | leftover `reclaim apply` / library / new-machine holds the flock |
+| 3 | lock_conflict | exclusive CLI maintenance, such as manual pull, encode run, reclaim apply, library, new-machine, seedbox apply, or edge repair, already holds the flock |
 | 4 | drift_verify | edge or grabber drifted from `config.toml` |
 | 5 | policy_refusal | encode refuse, PEM-in-git, pin matrix, watermark at bootstrap |
 

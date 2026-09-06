@@ -1,6 +1,6 @@
 # Setup
 
-Two machines: a home disk (library of record) and a seedbox (disposable buffer). SSH is used once, to enroll the box. After that, the CLI never SSHs and never dials the seedbox — it talks to a local unix-socket gateway.
+Two machines: a home disk (library of record) and a seedbox (disposable buffer). Daily object commands talk to the local Home API; Range and Control traffic reach the box through the local gateway. The gateway owns the seedbox connection. SSH is reserved for explicit enrollment, daemon upgrade, and edge-repair maintenance, never bulk media copy.
 
 Live bootstrap, a real pull, and NVENC spend WAN, disk, and GPU. They are not part of `make test` or CI. Run them on purpose.
 
@@ -28,7 +28,7 @@ schema_version = 1
 max_copy_gib = 80
 min_free_gib = 256
 range_len_mib = 32           # one Range RPC; the seedbox serves at most 64
-range_concurrency = 8        # set it and the probe is skipped
+range_concurrency = 8        # snapshotted on each Home Pull Job; omitted means 1
 max_nvenc = 3
 lock = false
 grabber = "none"             # or "servarr"
@@ -99,13 +99,13 @@ When upgrading an existing installation, first stop any retired units that exist
 Put one schema-valid file on an allowlisted root (see [library layout](config.md#library-layout)). Then:
 
 ```bash
-mediaops apply -f want.toml          # or: mediaops watch movie:key:thematrix.1999
+mediaops watch movie:key:thematrix.1999
 mediaops reconcile
 mediaops get Job -o wide
-mediaops why 'The Matrix'
+mediaops why movie:key:thematrix.1999
 ```
 
-`watch` records a Want and exits. It does not wait for a playable file. The pull worker Ranges into `_incoming/…/*.partial`; resume uses the sidecar, not current Cluster `range_len`.
+`watch` records a Want and exits. It does not wait for a playable file. Alternatively, use the [Want document example](usage.md#daily) with `apply -f`. The pull worker Ranges into `_incoming/…/*.partial`; resume uses the sidecar, not current Cluster `rangeLen`.
 
 ## 5. Optional: encode and grabber
 
@@ -128,11 +128,18 @@ With `grabber = "servarr"`, the seedbox daemon speaks *arr on `127.0.0.1`. API k
 
 ```bash
 mediaops new-machine export --out /path/to/bundle
-# on the new home, with mediaops-home/API running and no existing Titles or Jobs:
+# on the new home, with mediaops-home/API running and an empty Job list:
 mediaops new-machine import --from /path/to/bundle --library-root /mnt/storage/videos
 ```
 
 Exports `config.toml`, `tls/`, the title-index, and exact runtime `cluster.json` / `secret.json`. The bundle is private and contains credentials. Missing media on import is marked drifted; imported records alone never prove a disposable box copy is safe to reclaim. Import refuses a git work tree the same way bootstrap does.
+
+The first import normally starts with no Titles. Retrying a compatible bundle is
+supported: existing Title paths and installation digests must match the bundle,
+and only missing observations are published. Newer current digests and drift
+state are retained. Unrelated Titles or any existing Job, including a terminal
+Job, refuse import. When Titles exist, the requested library root must match the
+current Cluster. See [Usage](usage.md#command-map) for maintenance-lock recovery.
 
 ## Check the edge
 
@@ -140,4 +147,15 @@ Exports `config.toml`, `tls/`, the title-index, and exact runtime `cluster.json`
 mediaops doctor
 ```
 
-Prints `ok` when the nginx/Forms invariant holds. Write repair is a separate, confirmed command: `mediaops repair edge`.
+Default `doctor` checks the edge, credentials, and PEM locations, then requires
+the Home API and Ready scheduler, inventory, and pull Nodes. `ok` means all these
+checks passed, not just that nginx is healthy.
+
+Write repair is separate and explicit:
+
+```bash
+mediaops repair edge --repair --confirm
+```
+
+This uses SSH for nginx maintenance and the gateway Control API for edge apply
+and verification. It is not a read-only health check and is never part of tests.
