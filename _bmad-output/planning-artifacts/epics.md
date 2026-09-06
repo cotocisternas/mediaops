@@ -16,6 +16,10 @@ inputDocuments:
 
 # mediaops — work breakdown
 
+> **Historical work breakdown, not the current backlog.** This document describes
+> the pre-Home-API delivery. Its requirements and completion criteria must be
+> revalidated before reuse. See [documentation status](../../docs/documentation-status.md).
+
 ## Overview
 
 This document provides the complete epic and story breakdown for mediaops, decomposing SPEC-mediaops (the canonical contract), its companions, and the Architecture Spine into implementable stories.

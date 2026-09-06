@@ -6,6 +6,8 @@ altitude: feature
 paradigm: 'plan/apply reconciler (typed desired-state controller) over a thick-library Cargo workspace with ports-and-adapters edges'
 scope: 'Whole product: mediaops CLI + mediaopsd daemon reconciling desired state across one seedbox and one home archive disk. All SPEC-mediaops Constraints bind verbatim and are not restated here; this spine fixes only the HOW the spec left open.'
 status: final
+artifact_status: historical
+superseded_by: docs/architecture.md
 created: '2026-08-29'
 updated: '2026-08-29'
 binds: [CAP-1, CAP-2, CAP-3, CAP-4, CAP-5, CAP-6, CAP-7, CAP-8, CAP-9, CAP-10, CAP-11, CAP-12]
@@ -21,6 +23,11 @@ companions: []
 ---
 
 # Architecture Spine — mediaops
+
+> **Historical architecture, superseded by the Home API rewrite.** The original
+> design and review record below are retained, not updated implementation law.
+> Use [docs/architecture.md](../../../../docs/architecture.md) and the current
+> [crate-boundary tests](../../../../crates/arch-tests/src/lib.rs).
 
 ## Design Paradigm
 
