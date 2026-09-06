@@ -191,34 +191,59 @@ async fn snapshot(
     exclusive: bool,
     max: Option<usize>,
 ) -> Result<Snapshot, AppError> {
+    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
     let socket = socket.unwrap_or_else(bootstrap::default_socket);
-    let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
+    let state_db = crate::api_legacy::state_db_path(state_db);
     let lock_path = bootstrap::lock_path(&state_db);
     let lock = if exclusive {
         Some(bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?)
     } else {
         None
     };
-    let store = Store::open(&state_db)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let library_root = match library_root {
-        Some(p) => p,
-        None => store
-            .get_machine("library_root")
+    let (library_root, title_index, root_kinds) = if use_home {
+        let home = crate::api_legacy::HomeLibrary::load().await?;
+        let root = home.root(library_root)?;
+        let rows = home.rows(false).await?;
+        // Reclaim removes the remote copy. Check the current bytes immediately
+        // before planning deletion, even if the last drift observation is old.
+        let mut verified = Vec::new();
+        for row in rows {
+            let digest = std::fs::File::open(root.join(row.path()))
+                .and_then(mediaops_core::Blake3Hex::of_reader);
+            if digest
+                .as_ref()
+                .is_ok_and(|digest| digest == row.current_b3())
+            {
+                verified.push(row);
+            }
+        }
+        (root, verified, home.root_kinds()?)
+    } else {
+        let store = Store::open(&state_db)
             .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-            .map(PathBuf::from)
-            .unwrap_or_default(),
+            .map_err(crate::api_legacy::error)?;
+        let root = match library_root {
+            Some(root) => root,
+            None => store
+                .get_machine("library_root")
+                .await
+                .map_err(crate::api_legacy::error)?
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+        };
+        let rows = store
+            .list_titles()
+            .await
+            .map_err(crate::api_legacy::error)?;
+        (
+            root,
+            rows,
+            root_kinds_from(&bootstrap::default_desired_state(&config_dir)),
+        )
     };
-    let title_index = store
-        .list_titles()
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
     let on_disk = on_disk_files(&library_root)?;
-    let root_kinds = root_kinds_from(&bootstrap::default_desired_state(&config_dir));
     let channel = connect_home(&socket, &tls_dir)
         .await
         .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
