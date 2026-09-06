@@ -12,7 +12,12 @@ make clippy
 
 `make test OFFLINE=1` after a fetch. `make proto` needs [Buf](https://buf.build/docs/installation). `make musl` needs `musl-gcc` and is what CI runs for the static daemon.
 
-Read [docs/development.md](docs/development.md) and [AGENTS.md](AGENTS.md) before changing crate boundaries, PathSchema, or the JSON envelope.
+Read [docs/development.md](docs/development.md) and [AGENTS.md](AGENTS.md) before changing crate boundaries, PathSchema, or either JSON contract.
+
+Use [docs/](docs/README.md) as the current product documentation. The generated
+pre-rewrite BMAD records are [historical](docs/documentation-status.md), not an
+active backlog or acceptance criteria for new changes. Update the current docs
+when behavior changes; do not rewrite old reports to describe the new release.
 
 ## Commits
 
@@ -20,7 +25,7 @@ Read [docs/development.md](docs/development.md) and [AGENTS.md](AGENTS.md) befor
 
 ## Pull requests
 
-- Keep `--json` envelopes and plan JSON stable unless the change needs a new field.
+- Keep two output contracts stable unless the change needs a new field: Home API `-o json` is the raw object; legacy `--json` is one `{ok,data,error}` envelope.
 - Human stdout is the operator UI. Add or update exact-screen tests when you change a formatter.
 - Do not add a TUI, prompts, or auto-approve.
 

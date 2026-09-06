@@ -90,18 +90,50 @@ pub fn parse_ssh_config(text: &str, alias: &str) -> Result<SshHost, SshError> {
 }
 
 pub fn is_git_work_tree(path: &Path) -> bool {
-    let mut cur = Some(path.to_path_buf());
-    while let Some(dir) = cur {
-        if dir.join(".git").exists() {
-            return true;
+    checked_git_work_tree(path).unwrap_or(true)
+}
+
+fn checked_git_work_tree(path: &Path) -> std::io::Result<bool> {
+    // The destination may not exist yet, and an existing ancestor may be a
+    // symlink into dotfiles. Check both spellings before writing any PEMs.
+    for ancestor in path.ancestors() {
+        if has_git_marker(ancestor)? {
+            return Ok(true);
         }
-        cur = dir.parent().map(Path::to_path_buf);
+        match ancestor.canonicalize() {
+            Ok(real) => {
+                for directory in real.ancestors() {
+                    if has_git_marker(directory)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
-    false
+    Ok(false)
+}
+
+fn has_git_marker(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path.join(".git")) {
+        Ok(_) => Ok(true),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub fn refuse_git_work_tree(path: &Path) -> Result<(), SshError> {
-    if is_git_work_tree(path) {
+    if checked_git_work_tree(path)
+        .map_err(|err| SshError::Other(format!("inspect {}: {err}", path.display())))?
+    {
         Err(SshError::GitWorkTree(path.display().to_string()))
     } else {
         Ok(())
@@ -534,6 +566,44 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join(".git")).expect("mkdir");
         assert!(refuse_git_work_tree(&dir).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_ancestor_cannot_bypass_pem_refusal() {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-ssh-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("checkout/.git")).expect("checkout");
+        std::os::unix::fs::symlink(dir.join("checkout"), dir.join("config")).expect("config link");
+        assert!(refuse_git_work_tree(&dir.join("config/mediaops/tls")).is_err());
+        assert!(
+            !dir.join("checkout/mediaops").exists(),
+            "checking must not create files"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_existing_regular_config_file_is_not_a_git_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-ssh-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, b"config").expect("file");
+        assert!(refuse_git_work_tree(&config).is_ok());
         let _ = std::fs::remove_dir_all(dir);
     }
 

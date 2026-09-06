@@ -1,3 +1,6 @@
+# HISTORICAL: pre-Home-API work queue, retained for traceability only.
+# Do not dispatch this queue as current work. See docs/documentation-status.md
+# and _bmad-output/README.md. Entries below retain their historical meaning.
 - id: "1"
   title: Workspace scaffold and dependency law
   description: >-

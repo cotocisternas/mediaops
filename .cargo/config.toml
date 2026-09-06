@@ -2,4 +2,6 @@
 # Ubuntu/Debian musl-tools installs `musl-gcc`. Arch may ship `x86_64-linux-musl-gcc` as an alias.
 [target.x86_64-unknown-linux-musl]
 linker = "musl-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
+# Some musl-gcc specs handle -static but not Rust's default -static-pie,
+# leaving a PT_INTERP for a loader that the seedbox does not have.
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]

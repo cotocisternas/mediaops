@@ -148,6 +148,42 @@ fn format_hold_decide(data: &HoldDecideData) -> String {
     ])
 }
 
+pub(crate) fn render_live_list(items: &[HoldLiveItem], json: bool) -> Result<String, AppError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs() as i64)
+        .unwrap_or(0);
+    let holds: Vec<_> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| hold_json(i + 1, item, now))
+        .collect();
+    if json {
+        serde_json::to_string(&Envelope::ok(HoldListData { holds }))
+            .map_err(|err| AppError::Runtime(err.into()))
+    } else {
+        Ok(format_hold_list(&holds))
+    }
+}
+
+pub(crate) fn render_live_decision(
+    item: &HoldLiveItem,
+    decision: HoldDecision,
+    json: bool,
+) -> Result<String, AppError> {
+    let data = HoldDecideData {
+        name: hold_label(item),
+        title_id: item.key.title_id.render(),
+        release_id: item.key.release_id.as_str().to_string(),
+        decision: decision.as_str().to_string(),
+    };
+    if json {
+        serde_json::to_string(&Envelope::ok(data)).map_err(|err| AppError::Runtime(err.into()))
+    } else {
+        Ok(format_hold_decide(&data))
+    }
+}
+
 fn hold_json(n: usize, item: &HoldLiveItem, now: i64) -> HoldJson {
     HoldJson {
         n,
@@ -834,7 +870,7 @@ approved  Hearts of Darkness A Filmmaker's Apocalypse (1991)
     fn no_auto_approve_agent_approve_or_confidence_floor() {
         let apply = include_str!("../../../crates/sync/src/apply.rs");
         let plan = include_str!("../../../crates/sync/src/plan.rs");
-        let run = include_str!("run.rs");
+        let controllers = include_str!("../../../crates/api/src/controllers.rs");
         let needles = [
             concat!("auto", "-approve"),
             concat!("auto", "_approve"),
@@ -843,7 +879,7 @@ approved  Hearts of Darkness A Filmmaker's Apocalypse (1991)
             concat!("confidence", "_floor"),
             concat!("confidence", " floor"),
         ];
-        for hay in [apply, plan, run] {
+        for hay in [apply, plan, controllers] {
             let lower = hay.to_ascii_lowercase();
             for needle in needles {
                 assert!(

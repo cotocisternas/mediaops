@@ -11,7 +11,10 @@
 //! does not take a repository and does not touch sqlite.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::digest::Blake3Hex;
 use crate::pathschema::{self, PathSchemaError, Placement};
@@ -60,6 +63,12 @@ pub enum InstallError {
     MissingLive(String),
     #[error("title does not match destination")]
     TitleMismatch,
+    #[error("staged bytes no longer match the durable verification digest")]
+    DigestMismatch,
+    #[error("pull deadline reached before installation completed")]
+    DeadlineExceeded,
+    #[error("refusing an unowned or unsafe install temporary: {0}")]
+    UnsafeTemporary(String),
     #[error("backup destination `{0}` is inside the library root")]
     BackupInsideLibrary(String),
     /// `replace` moved the live file aside, then could neither place the new
@@ -249,6 +258,66 @@ pub fn free_bytes(path: &Path) -> Result<u64, InstallError> {
     }
 }
 
+/// Bytes still needing allocation on the staging filesystem. Logical length
+/// from set_len is sparse and must never be counted as allocated disk space.
+pub fn pull_remaining_bytes(spec: &crate::home::JobSpec) -> Result<u64, InstallError> {
+    use std::os::unix::fs::MetadataExt;
+    let id = TitleId::parse(&spec.title_id).map_err(|e| InstallError::NotStaging(e.to_string()))?;
+    let name = Path::new(&spec.dest_rel)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| InstallError::NotStaging(spec.dest_rel.clone()))?;
+    let staged = Path::new(&spec.library_root).join(pathschema::staging_path(&id, name)?);
+    let mut partial = staged.clone();
+    partial.as_mut_os_string().push(".partial");
+    for path in [staged, partial] {
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                return Ok(spec
+                    .file_len
+                    .saturating_sub(meta.blocks().saturating_mul(512)));
+            }
+            Ok(_) => return Err(InstallError::NotStaging(path.display().to_string())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(InstallError::io(&path, &err)),
+        }
+    }
+    Ok(spec.file_len)
+}
+
+/// Check the final filesystem too when a schema directory links another disk.
+pub fn install_fits(spec: &crate::home::JobSpec) -> Result<bool, InstallError> {
+    use std::os::unix::fs::MetadataExt;
+    let root = Path::new(&spec.library_root);
+    let dest = root.join(&spec.dest_rel);
+    let mut parent = dest
+        .parent()
+        .ok_or_else(|| InstallError::NotStaging(spec.dest_rel.clone()))?;
+    loop {
+        match fs::metadata(parent) {
+            Ok(meta) => {
+                let root_meta = fs::metadata(root).map_err(|e| InstallError::io(root, &e))?;
+                if meta.dev() == root_meta.dev() {
+                    return Ok(true);
+                }
+                return Ok(crate::home::pull_fits(
+                    free_bytes(parent)?,
+                    spec.min_free,
+                    0,
+                    0,
+                    spec.file_len,
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                parent = parent
+                    .parent()
+                    .ok_or_else(|| InstallError::io(parent, &err))?;
+            }
+            Err(err) => return Err(InstallError::io(parent, &err)),
+        }
+    }
+}
+
 fn reject_symlink_file(path: &Path, on_symlink: InstallError) -> Result<(), InstallError> {
     let meta = fs::symlink_metadata(path).map_err(|err| match err.kind() {
         // Only a genuine absence is "not found"; permissions and symlink loops
@@ -271,52 +340,363 @@ pub fn install(
     title_id: &TitleId,
     handle: &VerifiedStagingHandle,
 ) -> Result<InstallOutcome, InstallError> {
-    let dest = library_root.as_ref().join(&handle.dest_rel);
+    install_checked(
+        library_root.as_ref(),
+        title_id,
+        handle,
+        None,
+        &mut || Ok(()),
+    )
+}
+
+/// Home worker gate: recheck the persisted whole-file digest before publishing.
+pub fn install_verified(
+    library_root: impl AsRef<Path>,
+    title_id: &TitleId,
+    handle: &VerifiedStagingHandle,
+    expected: &Blake3Hex,
+) -> Result<InstallOutcome, InstallError> {
+    install_checked(
+        library_root.as_ref(),
+        title_id,
+        handle,
+        Some(expected),
+        &mut || Ok(()),
+    )
+}
+
+/// Fresh installation is bounded by the Job's persisted remaining budget.
+/// Each filesystem call is synchronous; no cancelled task can publish later.
+/// Checks surround each bounded chunk and precede the atomic publication.
+pub fn install_verified_before(
+    library_root: impl AsRef<Path>,
+    title_id: &TitleId,
+    handle: &VerifiedStagingHandle,
+    expected: &Blake3Hex,
+    deadline: Instant,
+) -> Result<InstallOutcome, InstallError> {
+    install_checked(
+        library_root.as_ref(),
+        title_id,
+        handle,
+        Some(expected),
+        &mut || {
+            if Instant::now() >= deadline {
+                Err(InstallError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn install_checked(
+    library_root: &Path,
+    title_id: &TitleId,
+    handle: &VerifiedStagingHandle,
+    expected: Option<&Blake3Hex>,
+    check: &mut impl FnMut() -> Result<(), InstallError>,
+) -> Result<InstallOutcome, InstallError> {
+    check()?;
+    let dest = library_root.join(&handle.dest_rel);
     check_title(title_id, &handle.dest_rel)?;
     // `exists()` follows symlinks, so a dangling symlink squatting the library
     // path would report `false`. `symlink_metadata` sees the entry itself.
-    if fs::symlink_metadata(&dest).is_ok() {
-        return Err(InstallError::DestinationExists(dest.display().to_string()));
+    match fs::symlink_metadata(&dest) {
+        Ok(_) => return Err(InstallError::DestinationExists(dest.display().to_string())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(InstallError::io(&dest, &err)),
     }
-    let file =
-        fs::File::open(&handle.source).map_err(|err| InstallError::io(&handle.source, &err))?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&handle.source)
+        .map_err(|err| InstallError::io(&handle.source, &err))?;
+    if !file
+        .metadata()
+        .map_err(|e| InstallError::io(&handle.source, &e))?
+        .is_file()
+    {
+        return Err(InstallError::NotStaging(
+            handle.source.display().to_string(),
+        ));
+    }
+    let mut hasher = blake3::Hasher::new();
+    read_chunks(&mut file, &handle.source, check, |bytes| {
+        hasher.update(bytes);
+        Ok(())
+    })?;
     let whole_file_b3 =
-        Blake3Hex::of_reader(file).map_err(|err| InstallError::io(&handle.source, &err))?;
+        Blake3Hex::parse(&hasher.finalize().to_hex()).expect("BLAKE3 generates a canonical digest");
+    if expected.is_some_and(|digest| *digest != whole_file_b3) {
+        return Err(InstallError::DigestMismatch);
+    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
     }
-    move_into_place(&handle.source, &dest)?;
+    move_into_place_checked(&handle.source, &dest, check)?;
     Ok(InstallOutcome {
         path: dest,
         whole_file_b3,
     })
 }
 
-/// `rename`, or when the destination is on another filesystem (a `music`
-/// symlink to a second disk), copy to a hidden temp name beside it, fsync,
-/// and rename that into place, so the schema path never shows a partial file.
+/// Atomically link a complete file into a previously absent destination.
+/// A music symlink may cross devices: copy to an owned temp on that device,
+/// fsync, then link without replacing any existing directory entry.
+#[cfg(test)]
 fn move_into_place(source: &Path, dest: &Path) -> Result<(), InstallError> {
-    match fs::rename(source, dest) {
-        Ok(()) => return Ok(()),
+    move_into_place_checked(source, dest, &mut || Ok(()))
+}
+
+fn move_into_place_checked(
+    source: &Path,
+    dest: &Path,
+    check: &mut impl FnMut() -> Result<(), InstallError>,
+) -> Result<(), InstallError> {
+    copy_into_place_checked(source, dest, check)?;
+    fs::remove_file(source).map_err(|err| InstallError::io(source, &err))?;
+    sync_parent(source)
+}
+
+fn copy_into_place(source: &Path, dest: &Path) -> Result<(), InstallError> {
+    copy_into_place_checked(source, dest, &mut || Ok(()))
+}
+
+fn copy_into_place_checked(
+    source: &Path,
+    dest: &Path,
+    check: &mut impl FnMut() -> Result<(), InstallError>,
+) -> Result<(), InstallError> {
+    check()?;
+    match fs::hard_link(source, dest) {
+        Ok(()) => return sync_parent(dest),
         Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(InstallError::DestinationExists(dest.display().to_string()));
+        }
         Err(err) => return Err(InstallError::io(source, &err)),
     }
-    let name = dest
+    copy_across_devices(source, dest, check)
+}
+
+fn copy_across_devices(
+    source: &Path,
+    dest: &Path,
+    check: &mut impl FnMut() -> Result<(), InstallError>,
+) -> Result<(), InstallError> {
+    let slot = InstallTemporary::open(source, dest, true)?.expect("created install slot");
+    slot.clear_data()?;
+    check()?;
+    let mut from = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)
+        .map_err(|e| InstallError::io(source, &e))?;
+    if !from
+        .metadata()
+        .map_err(|e| InstallError::io(source, &e))?
+        .is_file()
+    {
+        return Err(InstallError::NotStaging(source.display().to_string()));
+    }
+    let mut to = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&slot.data)
+        .map_err(|e| InstallError::io(&slot.data, &e))?;
+    // On failure or process death, one explicitly owned data file remains.
+    // The next attempt clears it before capacity checks; random or unmarked
+    // files are never searched for or removed.
+    read_chunks(&mut from, source, check, |bytes| {
+        to.write_all(bytes)
+            .map_err(|e| InstallError::io(&slot.data, &e))
+    })?;
+    to.sync_all()
+        .map_err(|e| InstallError::io(&slot.data, &e))?;
+    check()?;
+    fs::hard_link(&slot.data, dest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            InstallError::DestinationExists(dest.display().to_string())
+        } else {
+            InstallError::io(dest, &e)
+        }
+    })?;
+    slot.clear_data()?;
+    sync_parent(dest)
+}
+
+fn read_chunks(
+    reader: &mut impl Read,
+    path: &Path,
+    check: &mut impl FnMut() -> Result<(), InstallError>,
+    mut consume: impl FnMut(&[u8]) -> Result<(), InstallError>,
+) -> Result<(), InstallError> {
+    let mut bytes = [0; 64 * 1024];
+    loop {
+        check()?;
+        let len = reader
+            .read(&mut bytes)
+            .map_err(|e| InstallError::io(path, &e))?;
+        check()?;
+        if len == 0 {
+            return Ok(());
+        }
+        consume(&bytes[..len])?;
+        check()?;
+    }
+}
+
+/// Remove only a previous attempt's explicitly owned cross-device data file.
+/// Call before disk-capacity checks so an interrupted copy cannot permanently
+/// consume the space needed to retry. The small identity/lock slot is retained.
+pub fn cleanup_install_temporary(spec: &crate::home::JobSpec) -> Result<(), InstallError> {
+    let id = TitleId::parse(&spec.title_id).map_err(|e| InstallError::NotStaging(e.to_string()))?;
+    let relative = Path::new(&spec.dest_rel);
+    check_title(&id, relative)?;
+    let name = relative
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("install");
-    let tmp = dest.with_file_name(format!(".{name}.mediaops-tmp"));
-    let copy = || -> std::io::Result<()> {
-        let mut from = fs::File::open(source)?;
-        let mut to = fs::File::create(&tmp)?;
-        std::io::copy(&mut from, &mut to)?;
-        to.sync_all()?;
-        fs::rename(&tmp, dest)?;
-        fs::remove_file(source)
-    };
-    if let Err(err) = copy() {
-        let _ = fs::remove_file(&tmp);
-        return Err(InstallError::io(dest, &err));
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| InstallError::NotStaging(spec.dest_rel.clone()))?;
+    let root = Path::new(&spec.library_root);
+    let source = root.join(pathschema::staging_path(&id, name)?);
+    let dest = root.join(relative);
+    if let Some(slot) = InstallTemporary::open(&source, &dest, false)? {
+        slot.clear_data()?;
+    }
+    Ok(())
+}
+
+struct InstallTemporary {
+    data: PathBuf,
+    dest: PathBuf,
+    // The marker doubles as a process-lifetime lock, including during cleanup.
+    _owner: fs::File,
+}
+
+impl InstallTemporary {
+    fn identity(source: &Path, dest: &Path) -> Vec<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut identity = b"mediaops-install-v1\0".to_vec();
+        identity.extend_from_slice(source.as_os_str().as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(dest.as_os_str().as_bytes());
+        identity
+    }
+
+    fn directory(source: &Path, dest: &Path) -> PathBuf {
+        let digest = Blake3Hex::of_bytes(&Self::identity(source, dest));
+        dest.with_file_name(format!(".mediaops-install-{digest}"))
+    }
+
+    fn open(source: &Path, dest: &Path, create: bool) -> Result<Option<Self>, InstallError> {
+        let dir = Self::directory(source, dest);
+        let created = if create {
+            match fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(e) => return Err(InstallError::io(&dir, &e)),
+            }
+        } else {
+            false
+        };
+        let directory = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&dir)
+        {
+            Ok(file) => file,
+            Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(InstallError::io(&dir, &e)),
+        };
+        let metadata = directory
+            .metadata()
+            .map_err(|e| InstallError::io(&dir, &e))?;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(InstallError::UnsafeTemporary(dir.display().to_string()));
+        }
+        let marker = dir.join("owner");
+        let mut owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(created)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&marker)
+            .map_err(|e| InstallError::io(&marker, &e))?;
+        let metadata = owner
+            .metadata()
+            .map_err(|e| InstallError::io(&marker, &e))?;
+        if !owned_regular(&metadata) || metadata.nlink() != 1 {
+            return Err(InstallError::UnsafeTemporary(marker.display().to_string()));
+        }
+        owner.try_lock().map_err(|e| {
+            InstallError::UnsafeTemporary(format!("{} is busy: {e}", dir.display()))
+        })?;
+        let identity = Self::identity(source, dest);
+        if created {
+            owner
+                .write_all(&identity)
+                .map_err(|e| InstallError::io(&marker, &e))?;
+            owner
+                .sync_all()
+                .map_err(|e| InstallError::io(&marker, &e))?;
+            directory
+                .sync_all()
+                .map_err(|e| InstallError::io(&dir, &e))?;
+            sync_parent(&dir)?;
+        } else {
+            let mut saved = Vec::new();
+            (&mut owner)
+                .take(identity.len() as u64 + 1)
+                .read_to_end(&mut saved)
+                .map_err(|e| InstallError::io(&marker, &e))?;
+            if saved != identity {
+                return Err(InstallError::UnsafeTemporary(marker.display().to_string()));
+            }
+        }
+        Ok(Some(Self {
+            data: dir.join("data"),
+            dest: dest.into(),
+            _owner: owner,
+        }))
+    }
+
+    fn clear_data(&self) -> Result<(), InstallError> {
+        let metadata = match fs::symlink_metadata(&self.data) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(InstallError::io(&self.data, &e)),
+        };
+        // A second link is ours only in the crash window after publication.
+        let links_are_owned = metadata.nlink() == 1
+            || (metadata.nlink() == 2
+                && fs::symlink_metadata(&self.dest).is_ok_and(|dest| {
+                    dest.dev() == metadata.dev() && dest.ino() == metadata.ino()
+                }));
+        if !owned_regular(&metadata) || !links_are_owned {
+            return Err(InstallError::UnsafeTemporary(
+                self.data.display().to_string(),
+            ));
+        }
+        fs::remove_file(&self.data).map_err(|e| InstallError::io(&self.data, &e))?;
+        sync_parent(&self.data)
+    }
+}
+
+fn owned_regular(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o077 == 0
+}
+
+fn sync_parent(path: &Path) -> Result<(), InstallError> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|err| InstallError::io(parent, &err))?;
     }
     Ok(())
 }
@@ -358,19 +738,19 @@ pub fn replace(
     if let Some(parent) = backup_destination.parent() {
         fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
     }
-    fs::rename(&dest, backup_destination).map_err(|err| InstallError::io(&dest, &err))?;
+    // Preserve the live entry until the encoded file can replace it atomically.
+    copy_into_place(&dest, backup_destination)?;
     if let Err(err) = fs::rename(&handle.source, &dest) {
-        // Put the live file back. If that also fails, both failures are
-        // reported -- the cause is never dropped for the rollback's error.
-        if let Err(restore) = fs::rename(backup_destination, &dest) {
-            return Err(InstallError::RollbackFailed {
-                cause: err.to_string(),
-                restore: restore.to_string(),
-                live_now_at: backup_destination.display().to_string(),
-            });
-        }
+        // The live entry never moved. Discard only the duplicate this call
+        // created, allowing a corrected conversion to retry normally.
+        fs::remove_file(backup_destination).map_err(|cleanup| InstallError::RollbackFailed {
+            cause: err.to_string(),
+            restore: cleanup.to_string(),
+            live_now_at: dest.display().to_string(),
+        })?;
         return Err(InstallError::io(&handle.source, &err));
     }
+    sync_parent(&dest)?;
     Ok(dest)
 }
 
@@ -384,14 +764,329 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn concurrent_no_replace_gate_has_one_winner_and_preserves_loser() {
+        let tmp = TempTree::new();
+        let first = tmp.path.join("first");
+        let second = tmp.path.join("second");
+        let dest = tmp.path.join("destination");
+        write_file(&first, b"first");
+        write_file(&second, b"second");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let outcomes = std::thread::scope(|scope| {
+            let one = scope.spawn(|| {
+                barrier.wait();
+                move_into_place(&first, &dest)
+            });
+            let two = scope.spawn(|| {
+                barrier.wait();
+                move_into_place(&second, &dest)
+            });
+            [one.join().expect("first"), two.join().expect("second")]
+        });
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1);
+        if outcomes[0].is_ok() {
+            assert_eq!(fs::read(&dest).expect("dest"), b"first");
+            assert_eq!(fs::read(&second).expect("loser preserved"), b"second");
+        } else {
+            assert_eq!(fs::read(&dest).expect("dest"), b"second");
+            assert_eq!(fs::read(&first).expect("loser preserved"), b"first");
+        }
+    }
+
+    #[test]
+    fn deadline_during_hash_and_before_publication_preserves_staging() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let staged = tmp
+            .path
+            .join(staging_path(&id, "The.Matrix.(1999).mkv").expect("stage"));
+        let bytes = vec![7; 3 * 64 * 1024];
+        write_file(&staged, &bytes);
+        let handle = VerifiedStagingHandle::verify(&tmp.path, &id, staged.clone(), &placement)
+            .expect("handle");
+        let proof = Blake3Hex::of_bytes(&bytes);
+        assert_eq!(
+            install_verified_before(&tmp.path, &id, &handle, &proof, Instant::now()),
+            Err(InstallError::DeadlineExceeded)
+        );
+        // Deterministically expire between chunks, without wall-clock sleeps.
+        let mut checks = 0;
+        let result = install_checked(&tmp.path, &id, &handle, Some(&proof), &mut || {
+            checks += 1;
+            if checks == 5 {
+                Err(InstallError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err(InstallError::DeadlineExceeded));
+        assert_eq!(fs::read(&staged).expect("source"), bytes);
+        assert!(!tmp.path.join(handle.dest_rel()).exists());
+
+        // Empty-source hashing ends after these checks; expire at publication.
+        write_file(&staged, b"");
+        let proof = Blake3Hex::of_bytes(b"");
+        checks = 0;
+        assert_eq!(
+            install_checked(&tmp.path, &id, &handle, Some(&proof), &mut || {
+                checks += 1;
+                if checks == 4 {
+                    Err(InstallError::DeadlineExceeded)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(InstallError::DeadlineExceeded)
+        );
+        assert!(!tmp.path.join(handle.dest_rel()).exists());
+        assert!(staged.is_file());
+    }
+
+    #[test]
+    fn cross_device_copy_expiry_leaves_one_owned_recoverable_partial() {
+        let tmp = TempTree::new();
+        let source = tmp.path.join("source");
+        let dest = tmp.path.join("destination");
+        write_file(&source, &vec![9; 3 * 64 * 1024]);
+        let mut checks = 0;
+        let result = copy_across_devices(&source, &dest, &mut || {
+            checks += 1;
+            if checks == 5 {
+                Err(InstallError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err(InstallError::DeadlineExceeded));
+        assert!(!dest.exists());
+        let slot = InstallTemporary::open(&source, &dest, false)
+            .expect("owned slot")
+            .expect("present");
+        assert_eq!(fs::metadata(&slot.data).expect("partial").len(), 64 * 1024);
+        let data = slot.data.clone();
+        slot.clear_data().expect("recover space");
+        assert!(!data.exists());
+        drop(slot);
+        copy_across_devices(&source, &dest, &mut || Ok(())).expect("retry");
+        assert_eq!(
+            fs::read(&dest).expect("dest"),
+            fs::read(&source).expect("source")
+        );
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn job_cleanup_recovers_interrupted_copy_without_removing_unknown_files() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let relative = render(&id, &placement).expect("schema");
+        let source = tmp
+            .path
+            .join(staging_path(&id, "The.Matrix.(1999).mkv").expect("stage"));
+        let dest = tmp.path.join(&relative);
+        fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
+        let spec = crate::home::JobSpec {
+            title_id: id.render(),
+            dest_rel: relative.display().to_string(),
+            library_root: tmp.path.display().to_string(),
+            file_len: 128 * 1024,
+            ..crate::home::JobSpec::default()
+        };
+        let slot = InstallTemporary::open(&source, &dest, true)
+            .expect("slot")
+            .expect("created");
+        let mut partial = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&slot.data)
+            .expect("data");
+        partial
+            .write_all(&vec![8; 128 * 1024])
+            .expect("allocated partial");
+        partial.sync_all().expect("sync");
+        let data = slot.data.clone();
+        drop(partial);
+        drop(slot); // Same on-disk state as process death before publication.
+        cleanup_install_temporary(&spec).expect("recover before capacity check");
+        assert!(!data.exists());
+
+        // A symlink or a file without the slot's ownership proof is not ours.
+        let precious = tmp.path.join("precious");
+        write_file(&precious, b"keep");
+        std::os::unix::fs::symlink(&precious, &data).expect("symlink collision");
+        assert!(cleanup_install_temporary(&spec).is_err());
+        assert_eq!(fs::read(&precious).expect("preserved"), b"keep");
+        fs::remove_file(&data).expect("remove test symlink");
+        let marker = data.parent().expect("slot").join("owner");
+        fs::write(&marker, b"unknown user data").expect("foreign marker");
+        write_file(&data, b"untouched");
+        assert!(cleanup_install_temporary(&spec).is_err());
+        assert_eq!(fs::read(&data).expect("unknown preserved"), b"untouched");
+    }
+
+    #[test]
+    fn published_temp_cleanup_preserves_the_installed_hard_link() {
+        let tmp = TempTree::new();
+        let source = tmp.path.join("source");
+        let dest = tmp.path.join("destination");
+        let slot = InstallTemporary::open(&source, &dest, true)
+            .expect("slot")
+            .expect("created");
+        let mut data = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&slot.data)
+            .expect("data");
+        data.write_all(b"verified").expect("write");
+        fs::hard_link(&slot.data, &dest).expect("publication");
+        drop(slot);
+        let slot = InstallTemporary::open(&source, &dest, false)
+            .expect("reopen")
+            .expect("slot");
+        slot.clear_data().expect("post-publication cleanup");
+        assert_eq!(fs::read(dest).expect("installed preserved"), b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn music_symlink_install_crosses_filesystems_without_overwriting() {
+        let library = TempTree::new();
+        let music = TempTree::new_at(Path::new("/dev/shm"));
+        assert_ne!(
+            fs::metadata(&library.path).expect("library disk").dev(),
+            fs::metadata(&music.path).expect("music disk").dev(),
+            "fixture must cross devices"
+        );
+        std::os::unix::fs::symlink(&music.path, library.path.join("music")).expect("music link");
+        let id = TitleId::album_key("Yes", "Relayer").expect("id");
+        let placement = Placement::track(
+            "Yes",
+            "Relayer",
+            1974,
+            None,
+            Some(1),
+            "Sound.Chaser",
+            "flac",
+        );
+        let relative = render(&id, &placement).expect("schema");
+        let filename = relative
+            .file_name()
+            .expect("filename")
+            .to_str()
+            .expect("utf8");
+        let source = library
+            .path
+            .join(staging_path(&id, filename).expect("stage"));
+        write_file(&source, b"verified music");
+        let handle = VerifiedStagingHandle::verify(&library.path, &id, source.clone(), &placement)
+            .expect("handle");
+        let result = install_verified_before(
+            &library.path,
+            &id,
+            &handle,
+            &Blake3Hex::of_bytes(b"verified music"),
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .expect("cross-device install");
+        assert_eq!(fs::read(&result.path).expect("music"), b"verified music");
+        assert_eq!(
+            fs::metadata(&result.path).expect("installed disk").dev(),
+            fs::metadata(&music.path).expect("music disk").dev()
+        );
+        assert!(!source.exists());
+        let slot = InstallTemporary::open(&source, &result.path, false)
+            .expect("slot")
+            .expect("owned");
+        assert!(!slot.data.exists());
+        drop(slot);
+        write_file(&source, b"replacement");
+        assert!(matches!(
+            install(&library.path, &id, &handle),
+            Err(InstallError::DestinationExists(_))
+        ));
+        assert_eq!(fs::read(&result.path).expect("original"), b"verified music");
+        assert_eq!(
+            fs::read(&source).expect("replacement retained"),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn persisted_digest_is_checked_before_installing_changed_staging() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let staged = tmp
+            .path
+            .join(staging_path(&id, "The.Matrix.(1999).mkv").expect("stage"));
+        write_file(&staged, b"before");
+        let handle = VerifiedStagingHandle::verify(&tmp.path, &id, staged.clone(), &placement)
+            .expect("handle");
+        let proof = Blake3Hex::of_bytes(b"before");
+        write_file(&staged, b"after!");
+        assert!(matches!(
+            install_verified(&tmp.path, &id, &handle, &proof),
+            Err(InstallError::DigestMismatch)
+        ));
+        assert!(
+            !tmp.path
+                .join(render(&id, &placement).expect("dest"))
+                .exists()
+        );
+        assert_eq!(fs::read(staged).expect("staged preserved"), b"after!");
+    }
+
+    #[test]
+    fn resume_budget_counts_allocated_blocks_not_sparse_length() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let rel = render(&id, &Placement::movie("The.Matrix", 1999, "mkv")).expect("render");
+        let mut partial = tmp
+            .path
+            .join(staging_path(&id, "The.Matrix.(1999).mkv").expect("stage"));
+        partial.as_mut_os_string().push(".partial");
+        fs::create_dir_all(partial.parent().expect("parent")).expect("dir");
+        let mut file = fs::File::create(&partial).expect("partial");
+        let len = 8 * crate::Bytes::MIB;
+        file.set_len(len).expect("sparse length");
+        let spec = crate::home::JobSpec {
+            title_id: id.render(),
+            dest_rel: rel.display().to_string(),
+            file_len: len,
+            library_root: tmp.path.display().to_string(),
+            ..crate::home::JobSpec::default()
+        };
+        assert_eq!(
+            pull_remaining_bytes(&spec).expect("remaining"),
+            len.saturating_sub(file.metadata().expect("metadata").blocks() * 512)
+        );
+        file.write_all(&[7; 4096]).expect("write");
+        file.sync_all().expect("sync");
+        let remaining = pull_remaining_bytes(&spec).expect("remaining");
+        assert!(
+            remaining < len && remaining > 0,
+            "only allocated blocks count"
+        );
+    }
+
     struct TempTree {
         path: PathBuf,
     }
 
     impl TempTree {
         fn new() -> Self {
+            Self::new_at(&std::env::temp_dir())
+        }
+
+        fn new_at(base: &Path) -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let path = base.join(format!(
                 "mediaops-install-{}-{}-{}",
                 std::process::id(),
                 n,

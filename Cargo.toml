@@ -11,12 +11,21 @@ members = [
     "crates/sync",
     "crates/encode",
     "crates/arch-tests",
+    "crates/home-client",
+    "crates/api",
     "bins/mediaops",
     "bins/mediaopsd",
+    "bins/mediaops-api",
+    "bins/mediaops-scheduler",
+    "bins/mediaops-gateway",
+    "bins/mediaops-inventory",
+    "bins/mediaops-pull",
+    "bins/mediaops-home",
+    "bins/mediaops-tui",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98.0"
 license = "MIT"
@@ -55,6 +64,9 @@ tower = { version = "=0.5.3", default-features = false }
 http = { version = "=1.5.0", default-features = false }
 hyper-util = { version = "=0.1.20", default-features = false }
 rustls-pki-types = "=1.15.1"
+unicode-width = "=0.2.2"
+ratatui = "=0.30.2"
+crossterm = "=0.29.0"
 
 mediaops-core = { path = "crates/core" }
 mediaops-proto = { path = "crates/proto" }
@@ -65,3 +77,6 @@ mediaops-arr = { path = "crates/arr" }
 mediaops-transfer = { path = "crates/transfer" }
 mediaops-sync = { path = "crates/sync" }
 mediaops-encode = { path = "crates/encode" }
+mediaops-home-client = { path = "crates/home-client" }
+mediaops-apiserver = { path = "crates/api" }
+mediaops-tui = { path = "bins/mediaops-tui" }

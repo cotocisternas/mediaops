@@ -30,6 +30,32 @@ const ALLOWED_WORKSPACE_EDGES: &[(&str, &str)] = &[
     ("mediaops", "mediaops-ssh"),
     ("mediaops", "mediaops-sync"),
     ("mediaops", "mediaops-encode"),
+    ("mediaops-home-client", "mediaops-core"),
+    ("mediaops-home-client", "mediaops-proto"),
+    ("mediaops-apiserver", "mediaops-core"),
+    ("mediaops-apiserver", "mediaops-proto"),
+    ("mediaops-apiserver", "mediaops-store"),
+    ("mediaops-api", "mediaops-apiserver"),
+    ("mediaops-api", "mediaops-core"),
+    ("mediaops-api", "mediaops-home-client"),
+    ("mediaops-scheduler", "mediaops-core"),
+    ("mediaops-scheduler", "mediaops-home-client"),
+    ("mediaops-gateway", "mediaops-core"),
+    ("mediaops-gateway", "mediaops-home-client"),
+    ("mediaops-gateway", "mediaops-net"),
+    ("mediaops-inventory", "mediaops-core"),
+    ("mediaops-inventory", "mediaops-home-client"),
+    ("mediaops-inventory", "mediaops-proto"),
+    ("mediaops-inventory", "mediaops-transfer"),
+    ("mediaops-pull", "mediaops-core"),
+    ("mediaops-pull", "mediaops-home-client"),
+    ("mediaops-pull", "mediaops-transfer"),
+    ("mediaops", "mediaops-home-client"),
+    ("mediaops", "mediaops-apiserver"),
+    ("mediaops-tui", "mediaops-core"),
+    ("mediaops-tui", "mediaops-home-client"),
+    ("mediaops-apiserver", "mediaops-tui"),
+    ("mediaops-apiserver", "mediaops-home-client"),
 ];
 
 const BANNED_DIRECT_CRATES: &[&str] = &[
@@ -93,15 +119,48 @@ pub fn violations(metadata: &Metadata) -> Vec<Violation> {
                     message: format!("banned crate {to} is a direct dependency of {from}"),
                 });
             }
+            if (to == "ratatui" || to == "crossterm") && from != "mediaops-tui" {
+                found.push(Violation {
+                    message: format!("{to} is a direct dependency of {from}; only mediaops-tui may depend on {to}"),
+                });
+            }
         }
         workspace_graph.insert(from, tos);
     }
 
-    for forbidden in ["mediaops-store", "mediaops-encode"] {
-        if closure_contains(&workspace_graph, "mediaopsd", forbidden) {
+    for start in [
+        "mediaopsd",
+        "mediaops-home",
+        "mediaops-gateway",
+        "mediaops-scheduler",
+        "mediaops-inventory",
+        "mediaops-pull",
+    ] {
+        for forbidden in ["mediaops-store", "mediaops-encode"] {
+            if closure_contains(&workspace_graph, start, forbidden) {
+                found.push(Violation {
+                    message: format!(
+                        "{forbidden} is in {start}'s workspace-internal transitive closure"
+                    ),
+                });
+            }
+        }
+    }
+
+    for forbidden in [
+        "mediaops-store",
+        "mediaops-encode",
+        "mediaops-arr",
+        "mediaops-net",
+        "mediaops-ssh",
+        "mediaops-transfer",
+        "mediaops-apiserver",
+        "mediaops-sync",
+    ] {
+        if closure_contains(&workspace_graph, "mediaops-tui", forbidden) {
             found.push(Violation {
                 message: format!(
-                    "{forbidden} is in mediaopsd's workspace-internal transitive closure"
+                    "{forbidden} is in mediaops-tui's workspace-internal transitive closure"
                 ),
             });
         }
@@ -351,8 +410,17 @@ mod tests {
         "mediaops-sync",
         "mediaops-encode",
         "mediaops-arch-tests",
+        "mediaops-home-client",
+        "mediaops-apiserver",
+        "mediaops-api",
+        "mediaops-scheduler",
+        "mediaops-gateway",
+        "mediaops-inventory",
+        "mediaops-pull",
+        "mediaops-home",
         "mediaops",
         "mediaopsd",
+        "mediaops-tui",
     ];
 
     #[test]
@@ -473,6 +541,48 @@ mod tests {
                 .iter()
                 .any(|v| v.message.contains("ssh2") && v.message.contains("mediaops-net")),
             "expected banned ssh2 violation, got:\n{}",
+            messages(&found)
+        );
+    }
+
+    #[test]
+    fn ratatui_on_cli_is_violation() {
+        let mut metadata = live_metadata();
+        add_direct_dep(&mut metadata, "mediaops", "ratatui");
+        let found = violations(&metadata);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.message.contains("ratatui") && v.message.contains("mediaops")),
+            "expected ratatui-on-cli violation, got:\n{}",
+            messages(&found)
+        );
+    }
+
+    #[test]
+    fn crossterm_on_daemon_is_violation() {
+        let mut metadata = live_metadata();
+        add_direct_dep(&mut metadata, "mediaopsd", "crossterm");
+        let found = violations(&metadata);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.message.contains("crossterm") && v.message.contains("mediaopsd")),
+            "expected crossterm-on-daemon violation, got:\n{}",
+            messages(&found)
+        );
+    }
+
+    #[test]
+    fn tui_to_apiserver_is_violation() {
+        let mut metadata = live_metadata();
+        add_direct_dep(&mut metadata, "mediaops-tui", "mediaops-apiserver");
+        let found = violations(&metadata);
+        assert!(
+            found.iter().any(|v| {
+                v.message.contains("mediaops-tui") && v.message.contains("mediaops-apiserver")
+            }),
+            "expected tui→apiserver violation, got:\n{}",
             messages(&found)
         );
     }

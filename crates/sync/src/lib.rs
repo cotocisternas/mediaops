@@ -68,7 +68,7 @@ pub fn refuse_below_watermark(root: &Path, min_free: Bytes) -> Result<u64, Libra
 /// replaces: the library is a spinning disk shared with playback.
 pub fn run_service_unit(exec_start: &str) -> String {
     format!(
-        "[Unit]\nDescription=mediaops run (seedbox -> library)\nAfter=network-online.target mediaopsd-home.service\nWants=mediaopsd-home.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=infinity\nNice=10\nIOSchedulingClass=best-effort\nIOSchedulingPriority=6\nExecStart={exec_start}\n"
+        "[Unit]\nDescription=mediaops run (seedbox -> library)\nAfter=network-online.target mediaops-home.service\nWants=mediaops-home.service\n\n[Service]\nType=oneshot\nTimeoutStartSec=infinity\nNice=10\nIOSchedulingClass=best-effort\nIOSchedulingPriority=6\nExecStart={exec_start}\n"
     )
 }
 
@@ -91,13 +91,13 @@ pub fn write_user_units(unit_dir: &Path, exec_start: &str) -> Result<(), Library
 
 pub fn home_service_unit(exec_start: &str) -> String {
     format!(
-        "[Unit]\nDescription=mediaopsd home gateway\n\n[Service]\nType=simple\nRestart=on-failure\nExecStart={exec_start}\n\n[Install]\nWantedBy=default.target\n"
+        "[Unit]\nDescription=mediaops home control plane\n\n[Service]\nType=simple\nRestart=on-failure\nExecStart={exec_start}\n\n[Install]\nWantedBy=default.target\n"
     )
 }
 
 pub fn write_home_unit(unit_dir: &Path, exec_start: &str) -> Result<(), LibraryError> {
     fs::create_dir_all(unit_dir).map_err(|err| LibraryError::io(unit_dir, err))?;
-    let service = unit_dir.join("mediaopsd-home.service");
+    let service = unit_dir.join("mediaops-home.service");
     fs::write(&service, home_service_unit(exec_start))
         .map_err(|err| LibraryError::io(&service, err))?;
     Ok(())
@@ -344,11 +344,12 @@ mod tests {
 
     #[test]
     fn home_service_is_simple_restart_on_failure() {
-        let text = home_service_unit("/opt/mediaopsd serve --role home");
+        let text = home_service_unit("/opt/mediaops-home");
         assert!(text.contains("Type=simple"));
         assert!(text.contains("Restart=on-failure"));
-        assert!(text.contains("serve --role home"));
+        assert!(text.contains("ExecStart=/opt/mediaops-home"));
         assert!(!text.contains("OnCalendar"));
+        assert!(!text.contains("mediaops-run.timer"));
     }
 
     #[test]
@@ -403,14 +404,15 @@ mod tests {
     fn write_user_units_and_home_unit_use_expected_names() {
         let dir = scratch("units");
         write_user_units(&dir, "/opt/mediaops run").expect("run units");
-        write_home_unit(&dir, "/opt/mediaopsd serve --role home").expect("home unit");
+        write_home_unit(&dir, "/opt/mediaops-home").expect("home unit");
         let service = fs::read_to_string(dir.join("mediaops-run.service")).expect("service");
         let timer = fs::read_to_string(dir.join("mediaops-run.timer")).expect("timer");
-        let home = fs::read_to_string(dir.join("mediaopsd-home.service")).expect("home");
+        let home = fs::read_to_string(dir.join("mediaops-home.service")).expect("home");
         assert!(service.contains("ExecStart=/opt/mediaops run"));
         assert!(timer.contains("OnUnitInactiveSec="));
         assert!(!timer.contains("OnCalendar"));
-        assert!(home.contains("ExecStart=/opt/mediaopsd serve --role home"));
+        assert!(home.contains("ExecStart=/opt/mediaops-home"));
+        assert!(!dir.join("mediaopsd-home.service").exists());
         let _ = fs::remove_dir_all(dir);
     }
 

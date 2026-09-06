@@ -15,11 +15,7 @@ use mediaops_core::{
     classify_remote, normalize_placement, render_placement,
 };
 
-/// Extensions the planner treats as library media. Everything else on the
-/// box (`.nfo`, `.srt`, `.jpg`, `.par2`, `.sfv`, …) is release furniture and
-/// is neither copied nor reported.
-pub const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "m4v", "avi", "ts", "mov", "webm", "wmv"];
-pub const AUDIO_EXTENSIONS: &[&str] = &["flac", "mp3", "m4a", "ogg", "opus", "wav", "aac", "aiff"];
+pub use mediaops_core::{AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, is_media_file};
 
 pub struct PlanRequest<'a> {
     pub listings: &'a [RemoteEntry],
@@ -57,23 +53,6 @@ struct Candidate {
     listing_index: usize,
     kind: TitleKind,
     wanted: bool,
-}
-
-/// True for a file the planner would consider library media.
-pub fn is_media_file(remote: &RemoteRef) -> bool {
-    let name = remote
-        .rel_path()
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let lower = name.to_ascii_lowercase();
-    if lower.contains("sample") {
-        return false;
-    }
-    let Some((_, ext)) = lower.rsplit_once('.') else {
-        return false;
-    };
-    VIDEO_EXTENSIONS.contains(&ext) || AUDIO_EXTENSIONS.contains(&ext)
 }
 
 fn review_reason(err: &PathSchemaError) -> &'static str {

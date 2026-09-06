@@ -1,0 +1,21 @@
+[package]
+name = "mediaops-home-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+http.workspace = true
+libc.workspace = true
+hyper-util = { workspace = true, features = ["tokio"] }
+mediaops-core.workspace = true
+mediaops-proto.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, default-features = false, features = ["net"] }
+tonic = { workspace = true, features = ["codegen", "transport"] }
+tower = { workspace = true, features = ["util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "net", "time"] }

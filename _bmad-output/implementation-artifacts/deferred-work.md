@@ -1,5 +1,11 @@
 # Deferred Work
 
+> **Historical findings, not a verified current backlog.** Some items were
+> resolved or superseded by the Home API rewrite; others may still matter.
+> Reproduce each candidate against current code before scheduling it. Do not
+> bulk-close, bulk-reopen, or implement this ledger as-is. See
+> [documentation status](../../docs/documentation-status.md).
+
 Items raised by review workflows and consciously deferred. Each entry names the
 review that raised it so a later story can pick it up with context.
 

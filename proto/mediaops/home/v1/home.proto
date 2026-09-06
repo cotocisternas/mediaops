@@ -1,0 +1,467 @@
+// mediaops.home.v1 is the home apiserver contract.
+//
+// Seedbox Transfer/Control stay in mediaops.v1. This package is unix-socket
+// only. Clients identify themselves with x-mediaops-actor metadata.
+syntax = "proto3";
+
+package mediaops.home.v1;
+
+import "mediaops/v1/mediaops.proto";
+
+// Home object CRUD, watch, and a reconcile kick.
+service HomeService {
+  // Read one object by kind and name.
+  rpc Get(GetRequest) returns (GetResponse);
+  // List objects of one kind, or every kind when kind is empty.
+  rpc List(ListRequest) returns (ListResponse);
+  // Stream ADDED/MODIFIED/DELETED from a resourceVersion.
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+  // Create or replace spec. Status is preserved on update.
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  // Patch spec, status, or Job bind (nodeName).
+  rpc Patch(PatchRequest) returns (PatchResponse);
+  // Delete one object.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  // Increment Cluster.status.reconcile_generation.
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+}
+
+// Identity and optimistic concurrency.
+message Metadata {
+  // Object name. TitleId render for Title/Want; RemoteFile uses root/path.
+  string name = 1;
+  // Stable uid assigned at create.
+  string uid = 2;
+  // Increments when spec changes.
+  int64 generation = 3;
+  // Monotonic store revision. Writes fail on mismatch when set.
+  int64 resource_version = 4;
+}
+
+// One Home API object. CLI -o json is this message converted to domain JSON.
+message Object {
+  // Must be mediaops.home.v1.
+  string api_version = 1;
+  // Kind string (Cluster, Secret, Title, Want, Job, Hold, RemoteFile, Node, Event).
+  string kind = 2;
+  // Name, uid, generation, resourceVersion.
+  Metadata metadata = 3;
+  // Kind payload. Exactly one field is set.
+  oneof body {
+    // Cluster spec and status.
+    Cluster cluster = 10;
+    // Secret spec (seedbox_address). Status is empty.
+    Secret secret = 11;
+    // Title spec and status.
+    Title title = 12;
+    // Want spec and status.
+    Want want = 13;
+    // Job spec and status.
+    Job job = 14;
+    // Hold spec and status.
+    Hold hold = 15;
+    // Observed inventory only.
+    RemoteFile remote_file = 16;
+    // Worker heartbeat.
+    Node node = 17;
+    // Progress / refuse / drift / bind event.
+    Event event = 18;
+  }
+}
+
+// Budgets, roots, grabber. Runtime truth that used to live in config.toml.
+message Cluster {
+  // Desired cluster configuration.
+  ClusterSpec spec = 1;
+  // Accepted and reconcile generations.
+  ClusterStatus status = 2;
+}
+
+// Desired cluster configuration.
+message ClusterSpec {
+  // max_copy budget in bytes.
+  uint64 max_copy = 1;
+  // min_free watermark in bytes.
+  uint64 min_free = 2;
+  // GetRange length in bytes.
+  uint64 range_len = 3;
+  // Optional pinned Range concurrency. Zero means unset.
+  uint32 range_concurrency = 4;
+  // Grabber mode: none or servarr.
+  string grabber = 5;
+  // When true, controllers create no new Pull Jobs.
+  bool lock = 6;
+  // Encode pause. Unused in slice 1.
+  bool encode_pause = 7;
+  // Absolute library root the scheduler statfs-es.
+  string library_root = 8;
+  // Allowlisted remote roots.
+  repeated PathRoot roots = 9;
+}
+
+// One allowlisted remote root.
+message PathRoot {
+  // Root id (for example seedbox).
+  string id = 1;
+  // Absolute path on the box.
+  string path = 2;
+  // Optional TitleKind: movie, series, album.
+  string kind = 3;
+}
+
+// Observed cluster bookkeeping.
+message ClusterStatus {
+  // Last generation the API accepted.
+  int64 accepted_generation = 1;
+  // Incremented by Reconcile.
+  int64 reconcile_generation = 2;
+}
+
+// Upstream identity. CLI get redacts seedbox_address.
+message Secret {
+  // Desired secret fields.
+  SecretSpec spec = 1;
+}
+
+// Secret payload.
+message SecretSpec {
+  // seedbox HOST:PORT. Never printed by CLI get.
+  string seedbox_address = 1;
+  // CA SHA-256 hex.
+  string ca_sha256 = 2;
+  // Server leaf SHA-256 hex.
+  string server_sha256 = 3;
+  // Client leaf SHA-256 hex.
+  string client_sha256 = 4;
+}
+
+// Library title desired vs observed.
+message Title {
+  // Desired presence.
+  TitleSpec spec = 1;
+  // Installed path, digests, drift.
+  TitleStatus status = 2;
+}
+
+// Desired title.
+message TitleSpec {
+  // TitleId render.
+  string title_id = 1;
+  // Human wants this title on disk.
+  bool desired_present = 2;
+}
+
+// Observed title.
+message TitleStatus {
+  // Installed schema path, empty if missing.
+  string path = 1;
+  // Install-time BLAKE3 hex, empty if unknown.
+  string install_b3 = 2;
+  // Current BLAKE3 hex, empty if unknown.
+  string current_b3 = 3;
+  // True when desired present and the file is gone.
+  bool drifted = 4;
+  // Durable proof for every installed episode, track, or movie.
+  repeated TitleFileStatus files = 5;
+}
+
+// One library-relative schema file and its immutable install proof.
+message TitleFileStatus {
+  // Canonical PathSchema path relative to the library root.
+  string path = 1;
+  // Digest recorded when first installed.
+  string install_b3 = 2;
+  // Current digest, including any later verified encode.
+  string current_b3 = 3;
+  // Missing or changed since the last verified write.
+  bool drifted = 4;
+}
+
+// Watch-list entry.
+message Want {
+  // Title to copy when a RemoteFile exists.
+  WantSpec spec = 1;
+  // open / satisfied / dropped.
+  WantStatus status = 2;
+}
+
+// Desired want.
+message WantSpec {
+  // TitleId render.
+  string title_id = 1;
+}
+
+// Observed want.
+message WantStatus {
+  // open, satisfied, or dropped.
+  string phase = 1;
+}
+
+// Snapshotted work item. Controllers create; scheduler binds; worker reports.
+message Job {
+  // Frozen pull spec plus bind.
+  JobSpec spec = 1;
+  // Phase, bytes, attempts, message.
+  JobStatus status = 2;
+}
+
+// Frozen Job spec.
+message JobSpec {
+  // pull (encode/reclaim later).
+  string kind = 1;
+  // TitleId render.
+  string title_id = 2;
+  // Remote root id.
+  string remote_root = 3;
+  // Path relative to that root.
+  string remote_path = 4;
+  // PathSchema-rendered dest relative to library_root.
+  string dest_rel = 5;
+  // Remote file length.
+  uint64 file_len = 6;
+  // Snapshotted range_len bytes.
+  uint64 range_len = 7;
+  // Snapshotted max_copy bytes.
+  uint64 max_copy = 8;
+  // Snapshotted min_free bytes.
+  uint64 min_free = 9;
+  // Bound Node name. Empty until the scheduler binds.
+  string node_name = 10;
+  // Bound worker kind (pull).
+  string worker_kind = 11;
+  // Snapshotted absolute library root.
+  string library_root = 12;
+  // Snapshotted parallel Range streams.
+  uint32 range_concurrency = 13;
+  // Exact authorizing Hold object. Empty means the Title's Want.
+  string hold_name = 14;
+}
+
+// Observed Job.
+message JobStatus {
+  // pending, pulling, verifying, installed, refused, failed.
+  string phase = 1;
+  // Bytes written so far.
+  uint64 bytes_done = 2;
+  // In-process retry count.
+  uint32 attempts = 3;
+  // Refuse / fail reason.
+  string message = 4;
+  // First attempt start, persisted across restarts.
+  int64 started_unix = 5;
+  // Whole-file digest durably recorded before installation.
+  string verified_b3 = 6;
+}
+
+// Import-blocked inbox item.
+message Hold {
+  // Human decision.
+  HoldSpec spec = 1;
+  // Reason, size, release name.
+  HoldStatus status = 2;
+}
+
+// Hold desired decision.
+message HoldSpec {
+  // TitleId render.
+  string title_id = 1;
+  // Release token.
+  string release_id = 2;
+  // empty, approved, or rejected.
+  string decision = 3;
+}
+
+// Hold observed.
+message HoldStatus {
+  // Import-block reason from the box.
+  string reason = 1;
+  // Release size in bytes.
+  uint64 size = 2;
+  // Scene / release name.
+  string release = 3;
+  // Exact allowlist root selected by this release.
+  string remote_root = 4;
+  // Exact file relative to remote_root.
+  string remote_path = 5;
+  // Authoritative placement from the grabber, including unparseable releases.
+  mediaops.v1.Placement placement = 6;
+  // Release arrival time for the operator inbox.
+  int64 added_unix = 7;
+  // The exact release rejection has been acknowledged by the box.
+  bool rejection_observed = 8;
+  // Inventory generation in which this HoldKey was observed live.
+  int64 list_generation = 9;
+}
+
+// Observed box listing. No spec.
+message RemoteFile {
+  // Listing fields.
+  RemoteFileStatus status = 1;
+}
+
+// Inventory observation.
+message RemoteFileStatus {
+  // Allowlist root id.
+  string root_id = 1;
+  // Path relative to the root.
+  string rel_path = 2;
+  // Size in bytes.
+  uint64 len = 3;
+  // True when PathSchema parsed the path.
+  bool parse_ok = 4;
+  // TitleId render when parse_ok.
+  string title_id = 5;
+  // Inventory list generation that last wrote this object.
+  int64 list_generation = 6;
+}
+
+// Worker or scheduler heartbeat.
+message Node {
+  // workerKind.
+  NodeSpec spec = 1;
+  // Ready and last heartbeat.
+  NodeStatus status = 2;
+}
+
+// Node desired identity.
+message NodeSpec {
+  // pull, scheduler, or inventory.
+  string worker_kind = 1;
+}
+
+// Node observed.
+message NodeStatus {
+  // True while heartbeats are fresh.
+  bool ready = 1;
+  // Unix seconds of the last heartbeat.
+  int64 last_heartbeat_unix = 2;
+  // Last completely published inventory listing; zero means never published.
+  int64 list_generation = 3;
+  // Completion time for freshness independent of heartbeat.
+  int64 list_completed_unix = 4;
+}
+
+// Progress / refuse / drift / bind note.
+message Event {
+  // Event payload.
+  EventStatus status = 1;
+}
+
+// Event observed.
+message EventStatus {
+  // Involved object kind.
+  string involved_kind = 1;
+  // Involved object name.
+  string involved_name = 2;
+  // Short reason token.
+  string reason = 3;
+  // Operator-facing text.
+  string message = 4;
+  // Unix seconds.
+  int64 ts = 5;
+}
+
+// Get one object.
+message GetRequest {
+  // Kind string.
+  string kind = 1;
+  // Object name.
+  string name = 2;
+}
+
+// List objects.
+message ListRequest {
+  // Kind filter. Empty lists every kind.
+  string kind = 1;
+}
+
+// List result.
+message ListResponse {
+  // Objects in store order.
+  repeated Object items = 1;
+}
+
+// Watch from a revision.
+message WatchRequest {
+  // Kind filter. Empty watches every kind.
+  string kind = 1;
+  // Send events after this resourceVersion. Zero means now.
+  int64 resource_version = 2;
+}
+
+// Watch event type. Zero is unspecified.
+enum WatchType {
+  // Field omitted.
+  WATCH_TYPE_UNSPECIFIED = 0;
+  // Object created.
+  WATCH_TYPE_ADDED = 1;
+  // Object updated.
+  WATCH_TYPE_MODIFIED = 2;
+  // Object deleted.
+  WATCH_TYPE_DELETED = 3;
+}
+
+// One watch notification.
+message WatchResponse {
+  // Added, modified, or deleted.
+  WatchType type = 1;
+  // Object at that revision.
+  Object object = 2;
+}
+
+// Get result.
+message GetResponse {
+  // The object.
+  Object object = 1;
+}
+
+// Apply result.
+message ApplyResponse {
+  // The written object.
+  Object object = 1;
+}
+
+// Patch result.
+message PatchResponse {
+  // The written object.
+  Object object = 1;
+}
+
+// Delete result.
+message DeleteResponse {
+  // The deleted object.
+  Object object = 1;
+}
+
+// Apply (create or replace spec).
+message ApplyRequest {
+  // Object to write. metadata.resource_version must match when updating.
+  Object object = 1;
+}
+
+// Patch spec, status, or bind.
+message PatchRequest {
+  // Object carrying the fields to write.
+  Object object = 1;
+  // Empty or spec: replace spec. status: replace status. bind: set Job.nodeName.
+  string subresource = 2;
+}
+
+// Delete one object.
+message DeleteRequest {
+  // Kind string.
+  string kind = 1;
+  // Object name.
+  string name = 2;
+  // Exact revision to delete. Zero never bypasses concurrency checks.
+  int64 resource_version = 3;
+}
+
+// Kick controllers.
+message ReconcileRequest {}
+
+// Reconcile result.
+message ReconcileResponse {
+  // New Cluster.status.reconcile_generation.
+  int64 reconcile_generation = 1;
+}

@@ -7,16 +7,19 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mediaops_core::{
-    Blake3Hex, HoldDecision, HoldKey, HoldsRepo, Job, JobEvent, JobId, JobKind, JobsRepo, Probe,
-    ProbeRepo, TitleId, TitleIndexEntry, TitleIndexRepo,
+    Blake3Hex, HoldDecision, HoldKey, HoldsRepo, HomeError, Job, JobEvent, JobId, JobKind,
+    JobsRepo, Probe, ProbeRepo, TitleId, TitleIndexEntry, TitleIndexRepo,
 };
 use rusqlite::Connection;
 
+mod api;
 mod holds;
 mod jobs;
 mod machine;
 mod probes;
 mod title_index;
+
+pub use api::{ApiStore, StoreEvent, WatchType};
 
 const SCHEMA_VERSION: i64 = 7;
 
@@ -49,6 +52,8 @@ pub enum StoreError {
     JobNotFound(JobId),
     #[error("job {0} state changed during advance")]
     JobConflict(JobId),
+    #[error(transparent)]
+    Home(#[from] HomeError),
 }
 
 #[derive(Debug, Clone)]

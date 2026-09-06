@@ -1,5 +1,9 @@
 # Implementation Readiness — mediaops
 
+> **Historical readiness verdict, not approval of the Home API rewrite.** The
+> assessment and next-step instructions below belong to the pre-rewrite delivery.
+> Do not dispatch them. See [current documentation](../../docs/README.md).
+
 - **Date:** 2026-08-29
 - **Gate verdict:** PASS
 - **Assessed by:** bmad-sprint-planning readiness gate

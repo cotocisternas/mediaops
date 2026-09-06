@@ -61,11 +61,18 @@ pub async fn watch(
 }
 
 fn format_watch(label: &str, data: &WatchData) -> String {
+    format_watch_line(
+        label,
+        &data.title_id,
+        if data.created { "" } else { "already" },
+    )
+}
+
+pub fn format_watch_line(label: &str, title_id: &str, meta: &str) -> String {
     let style = Style::stdout();
-    let meta = if data.created { "" } else { "already" };
     finish(vec![
         row(style, "watching", Tone::Go, label, meta),
-        indent(style, &data.title_id),
+        indent(style, title_id),
     ])
 }
 

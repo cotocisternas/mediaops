@@ -1,17 +1,14 @@
 use std::io::{self, IsTerminal, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
 use mediaops_arr::{KeyPaths, LocalhostGrabOps, ReqwestTransport};
-use mediaops_core::{
-    Allowlist, DesiredState, ExitCode, GrabOps, Grabber, UnderlayMode, endpoint_fingerprint,
-};
-use mediaops_net::{DaemonRole, HomeGateway, IdentityBundle, Seedbox, serve_home_unix, serve_tcp};
+use mediaops_core::{Allowlist, DesiredState, ExitCode, GrabOps, Grabber};
+use mediaops_net::{DaemonRole, IdentityBundle, Seedbox, serve_tcp};
 use std::sync::Arc;
-use tokio::net::{UnixListener, UnixStream};
 
 const BIN_NAME: &str = "mediaopsd";
 
@@ -37,15 +34,15 @@ struct ServeArgs {
     role: String,
     #[arg(long, default_value = "0.0.0.0:50051")]
     bind: String,
-    /// Home role UDS path. Ignored for seedbox.
+    /// Ignored. Home UDS is `mediaops-gateway`.
     #[arg(long)]
     socket: Option<PathBuf>,
     #[arg(long)]
     tls_dir: PathBuf,
-    /// Home role: seedbox `HOST:PORT`. Alternative to `--config`.
+    /// Ignored. Home attach is `mediaops-gateway`.
     #[arg(long)]
     upstream: Option<String>,
-    /// Home role: read `seedbox_address` + underlay from config.toml.
+    /// Seedbox: read grabber from config.toml.
     #[arg(long = "config", value_name = "PATH")]
     desired_state: Option<PathBuf>,
     /// Allowlisted root as `id=path`. Repeatable. Seedbox role only.
@@ -175,50 +172,6 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
     }
 }
 
-fn default_home_socket() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|dir| PathBuf::from(dir).join("mediaopsd.sock"))
-        .unwrap_or_else(|| default_state_dir().join("mediaopsd.sock"))
-}
-
-fn default_state_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|b| {
-            b.state_dir()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| b.home_dir().join(".local").join("state"))
-                .join("mediaops")
-        })
-        .unwrap_or_else(|| PathBuf::from(".mediaops-state"))
-}
-
-fn parse_grpc_addr(raw: &str) -> Result<SocketAddr, AppError> {
-    if let Ok(addr) = raw.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    raw.to_socket_addrs()
-        .map_err(|err| AppError::Usage(format!("bad seedbox address `{raw}`: {err}")))?
-        .next()
-        .ok_or_else(|| AppError::Usage(format!("seedbox address `{raw}` did not resolve")))
-}
-
-fn resolve_upstream(args: &ServeArgs) -> Result<(String, SocketAddr, UnderlayMode), AppError> {
-    if let Some(raw) = args.upstream.as_deref() {
-        let addr = parse_grpc_addr(raw)?;
-        return Ok((raw.to_string(), addr, UnderlayMode::Direct));
-    }
-    let path = args.desired_state.as_ref().ok_or_else(|| {
-        AppError::Usage("home role requires --upstream HOST:PORT or --config".into())
-    })?;
-    let text = std::fs::read_to_string(path).map_err(|err| AppError::Runtime(err.into()))?;
-    let ds = DesiredState::from_toml(&text).map_err(|err| AppError::Runtime(anyhow!(err)))?;
-    let raw = ds.seedbox_address().ok_or_else(|| {
-        AppError::Usage("config.toml has no seedbox_address; pass --upstream".into())
-    })?;
-    let addr = parse_grpc_addr(raw)?;
-    Ok((raw.to_string(), addr, ds.underlay()))
-}
-
 async fn serve_seedbox(args: ServeArgs) -> Result<(), AppError> {
     if args.roots.is_empty() {
         return Err(AppError::Usage(
@@ -275,49 +228,13 @@ fn seedbox_grab_ops(
     Ok((ds.grabber(), Some(Arc::new(ops))))
 }
 
-async fn serve_home(args: ServeArgs) -> Result<(), AppError> {
-    let (raw, upstream, underlay) = resolve_upstream(&args)?;
-    let identity =
-        IdentityBundle::from_dir(&args.tls_dir).map_err(|err| AppError::Runtime(anyhow!(err)))?;
-    let server = identity
-        .server_config()
-        .map_err(|err| AppError::Runtime(anyhow!(err)))?;
-    let client = identity
-        .client_config()
-        .map_err(|err| AppError::Runtime(anyhow!(err)))?;
-    let fingerprint = endpoint_fingerprint(&raw, underlay);
-    let gateway = HomeGateway::connect(upstream, client, fingerprint, 1)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow!(err)))?;
-    let socket = args.socket.unwrap_or_else(default_home_socket);
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| AppError::Runtime(err.into()))?;
-    }
-    if Path::new(&socket).exists() {
-        match UnixStream::connect(&socket).await {
-            Ok(_) => {
-                return Err(AppError::Runtime(anyhow!(
-                    "home socket {} is live; not replacing a running gateway",
-                    socket.display()
-                )));
-            }
-            Err(_) => {
-                std::fs::remove_file(&socket).map_err(|err| AppError::Runtime(err.into()))?;
-            }
-        }
-    }
-    let listener = UnixListener::bind(&socket).map_err(|e| AppError::Runtime(e.into()))?;
-    tracing::info!(socket = %socket.display(), upstream = %upstream, "home gateway listen");
-    serve_home_unix(listener, server, gateway)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow!(err)))
-}
-
 async fn serve(args: ServeArgs) -> Result<(), AppError> {
     let role = DaemonRole::parse(&args.role).map_err(|err| AppError::Usage(err.to_string()))?;
     match role {
         DaemonRole::Seedbox => serve_seedbox(args).await,
-        DaemonRole::Home => serve_home(args).await,
+        DaemonRole::Home => Err(AppError::Usage(
+            "role `home` moved to mediaops-gateway; start mediaops-home".into(),
+        )),
         DaemonRole::ReverseConnect => Err(AppError::Usage(
             "role `reverse-connect` is a designed-unused mode of this binary".into(),
         )),
@@ -392,55 +309,6 @@ mod tests {
             roots: Vec::new(),
             nginx_dir: None,
         }
-    }
-
-    #[test]
-    fn parse_grpc_addr_happy_and_garbage() {
-        assert_eq!(
-            parse_grpc_addr("127.0.0.1:50051").expect("addr"),
-            "127.0.0.1:50051".parse().expect("parse")
-        );
-        assert!(matches!(
-            parse_grpc_addr("not-an-address"),
-            Err(AppError::Usage(_))
-        ));
-    }
-
-    #[test]
-    fn resolve_upstream_from_flag_or_desired_state() {
-        let mut args = serve_args();
-        args.upstream = Some("127.0.0.1:50051".into());
-        let (raw, addr, underlay) = resolve_upstream(&args).expect("upstream");
-        assert_eq!(raw, "127.0.0.1:50051");
-        assert_eq!(addr, "127.0.0.1:50051".parse().expect("parse"));
-        assert_eq!(underlay, UnderlayMode::Direct);
-
-        let err = resolve_upstream(&serve_args()).expect_err("missing");
-        assert!(
-            matches!(err, AppError::Usage(ref m) if m.contains("upstream")),
-            "{err}"
-        );
-
-        let dir = std::env::temp_dir().join(format!(
-            "mediaopsd-ds-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let ds = dir.join("config.toml");
-        std::fs::write(
-            &ds,
-            "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 1\nmax_nvenc = 1\nlock = false\nseedbox_address = \"127.0.0.1:9\"\n",
-        )
-        .expect("ds");
-        args.upstream = None;
-        args.desired_state = Some(ds);
-        let (raw, _, _) = resolve_upstream(&args).expect("from ds");
-        assert_eq!(raw, "127.0.0.1:9");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

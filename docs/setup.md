@@ -1,12 +1,12 @@
 # Setup
 
-Two machines: a home disk (library of record) and a seedbox (disposable buffer). SSH is used once, to enroll the box. After that, the CLI never SSHs and never dials the seedbox — it talks to a local unix-socket gateway.
+Two machines: a home disk (library of record) and a seedbox (disposable buffer). Daily object commands talk to the local Home API; Range and Control traffic reach the box through the local gateway. The gateway owns the seedbox connection. SSH is reserved for explicit enrollment, daemon upgrade, and edge-repair maintenance, never bulk media copy.
 
 Live bootstrap, a real pull, and NVENC spend WAN, disk, and GPU. They are not part of `make test` or CI. Run them on purpose.
 
 ## Prerequisites
 
-- This repo built (`make install`) so `mediaops` and `mediaopsd` are on `PATH`
+- This repo built (`make install`) so the CLI, seedbox daemon, supervisor, and five home roles are on `PATH`
 - `Host seedbox` in `~/.ssh/config` (the alias is fixed; do not invent another)
 - A home disk with enough free space for `min_free_gib` plus whatever you will copy
 - A port the box actually forwards. A rented Swizzin/SeedIt4Me box usually only forwards its per-user ports — pick a free one and pass it as `--address host:port`
@@ -28,7 +28,7 @@ schema_version = 1
 max_copy_gib = 80
 min_free_gib = 256
 range_len_mib = 32           # one Range RPC; the seedbox serves at most 64
-range_concurrency = 8        # set it and the probe is skipped
+range_concurrency = 8        # snapshotted on each Home Pull Job; omitted means 1
 max_nvenc = 3
 lock = false
 grabber = "none"             # or "servarr"
@@ -51,7 +51,9 @@ kind = "album"
 
 `kind` is `movie` | `series` | `album`. Omit it on a mixed folder. Full field list: [Config](config.md).
 
-`grabber = "none"` is enough for a first run: drop a schema-valid file on an allowlisted root, then plan/run. *arr is optional.
+`grabber = "none"` is enough for a first run: drop a schema-valid file on an allowlisted root, then `watch` / `apply` a Want. *arr is optional.
+
+Expose only completed files: finish writing outside the allowlisted tree, then move them into place on the same filesystem. Do not modify a source in place while it is being copied.
 
 ## 2. Enroll the seedbox
 
@@ -74,39 +76,38 @@ The daemon must bind the port you passed. Roots are an allowlist: walks never le
 ## 3. Bootstrap the home library
 
 ```bash
-mediaops library bootstrap --library-root /mnt/storage/videos
+mediaops library bootstrap --library-root /mnt/storage/videos --enable-timer
 ```
 
-Creates `movies/`, `series/`, `music/`, `_ops/`, `_incoming/`, the sqlite index, the lock, an NVENC probe (prefers `/usr/lib/jellyfin-ffmpeg/ffmpeg`), and three systemd-user units:
+Creates `movies/`, `series/`, `music/`, `_ops/`, `_incoming/`, and systemd-user `mediaops-home.service` (supervisor for api / scheduler / gateway / inventory / pull).
 
-- `mediaopsd-home.service` — unix-socket gateway
-- `mediaops-run.service` / `mediaops-run.timer` — plan+apply after the previous run finishes (`OnUnitInactiveSec`)
+The historical `--enable-timer` flag enables the always-on service; it does not create a timer. Bootstrap starts the API before publishing the Cluster and seedbox Secret. Without the flag, an API must already be running (for example, `mediaops-home` in another terminal).
 
-`--enable-timer` also enables the home unit and the timer. Without it, start the gateway yourself:
+To control the installed service later:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now mediaopsd-home.service
+systemctl --user enable --now mediaops-home.service
 ```
 
-Do not run an old `media-sync` timer alongside `mediaops-run.timer`. Both would pull the same files.
+Import existing Wants, hold decisions, and installation proofs with `mediaops import-legacy`. Repeating the import fills missing objects and preserves newer runtime decisions and settings. `config.toml` remains an import/export format; runtime truth is the Cluster object and Title file observations.
+
+When upgrading an existing installation, first stop any retired units that exist: `mediaops-run.timer`, `mediaops-run.service`, and `mediaopsd-home.service`. Use `systemctl --user disable --now UNIT` for each installed unit before starting `mediaops-home`. Removing an old unit file does not stop an already running process; the old gateway would still own its socket.
 
 ## 4. First copy
 
 Put one schema-valid file on an allowlisted root (see [library layout](config.md#library-layout)). Then:
 
 ```bash
-mediaops watch 'The Matrix'          # or movie:key:thematrix.1999
-mediaops plan                        # exclusive lock; read-only
-mediaops run                         # plan + apply in this process
-mediaops why 'The Matrix'
+mediaops watch movie:key:thematrix.1999
+mediaops reconcile
+mediaops get Job -o wide
+mediaops why movie:key:thematrix.1999
 ```
 
-`watch` records a want and exits. It does not wait for a playable file. `run` holds the exclusive lock; a conflict is exit 3, never a silent 0. Kill a copy mid-file and run again — resume uses `_incoming/…/*.partial` and its sidecar, not a restart.
+`watch` records a Want and exits. It does not wait for a playable file. Alternatively, use the [Want document example](usage.md#daily) with `apply -f`. The pull worker Ranges into `_incoming/…/*.partial`; resume uses the sidecar, not current Cluster `rangeLen`.
 
-`status`, `why`, `hold list`, `reclaim preview`, and `doctor` do not take the lock.
-
-## 5. Optional: encode, timer, grabber
+## 5. Optional: encode and grabber
 
 HEVC 10-bit MP4 movies (not HDR/DV, under 2160p) classify as NVENC → H.264 8-bit. Encode is home GPU only; the original moves under `_ops/backup-hevc-originals/` after a successful replace.
 
@@ -118,7 +119,7 @@ mediaops encode run
 When you trust the loop:
 
 ```bash
-systemctl --user enable --now mediaops-run.timer
+systemctl --user enable --now mediaops-home.service
 ```
 
 With `grabber = "servarr"`, the seedbox daemon speaks *arr on `127.0.0.1`. API keys are discovered from the box configs, never pasted. Import-blocked releases land in `mediaops hold list`.
@@ -127,11 +128,18 @@ With `grabber = "servarr"`, the seedbox daemon speaks *arr on `127.0.0.1`. API k
 
 ```bash
 mediaops new-machine export --out /path/to/bundle
-# on the new home:
+# on the new home, with mediaops-home/API running and an empty Job list:
 mediaops new-machine import --from /path/to/bundle --library-root /mnt/storage/videos
 ```
 
-Exports `config.toml`, `tls/`, and the title-index. Import refuses a git work tree the same way bootstrap does.
+Exports `config.toml`, `tls/`, the title-index, and exact runtime `cluster.json` / `secret.json`. The bundle is private and contains credentials. Missing media on import is marked drifted; imported records alone never prove a disposable box copy is safe to reclaim. Import refuses a git work tree the same way bootstrap does.
+
+The first import normally starts with no Titles. Retrying a compatible bundle is
+supported: existing Title paths and installation digests must match the bundle,
+and only missing observations are published. Newer current digests and drift
+state are retained. Unrelated Titles or any existing Job, including a terminal
+Job, refuse import. When Titles exist, the requested library root must match the
+current Cluster. See [Usage](usage.md#command-map) for maintenance-lock recovery.
 
 ## Check the edge
 
@@ -139,4 +147,15 @@ Exports `config.toml`, `tls/`, and the title-index. Import refuses a git work tr
 mediaops doctor
 ```
 
-Prints `ok` when the nginx/Forms invariant holds. Write repair is a separate, confirmed command: `mediaops repair edge`.
+Default `doctor` checks the edge, credentials, and PEM locations, then requires
+the Home API and Ready scheduler, inventory, and pull Nodes. `ok` means all these
+checks passed, not just that nginx is healthy.
+
+Write repair is separate and explicit:
+
+```bash
+mediaops repair edge --repair --confirm
+```
+
+This uses SSH for nginx maintenance and the gateway Control API for edge apply
+and verification. It is not a read-only health check and is never part of tests.

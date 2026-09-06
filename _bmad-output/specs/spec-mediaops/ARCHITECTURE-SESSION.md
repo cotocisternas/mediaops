@@ -1,5 +1,9 @@
 # Architecture session prompt
 
+> **Historical prompt. Do not use it to start current architecture work.** Its
+> locked decisions describe the pre-rewrite system. Start from the
+> [current architecture](../../../docs/architecture.md) instead.
+
 Paste this as the first message in a **fresh** window, in the `mediaops` repo.
 
 ```
