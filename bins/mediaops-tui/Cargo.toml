@@ -1,0 +1,29 @@
+[package]
+name = "mediaops-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mediaops-tui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+crossterm = { workspace = true, features = ["event-stream"] }
+mediaops-core.workspace = true
+mediaops-home-client.workspace = true
+ratatui.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+tokio-stream = { workspace = true, features = ["time"] }
+unicode-width.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, default-features = false, features = ["macros", "rt-multi-thread", "time"] }
