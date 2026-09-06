@@ -2,34 +2,58 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install toolchain
-        run: rustup show
-      - name: Install protobuf compiler, musl, cmake
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools cmake
-      - uses: bufbuild/buf-action@v1
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain and components
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+      - name: Check Rust formatting
+        run: make fmt-check
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler musl-tools cmake file
+      - name: Set up Buf
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1
         with:
           setup_only: true
+          version: "1.72.0"
       - name: Lint and format protos
         run: make proto
+      - name: Cache Rust dependencies and build outputs
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ubuntu-24.04
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Fetch crates
-        run: cargo fetch --locked
+        run: make fetch
       - name: Test workspace
-        run: |
-          cargo build --locked --offline --workspace
-          cargo test --locked --offline --workspace
+        run: make test OFFLINE=1
+      - name: Lint workspace
+        run: make clippy OFFLINE=1
       - name: Musl-static mediaopsd
         run: make musl OFFLINE=1
-      - name: mediaopsd is statically linked
-        run: |
-          bin=target/x86_64-unknown-linux-musl/release/mediaopsd
-          out=$(file "$bin")
-          echo "$out"
-          # Ubuntu's file(1) reports musl +crt-static as "static-pie linked".
-          echo "$out" | grep -Eq 'statically linked|static-pie linked'

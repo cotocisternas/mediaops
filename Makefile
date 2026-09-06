@@ -83,9 +83,12 @@ musl: ## Link musl-static mediaopsd (needs musl-gcc). Not part of make test.
 	@file "$(or $(CARGO_TARGET_DIR),target)/$(MUSL_TARGET)/release/$(PKG_DAEMON)"
 	@LC_ALL=C file -b "$(or $(CARGO_TARGET_DIR),target)/$(MUSL_TARGET)/release/$(PKG_DAEMON)" | grep -Eq 'statically linked|static-pie linked' || { echo 'refusing deployment: daemon is not statically linked' >&2; exit 1; }
 
-ci: fetch ## Same sequence as .github/workflows/ci.yml
+ci: ## Same validation sequence as .github/workflows/ci.yml
+	$(MAKE) fmt-check
 	$(MAKE) proto
+	$(MAKE) fetch
 	$(MAKE) test OFFLINE=1
+	$(MAKE) clippy OFFLINE=1
 	$(MAKE) musl OFFLINE=1
 
 install: ## Install CLI, daemon, supervisor, home roles and TUI into ~/.cargo/bin
