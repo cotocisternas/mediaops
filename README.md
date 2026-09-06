@@ -3,7 +3,7 @@
 [![CI](https://github.com/cotocisternas/mediaops/actions/workflows/ci.yml/badge.svg)](https://github.com/cotocisternas/mediaops/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Home disk is the library. The seedbox is disposable buffer. The CLI talks to a local Home API over a unix socket. Range traffic goes through a local unix-socket gateway that holds the mTLS pool. Only `mediaopsd` on the box opens the WAN. Pull is one-way Range RPC, not FTP, rsync, or SSH copy.
+Home disk is the library. The seedbox is disposable buffer. The CLI talks to a local Home API over a unix socket. Range traffic goes through a local unix-socket gateway that holds the mTLS pool and connects to the seedbox. Only `mediaopsd` on the box exposes the WAN listener. Pull is one-way Range RPC, not FTP, rsync, or SSH copy.
 
 `grabber=none` is a valid setup: a folder on the box, a disk at home. *arr is optional.
 
@@ -17,6 +17,7 @@ Home disk is the library. The seedbox is disposable buffer. The CLI talks to a l
 | [Architecture](docs/architecture.md) | Two machines, the wire, the crate graph |
 | [Development](docs/development.md) | Build, test, conventions |
 | [AGENTS.md](AGENTS.md) | Rules for agents working in this repo |
+| [Documentation status](docs/documentation-status.md) | Current architecture versus historical BMAD artifacts |
 
 ## Install
 
