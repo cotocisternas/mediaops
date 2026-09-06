@@ -2,6 +2,8 @@
 
 This program talks to a seedbox over mTLS and holds library paths and grabber config. Treat `config.toml` and `tls/` as secrets. Bootstrap refuses to mint PEMs inside a git work tree.
 
+The CLI and Home workers reach `mediaops-api` on a unix socket private to the Unix account. Range/Control to the box goes through `mediaops-gateway` (home UDS) then mTLS to `mediaopsd`. `x-mediaops-actor` enforces cooperating-role write rules. It is not authentication against malware already running as the same UID.
+
 ## Reporting
 
 Please do **not** open a public issue for a vulnerability.
