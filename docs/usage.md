@@ -1,20 +1,35 @@
 # Usage
 
-After [setup](setup.md), type these. The timer runs `mediaops run`; you peek with the rest.
+After [setup](setup.md), `mediaops-home` keeps the control plane up. You apply a Want and peek with the rest.
 
-`why` and `watch` take a spoken name (`Hearts`, `Mr Robot`) or a title id. A name only resolves when the library, a job, the hold inbox, or a listing already knows it. `hold approve` / `reject` take the id from `hold list` (`movie:tmdb:4539`).
+`why` and `watch` take a spoken name (`Hearts`, `Mr Robot`) or a title id. A name only resolves when the library, a job, the hold inbox, or a listing already knows it. Prefer a `TitleId` in scripts. `hold approve` / `reject` take the id from `hold list` (`movie:tmdb:4539`).
 
-`--json` on every verb prints one `{ok,data,error}` envelope on stdout. Tracing goes to stderr.
+Home API verbs (`get`, `apply`, `delete`) print a tab-separated pipeline table by default (`TitleId` in `$1`). `-o json` is the **raw object** (no `{ok,data,error}` envelope). `-o wide` adds columns, aligned with spaces for terminal reading. Legacy verbs still accept `--json` as one `{ok,data,error}` envelope. Tracing goes to stderr.
+
+Default commands require the Home API. An outage is an error, not an implicit switch to `state.db`. An isolated custom `--state-db` retains the offline legacy workflow; the default state file or a file beside `api.db` uses Home. `--socket` on `get` / `apply` / `watch` addresses the API; older gateway commands use `--api-socket` to override their Home API address separately.
 
 ## Daily
 
 ```bash
-mediaops status
-mediaops hold list
-mediaops plan
-mediaops run
+mediaops apply -f cluster.toml
+mediaops watch movie:key:thematrix.1999
+mediaops get Job
+mediaops get Title movie:key:thematrix.1999 -o json
+mediaops reconcile
 mediaops why 'Mr Robot'
 ```
+
+A new Want document can be TOML:
+
+```toml
+kind = "Want"
+[metadata]
+name = "movie:key:thematrix.1999"
+[spec]
+title_id = "movie:key:thematrix.1999"
+```
+
+Updates require the current `metadata.resourceVersion`. Retrieve the object with `get -o json`, edit its spec, and apply it; a stale version is refused. `watch TITLE` is idempotent. `get Job --watch -o json` streams one object per line until interrupted; an optional object name filters that stream.
 
 ### `status`
 
@@ -24,7 +39,6 @@ Lock-free. Quiet means nothing in flight:
 nothing happening
 
 disk      693.1 GiB free
-home      3.8 TiB free
 ```
 
 Work looks like:
@@ -59,34 +73,22 @@ approved  Hearts of Darkness A Filmmaker's Apocalypse (1991)
           movie:tmdb:4539
 ```
 
-Approve does not copy. The next exclusive `run` will. There is no auto-approve.
+Approve does not copy. The Hold controller creates a Pull Job after `Approved`. There is no auto-approve.
 
-### `plan` / `run`
+The numbered inbox includes only the fresh completed listing; archived decisions remain in `get Hold`. Rejection is recorded first and reconciled to the box by inventory. Revoking approval refuses an unstarted Job; once its Job is bound, decision changes are refused until that Job finishes. Approval requires a live release with a usable placement.
 
-Exclusive lock. One line per copy / skip / review. Reconciler bookkeeping is hidden. Empty is `nothing to copy`.
+### `get` / `apply` / `watch`
 
-```
-copy      Mr Robot (2015) S01E02  4.0 GiB
-copy      Mr Robot (2015) S04E01  2.6 GiB
-review    usenet_tv / _UNPACK_Mr.Robot.S02…  unparseable
-
-/home/you/.local/state/mediaops/plans/….json
-```
-
-`run` is plan then apply of that artifact in this process. Lock conflict is exit 3. A long pull prints progress on stderr (tty only):
+`watch` writes a Want and exits. Inventory + the Want controller create a snapshotted Pull Job for each file. The scheduler binds albums first. `get Job` / `get Title` peek. Empty Job list is a blank table. A series Want continues to include later episodes; Title observations retain separate proofs for every episode and track.
 
 ```
-pull    Mr Robot (2015) S01E02  1.2 GiB / 4.0 GiB
+watching  The Matrix (1999)
+          movie:key:thematrix.1999
 ```
 
-When it finishes:
+Music copies before video, under the same `max_copy` cap. A copy that would breach `min_free` is refused on the Job, not partial-written onto a full disk. Already-installed titles are skipped; there is no auto-upgrade from 1080p to a 4K remux.
 
-```
-copied    Mr Robot (2015) S01E02
-copied    Mr Robot (2015) S04E01
-```
-
-Music copies before video, under the same `max_copy_gib` cap. A copy that would breach `min_free_gib` is skipped, not partial-written onto a full disk. Already-installed titles are skipped; there is no auto-upgrade from 1080p to a 4K remux.
+Failed or refused Jobs remain visible. Inspect `why TITLE` or `get Job NAME -o wide`, fix the cause, then delete that terminal Job to let the still-open Want create a fresh attempt. Completed ranges can resume; existing library content is never overwritten by this retry. Deleting a bound active Job is refused.
 
 ### `why`
 
@@ -105,7 +107,13 @@ Mr Robot (2015)
 series:key:mrrobot.2015
 
 grab      wanted, not on the box
-import    Mr Robot (2015) S01E02
+
+$ mediaops why movie:key:matrix.1999
+Matrix (1999)
+movie:key:matrix.1999
+
+library   drifted
+want      open, listed on the box
 
 $ mediaops why series:key:foundation.2021
 Foundation (2021)
@@ -113,6 +121,8 @@ series:key:foundation.2021
 
 quiet
 ```
+
+Home `why` prints only facts that exist: `hold` (open inbox reason + size), `grab` (open Want, not listed), `want` (open Want, listed on the box), `pull` (Job phase), `library` (observed path or drifted), or `quiet`. There is no legacy `import` line.
 
 ## Occasional
 
@@ -127,6 +137,8 @@ mediaops encode scan
 mediaops encode run
 mediaops doctor
 ```
+
+Manual `pull` uses the current Cluster settings and requires the API. It pauses scheduling and refuses while a bound Job is active. With `--install`, success includes a verified Title file record; it does not create a legacy `job_id`. The normal unattended workflow is `watch` plus the pull worker.
 
 ### `list`
 
@@ -169,7 +181,7 @@ Home GPU only. Not linked into `mediaopsd`. Empty is `nothing to encode`.
 encode    The Matrix (1999)
 ```
 
-`encode pause` / `encode pause --off` sets a machine flag polled between jobs. It is not a signal to a running ffmpeg.
+`encode pause` / `encode pause --off` changes `Cluster.spec.encodePause`, checked between jobs. It is not a signal to a running ffmpeg. Explicit offline legacy mode keeps its machine flag.
 
 Policy (hardcoded, not a config field):
 
@@ -196,21 +208,39 @@ The live file is replaced only after the convert succeeds. The original moves to
 | `library bootstrap` | Schema dirs, sqlite, lock, systemd-user units, NVENC probe. |
 | `library relocate` | Retarget `library_root` and units. Does not copy media. |
 | `library reindex` | Rebuild title-index proof by hashing on-disk schema files. |
-| `list` / `pull` | List remotes / pull one file through the home socket. |
-| `watch TITLE` | Record a want. Exits 0; does not wait for playable. |
-| `plan` / `run` | Exclusive lock. `run` is plan + apply. Lock conflict is exit 3. |
-| `why TITLE` / `status` | Lock-free peek. Local FS is truth. |
+| `get` / `apply` / `delete` | Home API. `-o json` is the raw object. |
+| `watch TITLE` | Record a Want. Exits 0; does not wait for playable. |
+| `reconcile` | Kick in-process controllers. |
+| `import-legacy` | One-shot Apply of old `config.toml` + `state.db`. |
+| `why TITLE` / `status` | Peek at Home API state. |
+| `list` | Allowlisted remotes through the home unix-socket gateway. |
+| `pull` | One remote file into `_incoming/` with `.partial` resume. Maintenance: pauses scheduling, refuses a bound Job. |
 | `reclaim preview\|apply` | Ranked surplus dry-run; exclusive unlink after local proof. |
 | `hold list\|approve\|reject` | Lock-free import-blocked inbox. |
 | `encode scan\|run\|pause` | Home GPU only. |
 | `doctor` / `repair edge` | Read-only check vs confirmed edge write. |
-| `new-machine export\|import` | Bundle `config.toml` + `tls/` + title-index. |
+| `new-machine export\|import` | Private bundle with config, credentials, runtime objects and every file's installation proof. |
+
+Relocation refuses incompatible nonterminal Jobs, including unbound Pending Jobs: their library root is an immutable snapshot. Let that work finish before relocating. A failed maintenance command can leave `Cluster.spec.lock` set; inspect and resolve the cause, then unlock explicitly with `get` / edit / `apply`. Do not treat a leftover lock as auto-cleared.
+
+`new-machine import` requires an empty Home Job list (including terminal Jobs). A retry of the same bundle is success: it publishes only missing Title rows and keeps newer `current_b3` / drift. A foreign Title, an extra path, or a changed `install_b3` is refused and the previous Cluster lock is restored. `--library-root` must already match `Cluster.spec.libraryRoot` when Titles exist.
+
+### Output shapes
+
+| Mode | What stdout is |
+| ---- | -------------- |
+| default table | TSV pipeline (`TitleId` in `$1`). Empty Job list is a blank table. |
+| `-o wide` | Space-aligned columns for a terminal. |
+| `-o json` | Raw object or `{items:[…]}` list. No `{ok,data,error}` envelope. |
+| `--json` | One `{ok,data,error}` envelope. Do not combine with `-o`. |
+
+`reconcile` table is `reconcileGeneration\tN`. `import-legacy` table is `imported\tN`. `-o json` for those is `{"reconcileGeneration":N}` / `{"imported":N}`. Tracing stays on stderr.
 
 `TITLE` is `movie:key:<title>.<year>`, `series:key:<title>.<year>`, `album:key:<artist>.<album>`, or an *arr id `movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…`. See [identity](config.md#identity).
 
 ## Empty states
 
-English, no decoration: `nothing happening`, `nothing on hold`, `nothing to copy`, `nothing on the box`, `nothing to reclaim`, `nothing to encode`.
+English, no decoration: `nothing happening`, `nothing on hold`, `nothing on the box`, `nothing to reclaim`, `nothing to encode`.
 
 ## Exit codes
 
@@ -219,13 +249,13 @@ English, no decoration: `nothing happening`, `nothing on hold`, `nothing to copy
 | 0 | ok | |
 | 1 | runtime | I/O, RPC, unexpected failure |
 | 2 | usage | bad flags or args |
-| 3 | lock_conflict | another `plan` / `run` / `reclaim apply` holds the flock |
+| 3 | lock_conflict | leftover `reclaim apply` / library / new-machine holds the flock |
 | 4 | drift_verify | edge or grabber drifted from `config.toml` |
 | 5 | policy_refusal | encode refuse, PEM-in-git, pin matrix, watermark at bootstrap |
 
 ## Daemon (reference)
 
-Both units are written for you. You do not type these on a normal day.
+Units are written for you. You do not type these on a normal day.
 
 ```bash
 # seedbox — bind port = the port in seedbox_address
@@ -233,6 +263,6 @@ mediaopsd serve --role seedbox --bind 0.0.0.0:25410 \
   --tls-dir ~/.config/mediaops/tls --config ~/.config/mediaops/config.toml \
   --nginx-dir /etc/nginx/apps --root movies=/home/you/media/movies
 
-# home gateway — seedbox address comes from config.toml, not the CLI
-mediaopsd serve --role home --tls-dir <config-dir>/tls --config <config-dir>/config.toml
+# home control plane — execs api / scheduler / gateway / inventory / pull
+mediaops-home
 ```
