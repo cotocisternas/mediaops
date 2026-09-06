@@ -35,6 +35,7 @@ check: ## Typecheck without producing binaries
 	$(CARGO) check --workspace --all-targets $(CARGO_FLAGS)
 
 test: ## Default suite (no GPU, no seedbox, no live-box). OFFLINE=1 after fetch
+	$(CARGO) build --workspace $(CARGO_FLAGS)
 	$(CARGO) test --workspace $(CARGO_FLAGS)
 
 test-arch: ## Crate-graph and I/O-boundary tests
@@ -75,16 +76,24 @@ daemon: ## cargo run -p mediaopsd -- $(ARGS)
 MUSL_TARGET := x86_64-unknown-linux-musl
 
 musl: ## Link musl-static mediaopsd (needs musl-gcc). Not part of make test.
-	$(CARGO) build --release --target $(MUSL_TARGET) -p $(PKG_DAEMON) --bin $(PKG_DAEMON) $(CARGO_FLAGS)
+	$(CARGO) build --release --target $(MUSL_TARGET) -p $(PKG_DAEMON) --bin $(PKG_DAEMON) $(CARGO_FLAGS) --target-dir "$(or $(CARGO_TARGET_DIR),target)"
+	@file "$(or $(CARGO_TARGET_DIR),target)/$(MUSL_TARGET)/release/$(PKG_DAEMON)"
+	@LC_ALL=C file -b "$(or $(CARGO_TARGET_DIR),target)/$(MUSL_TARGET)/release/$(PKG_DAEMON)" | grep -Eq 'statically linked|static-pie linked' || { echo 'refusing deployment: daemon is not statically linked' >&2; exit 1; }
 
 ci: fetch ## Same sequence as .github/workflows/ci.yml
 	$(MAKE) proto
-	$(CARGO) test --locked --offline --workspace
+	$(MAKE) test OFFLINE=1
 	$(MAKE) musl OFFLINE=1
 
-install: ## Install mediaops and mediaopsd into ~/.cargo/bin
-	$(CARGO) install --path bins/mediaops --locked --force
-	$(CARGO) install --path bins/mediaopsd --locked --force
+install: ## Install CLI, daemon, supervisor and all home roles into ~/.cargo/bin
+	$(CARGO) install --path bins/mediaops $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaopsd $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaops-api $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaops-scheduler $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaops-gateway $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaops-inventory $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaops-pull $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaops-home $(CARGO_FLAGS) --force
 
 clean: ## cargo clean
 	$(CARGO) clean

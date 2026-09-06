@@ -21,7 +21,9 @@ jobs:
       - name: Fetch crates
         run: cargo fetch --locked
       - name: Test workspace
-        run: cargo test --locked --offline --workspace
+        run: |
+          cargo build --locked --offline --workspace
+          cargo test --locked --offline --workspace
       - name: Musl-static mediaopsd
         run: make musl OFFLINE=1
       - name: mediaopsd is statically linked
