@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::bytes::Bytes;
 use crate::plan::RootKinds;
@@ -58,7 +58,7 @@ struct DesiredStateToml {
 }
 
 /// *arr is optional. `none` means no live grabber HTTP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Grabber {
     #[default]
@@ -75,7 +75,7 @@ struct PathsToml {
 
 /// One allowlisted remote root. `kind` says what the root holds so the planner
 /// does not have to guess from path shape; omit it for a mixed folder.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathRoot {
     pub id: String,

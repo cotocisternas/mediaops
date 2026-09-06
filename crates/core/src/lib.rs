@@ -16,8 +16,10 @@ pub mod diff;
 pub mod digest;
 pub mod exec;
 pub mod hold;
+pub mod home;
 pub mod install;
 pub mod jobs;
+pub mod media;
 pub mod pathschema;
 pub mod plan;
 pub mod probe;
@@ -45,14 +47,24 @@ pub use hold::{
     HoldDecision, HoldError, HoldKey, HoldLiveItem, HoldsRepo, ReleaseId,
     preflight_approve_placement,
 };
+pub use home::{
+    ACTOR_HEADER, Actor, CLUSTER_NAME, ClusterSpec, ClusterStatus, EventStatus, HOME_API_VERSION,
+    HoldDecisionSpec, HoldSpec, HoldStatus, HomeError, HomeJobKind, HomeObject, HomeOp, JobPhase,
+    JobSpec, JobStatus, Kind, NODE_HEARTBEAT_SECS, NODE_NOTREADY_SECS, NodeSpec, NodeStatus,
+    ObjectMeta, PULL_DEADLINE_SECS, PULL_MAX_ATTEMPTS, RemoteFileStatus, SECRET_NAME, SecretSpec,
+    Spec, StatusBody, TitleFileStatus, TitleSpec, TitleStatus, WantPhase, WantSpec, WantStatus,
+    WorkerKind, admit, bind_priority, node_is_ready, pull_fits, remote_file_name,
+};
 pub use install::{
-    InstallError, InstallOutcome, VerifiedConvertingHandle, VerifiedStagingHandle, free_bytes,
-    install, replace,
+    InstallError, InstallOutcome, VerifiedConvertingHandle, VerifiedStagingHandle,
+    cleanup_install_temporary, free_bytes, install, install_fits, install_verified,
+    install_verified_before, pull_remaining_bytes, replace,
 };
 pub use jobs::{
     EncodeEvent, EncodeState, HoldEvent, HoldState, Job, JobError, JobEvent, JobId, JobKind,
     JobState, JobsRepo, PullEvent, PullState, WantEvent, WantState, advance, encode_ready,
 };
+pub use media::{AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, is_media_file};
 pub use pathschema::{
     FileKey, GRAMMAR_VERSION, PathSchemaError, Placement, RejectBin, dotted, kind_dir,
     normalize_placement, parse, parse_placement, parse_remote, render, render_placement,
