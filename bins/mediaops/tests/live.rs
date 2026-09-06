@@ -15,6 +15,6 @@ fn live_demo_pending_operator_confirm() {
     if !live_env() {
         return;
     }
-    // Do not SSH, pull, or encode. The runbook is
-    // `_bmad-output/implementation-artifacts/demo-epic-4.md`.
+    // Do not SSH, pull, or encode. Current operator steps are in docs/setup.md;
+    // the test boundary is documented in docs/development.md#tests.
 }

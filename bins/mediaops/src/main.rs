@@ -95,7 +95,7 @@ enum Command {
         #[arg(long)]
         state_db: Option<PathBuf>,
     },
-    /// Why is this title stuck (grab / import / hold / pull / watermark / lock / encode-queue).
+    /// Show this title's recorded Want, Hold, Job, and library facts.
     Why {
         title: String,
         #[arg(long)]
@@ -113,7 +113,7 @@ enum Command {
         #[arg(long = "api-socket")]
         api_socket: Option<PathBuf>,
     },
-    /// Open Wants, bound Jobs, Node readiness. Home API when the apiserver is up.
+    /// Show Home activity and library disk space; legacy state requires explicit --state-db.
     Status {
         #[arg(long)]
         state_db: Option<PathBuf>,
@@ -137,9 +137,9 @@ enum Command {
     Reclaim(ReclaimArgs),
     /// Import-blocked inbox (lock-free).
     Hold(HoldArgs),
-    /// Export/import config.toml + tls/ + title-index into the active XDG dirs.
+    /// Export/import config, credentials, Home runtime objects, and file proofs.
     NewMachine(NewMachineArgs),
-    /// Read-only EdgeInvariant + key presence + PEM-in-git scan.
+    /// Check edge, credentials, PEM locations, and default Home worker readiness.
     Doctor {
         #[arg(long)]
         repair: bool,
@@ -184,7 +184,7 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Increment Cluster.status.reconcile_generation.
+    /// Increment Cluster.status.reconcileGeneration and request reconciliation.
     Reconcile {
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -290,7 +290,7 @@ struct NewMachineArgs {
 
 #[derive(Subcommand, Debug)]
 enum NewMachineCommand {
-    /// Write config.toml, tls/, and title-index.json into `--out`.
+    /// Write config, TLS, file proofs, and Home runtime objects into a private bundle.
     Export {
         #[arg(long)]
         out: PathBuf,
@@ -303,7 +303,7 @@ enum NewMachineCommand {
         #[arg(long)]
         state_db: Option<PathBuf>,
     },
-    /// Populate the active config dir and state.db from a directory bundle.
+    /// Restore a bundle into Home state, resuming compatible Title proofs.
     Import {
         #[arg(long)]
         from: PathBuf,
@@ -392,7 +392,7 @@ enum EncodeCommand {
         #[arg(long)]
         config_dir: Option<PathBuf>,
     },
-    /// Set or clear the encode_pause machine flag. Lock-free.
+    /// Set or clear Cluster.spec.encodePause; explicit legacy mode uses its machine flag.
     Pause {
         #[arg(long)]
         off: bool,

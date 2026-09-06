@@ -61,6 +61,12 @@ cargo test -p mediaops --features live-box --offline --test live
 
 The live test is `#[ignore]` and still does not SSH or encode. `MEDIAOPS_LIVE=1` is a second gate; turning it on without operator confirm still does not dial a rented box.
 
+The current operator procedure is [Setup](setup.md), not an archived BMAD demo.
+Passing the ignored placeholder is not evidence that a live transfer or encode
+was exercised. The local supervisor/transfer regression is
+`bins/mediaops/tests/home_e2e.rs`; build the workspace before invoking that test
+directly so its sibling role binaries are current.
+
 `crates/arr` talks to *arr through cassettes in `fixtures/arr`. Do not add a live HTTP client to a default test.
 
 Human stdout is the operator UI. Changing a formatter means adding or updating an exact-screen test next to it.
@@ -94,7 +100,7 @@ crates/store             sqlite (state.db + api.db). Only mediaops-api opens api
 crates/home-client       typed Home API client
 crates/api               serve, admission, reconcilers
 crates/net               mTLS, channels, seedbox + gateway
-crates/ssh               bootstrap exec only
+crates/ssh               exec-only seedbox bootstrap/upgrade and edge maintenance
 crates/transfer          Range pull, .partial resume, BLAKE3
 crates/sync              leftover planner helpers + unit text
 crates/encode     EncodePolicy, ffprobe/ffmpeg
@@ -104,7 +110,12 @@ proto/            mediaops/v1/mediaops.proto (`mediaops.v1`) and mediaops/home/v
 docs/             this documentation
 ```
 
-`_bmad-output/` is historical planning. Do not treat it as current docs or as the product contract.
+See [Documentation status](documentation-status.md) for the current source-of-truth
+map and the [BMAD archive](../_bmad-output/README.md). Pre-rewrite specs, session
+prompts, readiness reports, and pending sprint/deferred-work entries are
+historical, not a current backlog. Revalidate candidates before creating a fresh
+plan. Installed `_bmad/` tooling and `.agents/skills/` are not retired product
+artifacts and should not be mass-edited to reflect this architecture change.
 
 ## What is not in the tree
 
