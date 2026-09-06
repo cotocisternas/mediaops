@@ -1,12 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{
-    ControlPort, DesiredState, Envelope, InstalledFile, ReclaimCandidate, RootKinds,
-    reclaim_preview, reclaim_proved,
+    ControlPort, Envelope, InstalledFile, ReclaimCandidate, reclaim_preview, reclaim_proved,
 };
 use mediaops_proto::ControlPortClient;
 use mediaops_proto::control_service_client::ControlServiceClient;
-use mediaops_store::Store;
 use mediaops_sync::{apply_reclaim, scan_schema_files};
 use mediaops_transfer::{HomeChannel, connect_home, list_entries};
 use serde::Serialize;
@@ -47,6 +45,7 @@ pub async fn preview(
         tls_dir,
         config_dir,
         false,
+        None,
         None,
     )
     .await?;
@@ -112,8 +111,13 @@ pub async fn apply(
         config_dir,
         true,
         max,
+        None,
     )
     .await?;
+    apply_snapshot(json, snap).await
+}
+
+async fn apply_snapshot(json: bool, snap: Snapshot) -> Result<String, AppError> {
     let remotes: Vec<_> = snap.candidates.iter().map(|c| c.remote.clone()).collect();
     let control = ControlPortClient::new(ControlServiceClient::new(snap.channel));
     let report = apply_reclaim(&control, &remotes)
@@ -190,20 +194,27 @@ async fn snapshot(
     config_dir: Option<PathBuf>,
     exclusive: bool,
     max: Option<usize>,
+    home: Option<&crate::home_library::HomeLibrary>,
 ) -> Result<Snapshot, AppError> {
-    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
     let socket = socket.unwrap_or_else(bootstrap::default_socket);
-    let state_db = crate::api_legacy::state_db_path(state_db);
+    let state_db = crate::home_library::state_db_path(state_db);
     let lock_path = bootstrap::lock_path(&state_db);
     let lock = if exclusive {
         Some(bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?)
     } else {
         None
     };
-    let (library_root, title_index, root_kinds) = if use_home {
-        let home = crate::api_legacy::HomeLibrary::load().await?;
+    let (library_root, title_index, root_kinds) = {
+        let loaded;
+        let home = match home {
+            Some(home) => home,
+            None => {
+                loaded = crate::home_library::HomeLibrary::load().await?;
+                &loaded
+            }
+        };
         let root = home.root(library_root)?;
         let rows = home.rows(false).await?;
         // Reclaim removes the remote copy. Check the current bytes immediately
@@ -220,28 +231,6 @@ async fn snapshot(
             }
         }
         (root, verified, home.root_kinds()?)
-    } else {
-        let store = Store::open(&state_db)
-            .await
-            .map_err(crate::api_legacy::error)?;
-        let root = match library_root {
-            Some(root) => root,
-            None => store
-                .get_machine("library_root")
-                .await
-                .map_err(crate::api_legacy::error)?
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-        };
-        let rows = store
-            .list_titles()
-            .await
-            .map_err(crate::api_legacy::error)?;
-        (
-            root,
-            rows,
-            root_kinds_from(&bootstrap::default_desired_state(&config_dir)),
-        )
     };
     let on_disk = on_disk_files(&library_root)?;
     let channel = connect_home(&socket, &tls_dir)
@@ -276,15 +265,6 @@ pub(crate) fn on_disk_files(library_root: &Path) -> Result<Vec<InstalledFile>, A
     scan_schema_files(library_root).map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))
 }
 
-/// Root kinds from the active config.toml; an unreadable file means "infer".
-pub(crate) fn root_kinds_from(desired_state: &Path) -> RootKinds {
-    std::fs::read_to_string(desired_state)
-        .ok()
-        .and_then(|text| DesiredState::from_toml(&text).ok())
-        .map(|ds| ds.root_kinds())
-        .unwrap_or_default()
-}
-
 fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
     match err.exit_code() {
         mediaops_core::ExitCode::LockConflict => AppError::LockConflict(err.to_string()),
@@ -307,8 +287,7 @@ fn map_control(err: mediaops_core::ControlError) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mediaops_core::{Blake3Hex, TitleId};
-    use mediaops_store::Store;
+    use mediaops_core::TitleId;
     use std::sync::Arc;
 
     struct TestGrabOps {
@@ -411,243 +390,185 @@ mod tests {
         }
     }
 
+    struct Fixture {
+        home: crate::home_library::HomeLibrary,
+        dir: PathBuf,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Fixture {
+        async fn new(tag: &str, proved: bool) -> Self {
+            let (home, dir, server) = crate::home_library::test_home(tag).await;
+            let path = home
+                .root(None)
+                .unwrap()
+                .join(crate::test_support::MOVIE_REL);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"orig").unwrap();
+            if proved {
+                home.reindex(&crate::progress::OperationProgress::new(false, "reindex"))
+                    .await
+                    .expect("Home proof");
+            }
+            Self { home, dir, server }
+        }
+
+        async fn snapshot(
+            &self,
+            lb: &crate::test_support::Loopback,
+            exclusive: bool,
+            max: Option<usize>,
+        ) -> Result<Snapshot, AppError> {
+            snapshot(
+                Some(self.dir.join("capabilities.db")),
+                None,
+                Some(lb.sock.clone()),
+                Some(lb.tls_dir.clone()),
+                None,
+                exclusive,
+                max,
+                Some(&self.home),
+            )
+            .await
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn remote(qbit_down: bool) -> crate::test_support::Loopback {
+        let ops = if qbit_down {
+            TestGrabOps {
+                qbit: Err(mediaops_core::ControlError::runtime("qbit down")),
+            }
+        } else {
+            TestGrabOps::default()
+        };
+        crate::test_support::start_pair_with(
+            Some(crate::test_support::MOVIE_REL),
+            b"remote",
+            if qbit_down {
+                mediaops_core::Grabber::Servarr
+            } else {
+                mediaops_core::Grabber::None
+            },
+            Some(Arc::new(ops)),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn preview_is_ranked_and_does_not_unlink() {
         let _g = crate::test_support::serial_net();
-        let dir = crate::test_support::scratch("reclaim-preview");
-        let library = crate::test_support::library_root(&dir);
-        let db = dir.join("state.db");
-        let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
-        store
-            .record_install(
-                &title,
-                &Blake3Hex::of_bytes(b"orig"),
-                crate::test_support::MOVIE_REL,
-            )
-            .await
-            .expect("index");
-        let movie = library.join(crate::test_support::MOVIE_REL);
-        std::fs::create_dir_all(movie.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&movie, b"orig").expect("file");
-        let lb = crate::test_support::start_pair_with(
-            Some(crate::test_support::MOVIE_REL),
-            b"remote",
-            mediaops_core::Grabber::None,
-            Some(Arc::new(TestGrabOps::default())),
-        )
-        .await;
-        let json = preview(
-            true,
-            Some(db.clone()),
-            Some(library.clone()),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            Some(dir.clone()),
-        )
-        .await
-        .expect("preview");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["ok"], true, "{json}");
-        let cands = value["data"]["candidates"].as_array().expect("cands");
-        assert_eq!(cands.len(), 1, "{json}");
-        assert_eq!(cands[0]["title_id"], "movie:key:thematrix.1999");
+        let fixture = Fixture::new("reclaim-preview", true).await;
+        let lb = remote(false).await;
+        let snap = fixture.snapshot(&lb, false, None).await.expect("preview");
+        assert_eq!(snap.candidates.len(), 1);
+        assert_eq!(
+            snap.candidates[0].title_id.render(),
+            "movie:key:thematrix.1999"
+        );
         assert!(
             lb.remote_root
                 .join(crate::test_support::MOVIE_REL)
-                .is_file(),
-            "preview must not unlink"
+                .is_file()
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn apply_unlinks_usenet_after_proof_and_skips_without_digest() {
         let _g = crate::test_support::serial_net();
-        let dir = crate::test_support::scratch("reclaim-apply");
-        let library = crate::test_support::library_root(&dir);
-        let db = dir.join("state.db");
-        let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
-        store
-            .record_install(
-                &title,
-                &Blake3Hex::of_bytes(b"orig"),
-                crate::test_support::MOVIE_REL,
-            )
-            .await
-            .expect("index");
-        let movie = library.join(crate::test_support::MOVIE_REL);
-        std::fs::create_dir_all(movie.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&movie, b"orig").expect("file");
-        let lb = crate::test_support::start_pair_with(
-            Some(crate::test_support::MOVIE_REL),
-            b"remote",
-            mediaops_core::Grabber::None,
-            Some(Arc::new(TestGrabOps::default())),
-        )
-        .await;
-        let json = apply(
-            true,
-            Some(db.clone()),
-            Some(library.clone()),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            Some(dir.clone()),
-            None,
-        )
-        .await
-        .expect("apply");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["data"]["deleted"], 1, "{json}");
-        assert!(
-            !lb.remote_root.join(crate::test_support::MOVIE_REL).exists(),
-            "usenet with proof must unlink"
-        );
-
-        let lb2 =
-            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"remote").await;
-        let db2 = dir.join("empty.db");
-        let json = apply(
-            true,
-            Some(db2),
-            Some(library),
-            Some(lb2.sock.clone()),
-            Some(lb2.tls_dir.clone()),
-            Some(dir.clone()),
-            None,
-        )
-        .await
-        .expect("no digest");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["data"]["deleted"], 0, "{json}");
-        assert!(
-            lb2.remote_root
-                .join(crate::test_support::MOVIE_REL)
-                .is_file(),
-            "no install_b3 means no delete"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn qbit_down() -> TestGrabOps {
-        TestGrabOps {
-            qbit: Err(mediaops_core::ControlError::runtime("qbit down")),
+        for proved in [true, false] {
+            let fixture = Fixture::new("reclaim-proof", proved).await;
+            let lb = remote(false).await;
+            let snap = fixture.snapshot(&lb, true, None).await.expect("snapshot");
+            let json = apply_snapshot(true, snap).await.expect("apply");
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["data"]["deleted"], usize::from(proved), "{json}");
+            assert_eq!(
+                lb.remote_root
+                    .join(crate::test_support::MOVIE_REL)
+                    .is_file(),
+                !proved
+            );
         }
     }
 
-    async fn proved_library(dir: &std::path::Path) -> (PathBuf, PathBuf) {
-        let library = crate::test_support::library_root(dir);
-        let db = dir.join("state.db");
-        let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie_key("The.Matrix", 1999).expect("id");
-        store
-            .record_install(
-                &title,
-                &Blake3Hex::of_bytes(b"orig"),
-                crate::test_support::MOVIE_REL,
-            )
-            .await
-            .expect("index");
-        let movie = library.join(crate::test_support::MOVIE_REL);
-        std::fs::create_dir_all(movie.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&movie, b"orig").expect("file");
-        (db, library)
+    #[tokio::test]
+    async fn changed_home_file_is_not_reclaim_proof() {
+        let _g = crate::test_support::serial_net();
+        let fixture = Fixture::new("reclaim-changed", true).await;
+        std::fs::write(
+            fixture
+                .home
+                .root(None)
+                .unwrap()
+                .join(crate::test_support::MOVIE_REL),
+            b"changed",
+        )
+        .unwrap();
+        let lb = remote(false).await;
+        let snap = fixture.snapshot(&lb, true, None).await.expect("snapshot");
+        assert!(snap.candidates.is_empty());
+        let _ = apply_snapshot(true, snap).await.expect("apply");
+        assert!(
+            lb.remote_root
+                .join(crate::test_support::MOVIE_REL)
+                .is_file()
+        );
     }
 
     #[tokio::test]
     async fn apply_with_qbit_down_still_hits_delete_remote_as_skipped_seeding() {
         let _g = crate::test_support::serial_net();
-        let dir = crate::test_support::scratch("reclaim-qbit-down");
-        let (db, library) = proved_library(&dir).await;
-        let lb = crate::test_support::start_pair_with(
-            Some(crate::test_support::MOVIE_REL),
-            b"remote",
-            mediaops_core::Grabber::Servarr,
-            Some(Arc::new(qbit_down())),
-        )
-        .await;
-        let json = apply(
-            true,
-            Some(db),
-            Some(library),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            Some(dir.clone()),
-            None,
-        )
-        .await
-        .expect("apply");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let fixture = Fixture::new("reclaim-qbit-down", true).await;
+        let lb = remote(true).await;
+        let snap = fixture.snapshot(&lb, true, None).await.expect("snapshot");
+        let json = apply_snapshot(true, snap).await.expect("apply");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["data"]["deleted"], 0, "{json}");
         assert_eq!(value["data"]["qbit_unavailable"], 1, "{json}");
         assert!(
             lb.remote_root
                 .join(crate::test_support::MOVIE_REL)
-                .is_file(),
-            "qBit down must not unlink"
+                .is_file()
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn preview_errors_when_qbit_cannot_answer() {
         let _g = crate::test_support::serial_net();
-        let dir = crate::test_support::scratch("reclaim-preview-qbit-down");
-        let (db, library) = proved_library(&dir).await;
-        let lb = crate::test_support::start_pair_with(
-            Some(crate::test_support::MOVIE_REL),
-            b"remote",
-            mediaops_core::Grabber::Servarr,
-            Some(Arc::new(qbit_down())),
-        )
-        .await;
-        let err = preview(
-            true,
-            Some(db),
-            Some(library),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            Some(dir.clone()),
-        )
-        .await
-        .expect_err("preview must not hide an unreachable qBit");
+        let fixture = Fixture::new("reclaim-preview-down", true).await;
+        let lb = remote(true).await;
+        let err = fixture
+            .snapshot(&lb, false, None)
+            .await
+            .err()
+            .expect("qBit unavailable");
         assert!(matches!(err, AppError::Runtime(_)), "{err}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn apply_max_truncates_ranked_candidates() {
         let _g = crate::test_support::serial_net();
-        let dir = crate::test_support::scratch("reclaim-max");
-        let (db, library) = proved_library(&dir).await;
-        let lb = crate::test_support::start_pair_with(
-            Some(crate::test_support::MOVIE_REL),
-            b"remote",
-            mediaops_core::Grabber::None,
-            Some(Arc::new(TestGrabOps::default())),
-        )
-        .await;
-        let json = apply(
-            true,
-            Some(db),
-            Some(library),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            Some(dir.clone()),
-            Some(0),
-        )
-        .await
-        .expect("apply");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let fixture = Fixture::new("reclaim-max", true).await;
+        let lb = remote(false).await;
+        let snap = fixture
+            .snapshot(&lb, true, Some(0))
+            .await
+            .expect("snapshot");
+        let json = apply_snapshot(true, snap).await.expect("apply");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["data"]["deleted"], 0, "{json}");
         assert!(
             lb.remote_root
                 .join(crate::test_support::MOVIE_REL)
-                .is_file(),
-            "--max 0 must not unlink"
+                .is_file()
         );
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

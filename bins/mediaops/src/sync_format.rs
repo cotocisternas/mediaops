@@ -1,3 +1,4 @@
+use crate::out::{fmt_bytes, inert};
 use mediaops_core::{HomeObject, StatusBody, SyncDisposition, SyncEntry, SyncPhase, SyncStatus};
 
 pub(crate) fn format_human(request_id: &str, dry_run: bool, obj: &HomeObject) -> Option<String> {
@@ -23,7 +24,40 @@ pub(crate) fn format_human(request_id: &str, dry_run: bool, obj: &HomeObject) ->
     for entry in &status.entries {
         lines.extend(entry_lines(entry));
     }
+    match status.phase {
+        SyncPhase::WaitingInventory | SyncPhase::Captured if !dry_run => {
+            lines.push(format!(
+                "inspect   mediaops get Sync {} -o wide",
+                crate::api_cmd::shell_arg(request_id)
+            ));
+        }
+        SyncPhase::Scheduled if !dry_run && counts.copy + counts.reuse > 0 => {
+            lines.push("progress  mediaops get Job --watch -o wide".into());
+        }
+        SyncPhase::Scheduled if counts.copy + counts.reuse == 0 => {
+            lines.push("          nothing to copy".into());
+        }
+        SyncPhase::Failed => {
+            lines.push("check     mediaops doctor".into());
+        }
+        _ => {}
+    }
     Some(lines.join("\n"))
+}
+
+pub(crate) fn summary(status: &SyncStatus) -> String {
+    let counts = Counts::from_entries(&status.entries);
+    let counts = format!(
+        "copy {}  reuse {}  present {}  blocked {}  ineligible {}",
+        counts.copy, counts.reuse, counts.present, counts.blocked, counts.ineligible
+    );
+    if !status.message.is_empty() {
+        format!("{counts}  {}", inert(&status.message))
+    } else if status.phase == SyncPhase::WaitingInventory {
+        "waiting for a fresh completed inventory listing".into()
+    } else {
+        counts
+    }
 }
 
 const fn verb(dry_run: bool) -> &'static str {
@@ -32,9 +66,11 @@ const fn verb(dry_run: bool) -> &'static str {
 
 fn phase_line(dry_run: bool, status: &SyncStatus) -> String {
     match status.phase {
-        SyncPhase::WaitingInventory => format!("pending  {}", status.phase.as_str()),
+        SyncPhase::WaitingInventory => {
+            "pending  waiting for a fresh completed inventory listing".into()
+        }
         SyncPhase::Captured if dry_run => "preview".into(),
-        SyncPhase::Captured => format!("pending  {}", status.phase.as_str()),
+        SyncPhase::Captured => "pending  inventory captured; creating copy jobs".into(),
         SyncPhase::Failed if status.message.is_empty() => "failed".into(),
         SyncPhase::Failed => format!("failed  {}", inert(&status.message)),
         SyncPhase::Scheduled if dry_run => "preview".into(),
@@ -74,10 +110,11 @@ impl Counts {
 
 fn entry_lines(entry: &SyncEntry) -> Vec<String> {
     let mut lines = vec![format!(
-        "{:<10} {} / {}",
+        "{:<10}{} / {}  {}",
         disposition_verb(entry.disposition),
         inert(&entry.remote_root),
-        inert(&entry.remote_path)
+        inert(&entry.remote_path),
+        fmt_bytes(entry.file_len),
     )];
     let dest = entry
         .job
@@ -91,13 +128,10 @@ fn entry_lines(entry: &SyncEntry) -> Vec<String> {
     if !entry.reason.is_empty() {
         lines.push(format!("          {}", inert(&entry.reason)));
     }
+    if !entry.job_name.is_empty() {
+        lines.push(format!("          Job {}", inert(&entry.job_name)));
+    }
     lines
-}
-
-fn inert(raw: &str) -> String {
-    raw.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
 }
 
 const fn disposition_verb(disposition: SyncDisposition) -> &'static str {

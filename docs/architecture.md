@@ -20,7 +20,7 @@ The CLI never dials `seedbox_address` for media traffic; it goes through the gat
 
 ## Roles
 
-**`mediaops`** — Home API client. `get` / `apply` / `delete` / `watch` / `reconcile` / `import-legacy`. Pretty verbs (`status`, `why`, `hold`) still exist; declarative copying runs in the worker. The low-level manual `pull` remains an operator maintenance command: it pauses scheduling, refuses active bound Jobs, and records verified installation proof through the API.
+**`mediaops`** — Home API client. `get` / `apply` / `delete` / `watch` / `reconcile`. Pretty verbs (`status`, `why`, `hold`) still exist; declarative copying runs in the worker. The low-level manual `pull` remains an operator maintenance command: it pauses scheduling, refuses active bound Jobs, and records verified installation proof through the API.
 
 **`mediaops-home`** — supervisor. Execs the five role binaries (next to `argv[0]`, then `PATH`), restarts a dead child, forwards SIGTERM. Links neither store nor transfer.
 
@@ -116,7 +116,7 @@ Cargo workspace. Edges are allowlisted and tested in `crates/arch-tests` (`make 
 | `bins/mediaopsd` | seedbox daemon |
 | `crates/core` | `TitleId`, PathSchema, Home objects, `config.toml`. No tokio, no tonic, no rusqlite. Only `walker` and `install` touch the filesystem |
 | `crates/proto` | gRPC stubs for `mediaops.v1` and `mediaops.home.v1`; the only wire↔domain conversions |
-| `crates/store` | sqlite. `state.db` (legacy) and `ApiStore` (`api.db`). The only crate that may depend on `rusqlite`. Only `mediaops-api` opens `api.db` |
+| `crates/store` | sqlite. `state.db` (local capabilities) and `ApiStore` (`api.db`). The only crate that may depend on `rusqlite`. Only `mediaops-api` opens `api.db` |
 | `crates/home-client` | typed Home API client |
 | `crates/api` | serve, admission, watch bus, reconcilers |
 | `crates/net` | mTLS, channel pool, seedbox + gateway serve |
@@ -131,7 +131,7 @@ Banned as direct deps: `rsync`, `rclone`, `ftp`, `ssh2`, `russh`, `ffmpeg-next`,
 
 ## Bind, not flock
 
-Unattended copy concurrency is Job bind + Job status, not the legacy
+Unattended copy concurrency is Job bind + Job status, not the maintenance
 `mediaops.lock`. Explicit CLI maintenance, including manual pull, still takes its
 flock and coordinates scheduling through Cluster maintenance state where needed.
 Lock conflict is exit 3. Role liveness uses heartbeats and becomes NotReady after

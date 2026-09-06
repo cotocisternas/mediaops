@@ -896,29 +896,28 @@ async fn watch_creates_want_and_json_is_raw_object() {
     assert_eq!(again["kind"], "Want");
     assert_eq!(again["metadata"]["name"], "movie:tmdb:603");
 
-    let legacy = Command::new(env!("CARGO_BIN_EXE_mediaops"))
-        .args(["watch", "movie:tmdb:603", "--json", "--socket"])
+    let retired = Command::new(env!("CARGO_BIN_EXE_mediaops"))
+        .args(["watch", "movie:tmdb:999", "--json", "--socket"])
         .arg(&socket)
         .output()
-        .expect("legacy json");
-    assert!(legacy.status.success());
-    let envelope: serde_json::Value = serde_json::from_slice(&legacy.stdout).expect("envelope");
-    assert_eq!(envelope["ok"], true);
-    assert_eq!(envelope["data"]["kind"], "Want");
-    assert!(envelope["error"].is_null());
+        .expect("retired output flag");
+    assert_eq!(retired.status.code(), Some(2));
+    assert!(retired.stdout.is_empty());
+    let api = HomeApi::connect(&socket, Actor::Cli).await.expect("api");
+    assert!(api.get(Kind::Want, "movie:tmdb:999").await.is_err());
 
     api_task.abort();
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
-fn unavailable_api_never_records_a_want_in_legacy_state() {
+fn unavailable_api_never_records_a_want_in_local_state() {
     let dir = scratch("offline");
     let out = Command::new(env!("CARGO_BIN_EXE_mediaops"))
         .env("HOME", &dir)
         .env("XDG_STATE_HOME", &dir)
         .env("XDG_RUNTIME_DIR", &dir)
-        .args(["watch", "movie:tmdb:603", "--json"])
+        .args(["watch", "movie:tmdb:603", "-o", "json"])
         .output()
         .expect("watch");
     assert!(!out.status.success(), "API outage must fail");
@@ -927,7 +926,8 @@ fn unavailable_api_never_records_a_want_in_legacy_state() {
         "no cold-state write"
     );
     let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error envelope");
-    assert_eq!(envelope["ok"], false);
+    assert!(envelope.get("ok").is_none());
+    assert!(envelope["error"].is_object());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1103,26 +1103,7 @@ async fn reconcile_json_is_raw_object() {
         value.get("ok").is_none(),
         "-o json must be the raw object: {value}"
     );
-    assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn reconcile_legacy_json_is_envelope() {
-    let home = TestHome::start("reconcile-legacy").await;
-    apply_cluster(&home, &home.dir.join("library"), false).await;
-    let out = home
-        .cli()
-        .args(["reconcile", "--json"])
-        .output()
-        .expect("cli");
-    assert_cli_ok(&out);
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
-    assert_eq!(value["ok"], true);
-    assert_eq!(
-        value["data"]["reconcileGeneration"],
-        cluster_generation(&home).await
-    );
-    assert!(value["error"].is_null());
+    assert!(out.stderr.is_empty(), "JSON success is quiet on stderr");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1141,7 +1122,7 @@ async fn reconcile_invalid_output_does_not_mutate() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reconcile_conflicting_flags_do_not_mutate() {
+async fn retired_json_flag_does_not_mutate() {
     let home = TestHome::start("reconcile-conflict").await;
     apply_cluster(&home, &home.dir.join("library"), false).await;
     let before = cluster_generation(&home).await;
@@ -1152,94 +1133,69 @@ async fn reconcile_conflicting_flags_do_not_mutate() {
         .expect("cli");
     assert_eq!(out.status.code(), Some(2));
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("envelope");
-    assert_eq!(value["ok"], false);
+    assert!(value.get("ok").is_none());
     assert_eq!(value["error"]["code"], "usage");
     assert_eq!(cluster_generation(&home).await, before);
 }
 
-fn import_legacy_cmd(home: &TestHome, extra: &[&str]) -> Command {
-    let mut cmd = home.cli();
-    cmd.arg("import-legacy").args(extra);
-    cmd
+#[tokio::test(flavor = "multi_thread")]
+async fn retired_import_command_does_not_create_home_objects() {
+    let home = TestHome::start("retired-import").await;
+    write_export_files(&home);
+    let out = home.cli().arg("import-legacy").output().expect("cli");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(home.api.get(Kind::Cluster, CLUSTER_NAME).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn import_legacy_table_and_wide_keep_tsv() {
-    let home = TestHome::start("import-tsv").await;
-    write_export_files(&home);
-    let first = import_legacy_cmd(&home, &[]).output().expect("cli");
-    assert_cli_ok(&first);
+async fn current_bundle_does_not_restore_a_stale_config_endpoint() {
+    let source = TestHome::start("bundle-no-secret").await;
+    write_export_files(&source);
+    let config = source.dir.join("config/config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("config");
+    text.push_str("seedbox_address = \"obsolete.example:9000\"\n");
+    std::fs::write(&config, text).expect("stale endpoint");
+    apply_cluster(&source, &source.dir.join("library"), false).await;
+    let bundle = export_bundle(&source);
+    assert!(!bundle.join("secret.json").exists());
+    let destination = TestHome::start("restore-no-secret").await;
+    let out = import_bundle(&destination, &bundle, &destination.dir.join("library"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        destination
+            .api
+            .get(Kind::Secret, mediaops_core::SECRET_NAME)
+            .await
+            .is_err(),
+        "absent runtime Secret must not be reconstructed from stale config"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bundle_without_cluster_is_rejected_before_home_mutation() {
+    let (source, bundle) = movie_bundle("bundle-without-cluster").await;
+    std::fs::remove_file(bundle.join("cluster.json")).expect("remove cluster");
+    let destination = TestHome::start("reject-old-bundle").await;
+    let out = import_bundle(&destination, &bundle, &destination.dir.join("library"));
     assert_eq!(
-        String::from_utf8_lossy(&first.stdout).trim_end(),
-        "imported\t1"
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    for flags in [&["-o", "table"][..], &["-o", "wide"][..]] {
-        let out = import_legacy_cmd(&home, flags).output().expect("cli");
-        assert_cli_ok(&out);
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim_end(),
-            "imported\t0"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn import_legacy_json_is_raw_object() {
-    let home = TestHome::start("import-json").await;
-    write_export_files(&home);
-    let out = import_legacy_cmd(&home, &["-o", "json"])
-        .output()
-        .expect("cli");
-    assert_cli_ok(&out);
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
-    assert_eq!(value["imported"], 1);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cluster.json"));
     assert!(
-        value.get("ok").is_none(),
-        "-o json must be the raw object: {value}"
+        destination
+            .api
+            .list(None)
+            .await
+            .expect("objects")
+            .is_empty()
     );
-    assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn import_legacy_legacy_json_is_envelope() {
-    let home = TestHome::start("import-legacy-json").await;
-    write_export_files(&home);
-    let out = import_legacy_cmd(&home, &["--json"]).output().expect("cli");
-    assert_cli_ok(&out);
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
-    assert_eq!(value["ok"], true);
-    assert_eq!(value["data"]["imported"], 1);
-    assert!(value["error"].is_null());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn import_legacy_invalid_output_does_not_mutate() {
-    let home = TestHome::start("import-bad-o").await;
-    write_export_files(&home);
-    let out = import_legacy_cmd(&home, &["-o", "yaml"])
-        .output()
-        .expect("cli");
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
-    assert!(
-        home.api.get(Kind::Cluster, CLUSTER_NAME).await.is_err(),
-        "invalid -o must not import"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn import_legacy_conflicting_flags_do_not_mutate() {
-    let home = TestHome::start("import-conflict").await;
-    write_export_files(&home);
-    let out = import_legacy_cmd(&home, &["--json", "-o", "json"])
-        .output()
-        .expect("cli");
-    assert_eq!(out.status.code(), Some(2));
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("envelope");
-    assert_eq!(value["ok"], false);
-    assert_eq!(value["error"]["code"], "usage");
-    assert!(
-        home.api.get(Kind::Cluster, CLUSTER_NAME).await.is_err(),
-        "conflicting flags must not import"
-    );
+    assert!(!destination.dir.join("config/config.toml").exists());
+    drop(source);
 }

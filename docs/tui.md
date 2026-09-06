@@ -2,8 +2,6 @@
 
 `mediaops-tui` is an additive Home API viewer with scoped Want/Hold actions.
 It is not a `mediaops` subcommand.
-The CLI, its help, formatters, exact-screen tests, `-o json`, `--json`, and exit
-codes are unchanged.
 
 ```bash
 mediaops-tui [--api-socket PATH] [--color auto|always|never]
@@ -20,15 +18,15 @@ shows `reconnecting`. It never falls back to `state.db`.
 
 | Key | Screen |
 | --- | --- |
-| 1 | Overview — open work, non-installed Jobs, failures, disk |
+| 1 | Overview — scheduling/encode pauses, open work, failures, worker readiness, disk |
 | 2 | Wants |
-| 3 | Jobs — phase, bytes, attempts, binding, failure |
+| 3 | Jobs — phase, percent copied, bytes, attempts, binding, message |
 | 4 | open Holds |
 | 5 | Titles / why facts |
-| 6 | Nodes / readiness |
+| 6 | Nodes / readiness, heartbeat age, service inspection |
 | 7 | Box / current RemoteFiles |
 
-Holds and Titles show readable names and years from existing placement metadata
+Overview, Wants, Jobs, Holds and Titles show readable names and years from existing placement metadata
 and library/Job/listing paths. Exact TitleIds and release-object names remain in
 detail, and actions still target those IDs, never the display label. If no name
 metadata is available, a readable key label or the original ID is shown instead
@@ -39,6 +37,21 @@ rows. In detail, those keys scroll facts instead. Enter opens detail; Esc goes
 back. `?` is read-only help. `p` previews eligible copies. `S` schedules a
 fresh sync (not permanent watching). `q`, Ctrl-C, and SIGTERM exit 0 after
 restoring the terminal.
+
+Jobs show copied bytes as a percentage of their captured file size. `100%` means
+the bytes have arrived; the phase distinguishes verification from installation.
+A zero total shows `n/a`. Detail includes copied/total bytes, the current stage,
+binding and the worker's message. No throughput or ETA is inferred.
+
+The status row shows the selected row or visible detail/report lines. Pending
+requests show elapsed time and the operation being performed. Reconnection shows
+the retry countdown and disables actions. `?` includes the complete status text
+when it is too long for the status row, plus service/log inspection commands;
+help scrolls with the same navigation keys. Navigation dismisses a completed
+operation's message from the status row and retains it in help as `Last status`.
+An unavailable inventory points to
+Nodes. When identity visibility disables an action, the status explains how to
+restore it.
 
 ## Mutations
 
@@ -94,7 +107,7 @@ preview remains available. Use the CLI or restart the TUI for another sync.
 
 Meaning survives `NO_COLOR` and `--color never` via text, reverse, and bold.
 The TUI cannot offer a screen reader. Use the CLI (`mediaops status`, `why`,
-`hold`, `sync`) as the unchanged alternative.
+`hold`, `sync`) as the text alternative.
 
 See [tui-qa.md](tui-qa.md) for fixture and PTY checks. Design tokens live in
 [`DESIGN.md`](../DESIGN.md).

@@ -3,6 +3,10 @@
 Headless `TestBackend` tests run in `make test`. They are not a substitute for
 a real PTY.
 
+`tests/operator_feedback.rs` fixes the complete 60×16 Jobs screen and checks
+verification versus byte completion, scheduling pauses, absent workers,
+heartbeat age, inventory failure guidance and scrollable connection errors.
+
 ## Local fixture
 
 ```bash
@@ -40,6 +44,10 @@ Drive a real terminal (tmux is fine for keys; do not treat `tmux capture-pane`
 as truecolor evidence):
 
 - [ ] seven screens, Tab / 1–7, j/k, Enter/Esc, `?`, `q`
+- [ ] Jobs show readable titles, complete phase names and percentages at 60 columns; detail separates copied bytes from verification/installation
+- [ ] Overview exposes scheduling/encode pauses; missing or expired workers have an inspection command
+- [ ] row/line position follows navigation; long errors remain readable via `?`, End, Up, Home without changing the selected object
+- [ ] pending requests show operation and elapsed time; disconnects show retry countdown
 - [ ] W/D on a Want detail; A/X on one Hold when two share a TitleId
 - [ ] `p` produces a completed preview after the next fixture inventory; no Sync or copy objects are created
 - [ ] `S` submits a fresh one-shot request; its report names a durable Sync, and repeated requests reuse existing Jobs

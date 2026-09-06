@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Output};
 
 use serde_json::Value;
 
@@ -6,244 +6,173 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_mediaopsd"))
 }
 
-fn stdout_json(output: &std::process::Output) -> Value {
-    serde_json::from_slice(&output.stdout).expect("stdout must be one JSON envelope")
+fn stdout_json(output: &Output) -> Value {
+    assert!(
+        !output.stdout.contains(&0x1b),
+        "JSON cannot contain terminal escapes"
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("one raw JSON object");
+    assert!(
+        value.get("ok").is_none(),
+        "retired envelope must not return"
+    );
+    assert!(
+        value.get("data").is_none(),
+        "retired envelope must not return"
+    );
+    value
 }
 
-fn assert_json_tracing_stderr(stderr: &str) {
-    assert!(!stderr.is_empty(), "tracing must land on stderr");
-    for line in stderr.lines().filter(|line| !line.is_empty()) {
-        let event: Value = serde_json::from_str(line).unwrap_or_else(|_| {
-            panic!("stderr must be JSON tracing lines when not a tty, got: {line}")
-        });
+#[test]
+fn json_identity_is_raw_and_quiet() {
+    let output = bin().args(["-o", "json"]).output().expect("identity");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({
+            "name": "mediaopsd", "version": env!("CARGO_PKG_VERSION")
+        })
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn human_identity_is_quiet() {
+    let output = bin().output().expect("identity");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("mediaopsd {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn human_usage_error_is_printed_once() {
+    let output = bin().arg("--not-a-flag").output().expect("usage");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--not-a-flag"));
+    assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
+    assert!(!stderr.contains("command failed"));
+    assert!(!output.stderr.contains(&0x1b));
+}
+
+#[test]
+fn structured_parse_errors_recognize_output_before_or_after_bad_arguments() {
+    for args in [
+        vec!["-o", "json", "--not-a-flag"],
+        vec!["--not-a-flag", "-o", "json"],
+        vec!["--not-a-flag", "--output=json"],
+        vec!["--not-a-flag", "-ojson"],
+        vec!["--not-a-flag", "-o=json"],
+    ] {
+        let output = bin().args(&args).output().expect("usage");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let value = stdout_json(&output);
+        assert_eq!(value["error"]["code"], "usage");
         assert!(
-            event.get("ok").is_none(),
-            "result envelope must not appear on stderr: {stderr}"
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--not-a-flag")
         );
+        assert!(output.stderr.is_empty(), "{args:?}");
     }
 }
 
-fn assert_no_result_envelope_on_stderr(stderr: &str) {
-    assert!(
-        !stderr.contains(r#""ok":false"#) && !stderr.contains(r#""ok": false"#),
-        "result envelope must not appear on stderr: {stderr}"
-    );
+#[test]
+fn retired_flags_and_unknown_output_are_rejected() {
+    for args in [
+        vec!["--json"],
+        vec!["--json=true"],
+        vec!["-o", "xml"],
+        vec!["serve", "--socket", "/tmp/old.sock", "--tls-dir", "/tmp"],
+        vec!["serve", "--upstream", "old-box", "--tls-dir", "/tmp"],
+    ] {
+        let output = bin().args(&args).output().expect("rejected flag");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
 }
 
 #[test]
-fn json_happy() {
-    let output = bin().arg("--json").output().expect("run mediaopsd --json");
+fn help_and_version_are_quiet_without_needing_a_server() {
+    for args in [vec!["--help"], vec!["-o", "json", "--help"]] {
+        let output = bin().args(args).output().expect("help");
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Usage:"));
+        assert!(stdout.contains("--output"));
+        assert!(!stdout.contains("--json"));
+        assert!(output.stderr.is_empty());
+    }
+    let output = bin().arg("--version").output().expect("version");
     assert_eq!(output.status.code(), Some(0));
-    let value = stdout_json(&output);
-    assert_eq!(value["ok"], true);
-    assert_eq!(value["data"]["name"], "mediaopsd");
-    assert_eq!(value["data"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(value.get("error"), Some(&Value::Null));
-    let stdout = String::from_utf8(output.stdout.clone()).expect("utf8");
-    assert_eq!(stdout.trim().lines().count(), 1);
-    assert_json_tracing_stderr(&String::from_utf8_lossy(&output.stderr));
-}
-
-#[test]
-fn human_happy() {
-    let output = bin().output().expect("run mediaopsd");
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
     assert_eq!(
-        stdout.trim(),
-        format!("mediaopsd {}", env!("CARGO_PKG_VERSION"))
+        String::from_utf8_lossy(&output.stdout),
+        format!("mediaopsd {}\n", env!("CARGO_PKG_VERSION"))
     );
-    assert!(
-        serde_json::from_str::<Value>(stdout.trim()).is_err(),
-        "human stdout must not be JSON"
-    );
-    assert_json_tracing_stderr(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn usage_unknown_flag() {
-    let output = bin()
-        .arg("--nope-not-a-flag")
-        .output()
-        .expect("run mediaopsd unknown flag");
-    assert_eq!(output.status.code(), Some(2));
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
-    assert!(
-        stdout.trim().is_empty(),
-        "human usage must not print a result envelope on stdout: {stdout}"
-    );
-    assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
-}
-
-#[test]
-fn usage_unknown_flag_with_json() {
-    let output = bin()
-        .args(["--json", "--nope-not-a-flag"])
-        .output()
-        .expect("run mediaopsd --json unknown flag");
-    assert_eq!(output.status.code(), Some(2));
-    let value = stdout_json(&output);
-    assert_eq!(value["ok"], false);
-    assert_eq!(value.get("data"), Some(&Value::Null));
-    assert_eq!(value["error"]["code"], "usage");
-    assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
-}
-
-#[test]
-fn usage_unknown_flag_json_anywhere_in_argv() {
-    let output = bin()
-        .args(["--nope-not-a-flag", "--json"])
-        .output()
-        .expect("run mediaopsd unknown flag --json");
-    assert_eq!(output.status.code(), Some(2));
-    let value = stdout_json(&output);
-    assert_eq!(value["ok"], false);
-    assert_eq!(value.get("data"), Some(&Value::Null));
-    assert_eq!(value["error"]["code"], "usage");
-    assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
-}
-
-#[test]
-fn help_exits_ok() {
-    let output = bin().arg("--help").output().expect("run mediaopsd --help");
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
-    assert!(
-        stdout.contains("Usage:"),
-        "help must print clap usage, got: {stdout}"
-    );
-    assert!(
-        serde_json::from_str::<Value>(stdout.trim()).is_err(),
-        "help must not be a JSON envelope: {stdout}"
-    );
-}
-
-#[test]
-fn version_exits_ok() {
-    let output = bin()
-        .arg("--version")
-        .output()
-        .expect("run mediaopsd --version");
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
-    assert_eq!(
-        stdout,
-        format!("mediaopsd {}\n", env!("CARGO_PKG_VERSION")),
-        "version must print the exact package version"
-    );
-    assert!(
-        serde_json::from_str::<Value>(stdout.trim()).is_err(),
-        "version must not be a JSON envelope: {stdout}"
-    );
-}
-
-#[test]
-fn usage_json_equals_true() {
-    let output = bin()
-        .args(["--json=true", "--nope-not-a-flag"])
-        .output()
-        .expect("run mediaopsd --json=true unknown flag");
-    assert_eq!(output.status.code(), Some(2));
-    let value = stdout_json(&output);
-    assert_eq!(value["ok"], false);
-    assert_eq!(value.get("data"), Some(&Value::Null));
-    assert_eq!(value["error"]["code"], "usage");
-    assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
-}
-
-#[test]
-fn usage_json_equals_false_stays_human() {
-    let output = bin()
-        .args(["--json=false", "--nope-not-a-flag"])
-        .output()
-        .expect("run mediaopsd --json=false unknown flag");
-    assert_eq!(output.status.code(), Some(2));
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
-    assert!(
-        stdout.trim().is_empty(),
-        "human usage must not print a result envelope on stdout: {stdout}"
-    );
-    assert_no_result_envelope_on_stderr(&String::from_utf8_lossy(&output.stderr));
-}
-
-#[test]
-fn serve_help_mentions_all_interfaces_bind() {
+fn serve_help_describes_only_current_seedbox_arguments() {
     let output = bin()
         .args(["serve", "--help"])
         .output()
-        .expect("run mediaopsd serve --help");
+        .expect("serve help");
     assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8(output.stdout).expect("utf8");
-    assert!(
-        stdout.contains("0.0.0.0:50051"),
-        "serve --help must mention bind 0.0.0.0:50051, got: {stdout}"
-    );
-}
-
-fn unused_role_exits_usage(role: &str) {
-    let dir = std::env::temp_dir().join(format!(
-        "mediaopsd-role-{role}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let output = bin()
-        .args([
-            "serve",
-            "--role",
-            role,
-            "--tls-dir",
-            dir.to_str().unwrap(),
-            "--root",
-            "media=/tmp",
-        ])
-        .output()
-        .expect("run unused role");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "role {role} must exit usage without hanging, status={:?} stderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("0.0.0.0:50051"));
+    assert!(stdout.contains("--root"));
+    assert!(!stdout.contains("--socket"));
+    assert!(!stdout.contains("--upstream"));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn serve_reverse_connect_exits_usage() {
-    unused_role_exits_usage("reverse-connect");
+fn unused_roles_are_usage_errors_without_starting_a_server() {
+    for role in ["home", "reverse-connect"] {
+        let output = bin()
+            .args(["serve", "--role", role, "--tls-dir", "/tmp"])
+            .output()
+            .expect("unused role");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.starts_with("error: "), "{stderr}");
+        assert!(stderr.contains(role), "{stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    }
 }
 
 #[test]
-fn serve_home_without_upstream_exits_usage() {
-    let dir = std::env::temp_dir().join(format!(
-        "mediaopsd-home-{}-{}",
+fn runtime_and_role_errors_use_the_same_raw_error_shape() {
+    let output = bin()
+        .args(["serve", "--role", "home", "--tls-dir", "/tmp", "-o", "json"])
+        .output()
+        .expect("role error");
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_json(&output)["error"]["code"], "usage");
+    assert!(output.stderr.is_empty());
+
+    let absent = std::env::temp_dir().join(format!(
+        "mediaopsd-no-tls-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
+            .unwrap()
             .as_nanos()
     ));
-    std::fs::create_dir_all(&dir).expect("mkdir");
     let output = bin()
-        .args([
-            "serve",
-            "--role",
-            "home",
-            "--tls-dir",
-            dir.to_str().unwrap(),
-        ])
+        .args(["serve", "--root", "media=/tmp", "--tls-dir"])
+        .arg(absent)
+        .args(["-o", "json"])
         .output()
-        .expect("run home without upstream");
-    let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "role home must exit usage, status={:?} stderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .expect("TLS error");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout_json(&output)["error"]["code"], "runtime");
+    assert!(output.stderr.is_empty());
 }

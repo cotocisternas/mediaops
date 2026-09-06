@@ -52,8 +52,8 @@ pub struct Projection {
 pub fn project(cache: &ObjectCache, screen: Screen, selected: usize, now_unix: i64) -> Projection {
     match screen {
         Screen::Overview => overview::overview(cache, selected, now_unix),
-        Screen::Wants => lists::wants(cache, selected),
-        Screen::Jobs => lists::jobs(cache, selected, false),
+        Screen::Wants => lists::wants(cache, selected, now_unix),
+        Screen::Jobs => lists::jobs(cache, selected, false, now_unix),
         Screen::Holds => lists::holds(cache, selected, now_unix),
         Screen::Titles => overview::titles(cache, selected, now_unix),
         Screen::Nodes => lists::nodes(cache, selected, now_unix),

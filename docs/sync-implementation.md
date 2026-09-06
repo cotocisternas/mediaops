@@ -123,8 +123,7 @@ refuses it permanently. Revoked exact Hold authorization refuses it too.
 CLI: `mediaops sync [--dry-run] [--request-id ID] [--socket PATH]`.
 Validate conflicting output flags before RPC. Default readable summary includes
 request ID, captured generation, copy/reuse/present/blocked/ineligible counts,
-each source and destination/reason. `-o json` raw Sync object, `--json` one existing
-envelope. Transport error names request ID for inspection/retry; dry-run/no-queue
+each source and destination/reason. `-o json` emits the raw Sync object. The retired `--json` interface is not supported. Transport error names request ID for inspection/retry; dry-run/no-queue
 must never print scheduled success. `mediaops get Sync ID` inspects durable result.
 Keep implementation in a new sync_cmd.rs, not growing api_cmd.rs.
 

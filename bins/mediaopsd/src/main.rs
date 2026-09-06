@@ -15,9 +15,9 @@ const BIN_NAME: &str = "mediaopsd";
 #[derive(Parser, Debug)]
 #[command(name = BIN_NAME, version)]
 struct Cli {
-    /// Emit a single JSON envelope on stdout.
-    #[arg(long, global = true)]
-    json: bool,
+    /// Emit a raw JSON identity or error on stdout.
+    #[arg(short = 'o', long = "output", global = true, value_parser = ["json"])]
+    output: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -34,14 +34,8 @@ struct ServeArgs {
     role: String,
     #[arg(long, default_value = "0.0.0.0:50051")]
     bind: String,
-    /// Ignored. Home UDS is `mediaops-gateway`.
-    #[arg(long)]
-    socket: Option<PathBuf>,
     #[arg(long)]
     tls_dir: PathBuf,
-    /// Ignored. Home attach is `mediaops-gateway`.
-    #[arg(long)]
-    upstream: Option<String>,
     /// Seedbox: read grabber from config.toml.
     #[arg(long = "config", value_name = "PATH")]
     desired_state: Option<PathBuf>,
@@ -67,6 +61,7 @@ fn parse_root(raw: &str) -> Result<(String, PathBuf), String> {
 enum AppError {
     Usage(String),
     Runtime(anyhow::Error),
+    Emitted(ExitCode),
 }
 
 impl std::fmt::Display for AppError {
@@ -74,6 +69,7 @@ impl std::fmt::Display for AppError {
         match self {
             Self::Usage(message) => write!(f, "{message}"),
             Self::Runtime(err) => write!(f, "{err}"),
+            Self::Emitted(_) => write!(f, "error already printed"),
         }
     }
 }
@@ -83,21 +79,28 @@ enum ParseOutcome {
     HelpOrVersion,
 }
 
-fn json_token_requests_json(arg: &str) -> bool {
-    if arg == "--json" {
-        return true;
+fn args_request_json(args: impl IntoIterator<Item = String>) -> bool {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if (arg == "-o" || arg == "--output") && args.next().as_deref() == Some("json") {
+            return true;
+        }
+        if arg == "--output=json" || arg == "-ojson" || arg == "-o=json" {
+            return true;
+        }
     }
-    let Some(value) = arg.strip_prefix("--json=") else {
-        return false;
-    };
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "true" | "t" | "yes" | "y" | "1" | "on"
-    )
+    false
 }
 
 fn json_requested() -> bool {
-    std::env::args_os().any(|arg| arg.to_str().is_some_and(json_token_requests_json))
+    args_request_json(
+        std::env::args_os()
+            .skip(1)
+            .filter_map(|arg| arg.into_string().ok()),
+    )
 }
 
 fn init_tracing() {
@@ -113,6 +116,7 @@ fn to_exit_code(err: &AppError) -> ExitCode {
     match err {
         AppError::Usage(_) => ExitCode::Usage,
         AppError::Runtime(_) => ExitCode::Runtime,
+        AppError::Emitted(code) => *code,
     }
 }
 
@@ -145,8 +149,11 @@ fn emit_error(json: bool, code: ExitCode, err: &AppError) -> Result<(), AppError
 
 fn finish_error(json_flag: bool, err: &AppError) -> ExitCode {
     let code = to_exit_code(err);
+    if matches!(err, AppError::Emitted(_)) {
+        return code;
+    }
     if !json_flag {
-        tracing::error!(error = %err, "command failed");
+        eprintln!("error: {err}");
     }
     if let Err(emit_err) = emit_error(json_flag, code, err) {
         tracing::error!(error = %emit_err, "failed to emit error output");
@@ -165,6 +172,7 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
             _ => {
                 if !json_flag {
                     err.print().map_err(|e| AppError::Runtime(anyhow!(e)))?;
+                    return Err(AppError::Emitted(ExitCode::Usage));
                 }
                 Err(AppError::Usage(err.to_string()))
             }
@@ -244,15 +252,14 @@ async fn serve(args: ServeArgs) -> Result<(), AppError> {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
-    tracing::info!(bin = BIN_NAME, "start");
 
     let json_flag = json_requested();
     match parse_cli(json_flag) {
         Ok(ParseOutcome::HelpOrVersion) => ExitCode::Ok,
         Ok(ParseOutcome::Parsed(cli)) => {
-            let json = json_flag || cli.json;
+            let json = json_flag || cli.output.as_deref() == Some("json");
             let result = match cli.command {
-                None => emit_success(cli.json),
+                None => emit_success(json),
                 Some(Command::Serve(args)) => serve(args).await,
             };
             match result {
@@ -269,11 +276,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_token_matches_clap_boolish_true() {
-        assert!(json_token_requests_json("--json"));
-        assert!(json_token_requests_json("--json=true"));
-        assert!(!json_token_requests_json("--json=false"));
-        assert!(!json_token_requests_json("--help"));
+    fn output_json_is_detected_before_reporting_parse_errors() {
+        let requested =
+            |args: &[&str]| args_request_json(args.iter().map(|arg| (*arg).to_string()));
+        assert!(requested(&["--bad", "-o", "json"]));
+        assert!(requested(&["--output=json"]));
+        assert!(requested(&["-ojson"]));
+        assert!(requested(&["-o=json"]));
+        assert!(!requested(&["--json"]));
+        assert!(!requested(&["--", "-o", "json"]));
     }
 
     #[test]
@@ -302,9 +313,7 @@ mod tests {
         ServeArgs {
             role: "seedbox".into(),
             bind: "127.0.0.1:0".into(),
-            socket: None,
             tls_dir: PathBuf::from("/tmp"),
-            upstream: None,
             desired_state: None,
             roots: Vec::new(),
             nginx_dir: None,

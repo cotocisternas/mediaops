@@ -76,12 +76,12 @@ The daemon must bind the port you passed. Roots are an allowlist: walks never le
 ## 3. Bootstrap the home library
 
 ```bash
-mediaops library bootstrap --library-root /mnt/storage/videos --enable-timer
+mediaops library bootstrap --library-root /mnt/storage/videos --enable-service
 ```
 
 Creates `movies/`, `series/`, `music/`, `_ops/`, `_incoming/`, and systemd-user `mediaops-home.service` (supervisor for api / scheduler / gateway / inventory / pull).
 
-The historical `--enable-timer` flag enables the always-on service; it does not create a timer. Bootstrap starts the API before publishing the Cluster and seedbox Secret. Without the flag, an API must already be running (for example, `mediaops-home` in another terminal).
+The `--enable-service` flag enables and starts the always-on Home service. Bootstrap starts the API before publishing the Cluster and seedbox Secret. Without the flag, an API must already be running (for example, `mediaops-home` in another terminal).
 
 To control the installed service later:
 
@@ -90,7 +90,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now mediaops-home.service
 ```
 
-Import existing Wants, hold decisions, and installation proofs with `mediaops import-legacy`. Repeating the import fills missing objects and preserves newer runtime decisions and settings. `config.toml` remains an import/export format; runtime truth is the Cluster object and Title file observations.
+For existing media, run `mediaops library reindex --library-root /mnt/storage/videos` to publish verified file observations to Home. To move a current installation, use `new-machine export` and `new-machine import`. `config.toml` remains an import/export format; runtime truth is the Cluster object and Title file observations.
 
 When upgrading an existing installation, first stop any retired units that exist: `mediaops-run.timer`, `mediaops-run.service`, and `mediaopsd-home.service`. Use `systemctl --user disable --now UNIT` for each installed unit before starting `mediaops-home`. Removing an old unit file does not stop an already running process; the old gateway would still own its socket.
 

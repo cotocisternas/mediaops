@@ -5,8 +5,8 @@ use mediaops_encode::probe_nvenc;
 use mediaops_ssh::SystemExec;
 use mediaops_store::Store;
 use mediaops_sync::{
-    ensure_layout, media_server_warnings, refuse_below_watermark, reindex_schema,
-    systemd_exec_start, write_home_unit,
+    ensure_layout, media_server_warnings, refuse_below_watermark, systemd_exec_start,
+    write_home_unit,
 };
 use serde::Serialize;
 
@@ -30,16 +30,15 @@ pub async fn bootstrap_library(
     enable_timer: bool,
     unit_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let desired_state =
         desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
-    let state_db = crate::api_legacy::state_db_path(state_db);
+    let state_db = crate::home_library::state_db_path(state_db);
     let _lock =
         bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
-    if use_home && !enable_timer {
-        crate::api_legacy::connect().await.map_err(|err| {
-            AppError::Runtime(anyhow::anyhow!("Home API must be running for library bootstrap; use --enable-timer to start mediaops-home: {err}"))
+    if !enable_timer {
+        crate::home_library::connect().await.map_err(|err| {
+            AppError::Runtime(anyhow::anyhow!("Home API must be running for library bootstrap; use --enable-service to start mediaops-home: {err}"))
         })?;
     }
     let ds_text =
@@ -75,15 +74,15 @@ pub async fn bootstrap_library(
     if enable_timer {
         enable_user_timer(&SystemExec).await?;
     }
-    if use_home {
+    {
         let encode_pause = store
             .get_machine("encode_pause")
             .await
-            .map_err(crate::api_legacy::error)?
+            .map_err(crate::home_library::error)?
             .as_deref()
             == Some("1");
         bootstrap_home(&ds, &library_root, enable_timer, encode_pause).await.map_err(|err| {
-            AppError::Runtime(anyhow::anyhow!("library layout and service unit are prepared, but Home state publication failed: {err}; after restoring API availability, rerun library bootstrap{}", if enable_timer { " --enable-timer" } else { "" }))
+            AppError::Runtime(anyhow::anyhow!("library layout and service unit are prepared, but Home state publication failed: {err}; after restoring API availability, rerun library bootstrap{}", if enable_timer { " --enable-service" } else { "" }))
         })?;
     }
 
@@ -127,66 +126,12 @@ struct RelocateData {
 pub async fn relocate_library(
     json: bool,
     library_root: PathBuf,
-    desired_state: Option<PathBuf>,
-    config_dir: Option<PathBuf>,
     state_db: Option<PathBuf>,
     enable_timer: bool,
     unit_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    if crate::api_legacy::use_home(&state_db) {
-        return relocate_home(json, library_root, state_db, enable_timer, unit_dir).await;
-    }
-    let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
-    let desired_state =
-        desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
-    let state_db = crate::api_legacy::state_db_path(state_db);
-    let lock_path = bootstrap::lock_path(&state_db);
-    let _lock = bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?;
-    let ds_text =
-        std::fs::read_to_string(&desired_state).map_err(|err| AppError::Runtime(err.into()))?;
-    let ds = DesiredState::from_toml(&ds_text).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-
-    let library_root = layout_canonical_root(library_root, ds.min_free())?;
-
-    let store = Store::open(&state_db)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let new_root = library_root.display().to_string();
-    let rewritten_absolute = match store
-        .get_machine("library_root")
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?
-    {
-        Some(old_root) => store
-            .rewrite_absolute_prefix(&old_root, &new_root)
-            .await
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?,
-        None => 0,
-    };
-    store
-        .put_machine("library_root", &new_root)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-
-    let unit_dir = unit_dir.unwrap_or_else(bootstrap::default_unit_dir);
-    write_library_units(&unit_dir)?;
-    if enable_timer {
-        enable_user_timer(&SystemExec).await?;
-    }
-
-    let data = RelocateData {
-        library_root: new_root,
-        dirs: mediaops_sync::SCHEMA_DIRS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        rewritten_absolute,
-    };
-    if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-    } else {
-        Ok(format!("library {}", data.library_root))
-    }
+    refuse_library_root(&library_root)?;
+    relocate_home(json, library_root, state_db, enable_timer, unit_dir).await
 }
 
 #[derive(Debug, Serialize)]
@@ -199,54 +144,46 @@ pub async fn reindex_library(
     library_root: Option<PathBuf>,
     state_db: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    if crate::api_legacy::use_home(&state_db) {
-        let state_db = crate::api_legacy::state_db_path(state_db);
-        let _lock =
-            bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
-        let mut home = crate::api_legacy::HomeLibrary::load().await?;
-        home.root(library_root)?;
-        let was_locked = home.begin_maintenance().await?;
-        let indexed = home.reindex().await.map_err(maintenance_error)?;
-        home.finish_maintenance(was_locked).await?;
-        return if json {
-            serde_json::to_string(&Envelope::ok(ReindexData { indexed }))
-                .map_err(|err| AppError::Runtime(err.into()))
-        } else {
-            Ok(format!("reindex {indexed}"))
-        };
-    }
-    let state_db = crate::api_legacy::state_db_path(state_db);
-    let lock_path = bootstrap::lock_path(&state_db);
-    let _lock = bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?;
-    let store = Store::open(&state_db)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let library_root = match library_root {
-        Some(p) => p,
-        None => store
-            .get_machine("library_root")
-            .await
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                AppError::Usage("pass --library-root or run mediaops library bootstrap".into())
-            })?,
-    };
-    let report = reindex_schema(&library_root, &store)
-        .await
-        .map_err(map_reindex)?;
-    let data = ReindexData {
-        indexed: report.indexed,
-    };
+    let mut progress = crate::progress::OperationProgress::new(!json, "reindex");
+    progress.stage("connecting to Home API", "");
+    let state_db = crate::home_library::state_db_path(state_db);
+    let _lock =
+        bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
+    let mut home = crate::home_library::HomeLibrary::load().await?;
+    let root = home.root(library_root)?;
+    progress.stage("pausing scheduling", root.display().to_string());
+    let was_locked = home.begin_maintenance().await?;
+    let indexed = home.reindex(&progress).await.map_err(maintenance_error)?;
+    progress.stage("restoring scheduling", "");
+    home.finish_maintenance(was_locked).await?;
+    progress.finish();
     if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
+        serde_json::to_string(&Envelope::ok(ReindexData { indexed }))
+            .map_err(|err| AppError::Runtime(err.into()))
     } else {
-        Ok(format!("reindex {}", data.indexed))
+        Ok(format_reindex(indexed, &root, progress.elapsed()))
     }
 }
 
 fn maintenance_error(err: AppError) -> AppError {
-    crate::api_legacy::maintenance_failure(err)
+    crate::home_library::maintenance_failure(err)
+}
+
+fn format_reindex(indexed: usize, root: &Path, elapsed: std::time::Duration) -> String {
+    let noun = if indexed == 1 { "file" } else { "files" };
+    let root: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut result = format!(
+        "indexed   {indexed} {noun}\nlibrary   {root}\nelapsed   {}",
+        crate::progress::duration(elapsed)
+    );
+    if indexed == 0 {
+        result.push_str("\n          no schema media files under movies/, series/, or music/");
+    }
+    result
 }
 
 async fn bootstrap_home(
@@ -257,7 +194,7 @@ async fn bootstrap_home(
 ) -> Result<(), AppError> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let api = loop {
-        match crate::api_legacy::connect().await {
+        match crate::home_library::connect().await {
             Ok(api) => break api,
             Err(_) if wait && tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -271,13 +208,13 @@ async fn bootstrap_home(
     {
         Ok(cluster) => cluster,
         Err(err) if err.is_not_found() => {
-            let mut cluster = crate::api_legacy::cluster_from_config(ds, root);
+            let mut cluster = crate::home_library::cluster_from_config(ds, root);
             if let mediaops_core::Spec::Cluster(spec) = &mut cluster.spec {
                 spec.encode_pause = encode_pause;
             }
             cluster
         }
-        Err(err) => return Err(crate::api_legacy::error(err)),
+        Err(err) => return Err(crate::home_library::error(err)),
     };
     if let mediaops_core::Spec::Cluster(spec) = &mut cluster.spec {
         if !spec.library_root.is_empty() && Path::new(&spec.library_root) != root {
@@ -287,7 +224,7 @@ async fn bootstrap_home(
         }
         spec.library_root = root.display().to_string();
     }
-    crate::api_legacy::apply_spec(&api, cluster).await?;
+    crate::home_library::apply_spec(&api, cluster).await?;
     if let Some(address) = ds.seedbox_address() {
         match api
             .get(mediaops_core::Kind::Secret, mediaops_core::SECRET_NAME)
@@ -311,9 +248,9 @@ async fn bootstrap_home(
                     mediaops_core::StatusBody::Secret,
                 ))
                 .await
-                .map_err(crate::api_legacy::error)?;
+                .map_err(crate::home_library::error)?;
             }
-            Err(err) => return Err(crate::api_legacy::error(err)),
+            Err(err) => return Err(crate::home_library::error(err)),
         }
     }
     Ok(())
@@ -326,10 +263,10 @@ async fn relocate_home(
     enable_timer: bool,
     unit_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let state_db = crate::api_legacy::state_db_path(state_db);
+    let state_db = crate::home_library::state_db_path(state_db);
     let _lock =
         bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
-    let mut home = crate::api_legacy::HomeLibrary::load().await?;
+    let mut home = crate::home_library::HomeLibrary::load().await?;
     let root = layout_canonical_root(root, home.spec()?.min_free)?;
     let was_locked = home.begin_maintenance().await?;
     if let mediaops_core::Spec::Cluster(spec) = &mut home.cluster.spec {
@@ -339,7 +276,7 @@ async fn relocate_home(
         .api
         .patch(home.cluster.clone(), "spec")
         .await
-        .map_err(crate::api_legacy::error)
+        .map_err(crate::home_library::error)
         .map_err(maintenance_error)?;
     write_library_units(&unit_dir.unwrap_or_else(bootstrap::default_unit_dir))
         .map_err(maintenance_error)?;
@@ -437,10 +374,6 @@ fn write_library_units(unit_dir: &Path) -> Result<(), AppError> {
 
 fn anyhow_err(err: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{err}")
-}
-
-fn map_reindex(err: mediaops_sync::ReindexError) -> AppError {
-    AppError::Runtime(anyhow_err(err))
 }
 
 fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
@@ -549,174 +482,38 @@ mod tests {
         dir
     }
 
-    const DS: &str = "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 0\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n";
-
     #[tokio::test]
-    async fn relocate_rewrites_root_and_units_without_copying_media() {
-        let dir = scratch("relocate");
-        let ds = dir.join("config.toml");
-        std::fs::write(&ds, DS).expect("ds");
-        let old = dir.join("old");
-        mediaops_sync::ensure_layout(&old).expect("old layout");
-        let rel = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
-        let media = old.join(rel);
-        std::fs::create_dir_all(media.parent().expect("parent")).expect("mkdir");
-        std::fs::write(&media, b"orig").expect("media");
-        let db = dir.join("state.db");
-        let store = Store::open(&db).await.expect("store");
-        let title = mediaops_core::TitleId::movie_key("The.Matrix", 1999).expect("title");
-        let abs_title = mediaops_core::TitleId::movie_key("Other", 2000).expect("abs");
-        let digest = mediaops_core::Blake3Hex::of_bytes(b"orig");
-        let old_canon = std::fs::canonicalize(&old).expect("canon old");
-        store
-            .import_rows(&[
-                mediaops_core::TitleIndexEntry::new(
-                    title.clone(),
-                    rel,
-                    digest.clone(),
-                    digest.clone(),
-                ),
-                mediaops_core::TitleIndexEntry::new(
-                    abs_title.clone(),
-                    old_canon.join(rel).display().to_string(),
-                    digest.clone(),
-                    digest,
-                ),
-            ])
-            .await
-            .expect("index rows");
-        store
-            .put_machine("library_root", &old_canon.display().to_string())
-            .await
-            .expect("old root");
-        drop(store);
-        let units = dir.join("units");
-        let neu = dir.join("new");
-        let json = relocate_library(
-            true,
-            neu.clone(),
-            Some(ds),
-            Some(dir.clone()),
-            Some(db.clone()),
-            false,
-            Some(units.clone()),
-        )
-        .await
-        .expect("relocate");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["ok"], true, "{json}");
-        let root = value["data"]["library_root"].as_str().expect("root");
-        assert!(std::path::Path::new(root).is_absolute(), "{root}");
-        for name in mediaops_sync::SCHEMA_DIRS {
-            assert!(neu.join(name).is_dir(), "{name}");
-        }
-        assert!(media.is_file(), "relocate must not move media");
-        assert!(!neu.join(rel).exists(), "relocate must not copy media");
-        assert!(units.join("mediaops-home.service").is_file());
-        assert!(!units.join("mediaops-run.service").exists());
-        assert!(!units.join("mediaops-run.timer").exists());
-        let home = std::fs::read_to_string(units.join("mediaops-home.service")).expect("home");
-        assert!(home.contains("ExecStart="));
-        assert!(home.contains("mediaops-home"));
-        let store = Store::open(&db).await.expect("reopen");
-        assert_eq!(
-            store
-                .get_machine("library_root")
-                .await
-                .expect("get")
-                .as_deref(),
-            Some(root)
-        );
-        let entry = store
-            .get_title(&title)
-            .await
-            .expect("get")
-            .into_iter()
-            .next()
-            .expect("row");
-        assert_eq!(
-            entry.path(),
-            rel,
-            "relative index path must stay schema-relative"
-        );
-        let abs_entry = store
-            .get_title(&abs_title)
-            .await
-            .expect("get")
-            .into_iter()
-            .next()
-            .expect("abs row");
-        assert!(
-            abs_entry.path().starts_with(root),
-            "absolute path under old root must rewrite: {}",
-            abs_entry.path()
-        );
-        assert!(
-            !abs_entry
-                .path()
-                .starts_with(old_canon.to_str().expect("utf8")),
-            "old absolute prefix must be gone: {}",
-            abs_entry.path()
-        );
+    async fn relocation_watermark_refuses_before_layout_changes() {
+        let dir = scratch("relocate-water");
+        let root = dir.join("new");
+        let err = layout_canonical_root(root.clone(), mediaops_core::Bytes::new(u64::MAX))
+            .expect_err("watermark");
+        assert!(matches!(err, AppError::Policy(_)), "{err}");
+        assert!(!root.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[tokio::test]
-    async fn relocate_watermark_does_not_write_store_or_units() {
-        let dir = scratch("relocate-water");
-        let ds = dir.join("config.toml");
-        std::fs::write(
-            &ds,
-            "schema_version = 1\nmax_copy_gib = 1\nmin_free_gib = 999999999\nrange_len_mib = 8\nmax_nvenc = 1\nlock = false\n",
-        )
-        .expect("ds");
-        let db = dir.join("state.db");
-        let store = Store::open(&db).await.expect("store");
-        store
-            .put_machine("library_root", "/old/lib")
-            .await
-            .expect("seed");
-        drop(store);
-        let units = dir.join("units");
-        let neu = dir.join("new");
-        let err = relocate_library(
-            true,
-            neu,
-            Some(ds),
-            Some(dir.clone()),
-            Some(db.clone()),
-            false,
-            Some(units.clone()),
-        )
-        .await
-        .expect_err("watermark");
-        assert!(matches!(err, AppError::Policy(_)), "{err}");
-        let store = Store::open(&db).await.expect("reopen");
+    #[test]
+    fn reindex_exact_screen_explains_file_count_root_and_empty_schema() {
         assert_eq!(
-            store
-                .get_machine("library_root")
-                .await
-                .expect("get")
-                .as_deref(),
-            Some("/old/lib")
+            format_reindex(2, Path::new("/library"), std::time::Duration::from_secs(65)),
+            "indexed   2 files\nlibrary   /library\nelapsed   1m 05s"
         );
-        assert!(!units.join("mediaops-run.service").exists());
-        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(
+            format_reindex(0, Path::new("/library"), std::time::Duration::ZERO),
+            "indexed   0 files\nlibrary   /library\nelapsed   0s\n          no schema media files under movies/, series/, or music/"
+        );
     }
 
     #[tokio::test]
     async fn relocate_refuses_filesystem_root_and_empty() {
         let dir = scratch("relocate-root");
-        let ds = dir.join("config.toml");
-        std::fs::write(&ds, DS).expect("ds");
         let db = dir.join("state.db");
         let units = dir.join("units");
         for root in [PathBuf::from("/"), PathBuf::new()] {
             let err = relocate_library(
                 true,
                 root.clone(),
-                Some(ds.clone()),
-                Some(dir.clone()),
                 Some(db.clone()),
                 false,
                 Some(units.clone()),

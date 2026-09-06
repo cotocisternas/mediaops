@@ -1,14 +1,12 @@
 use std::path::PathBuf;
 
 use mediaops_core::{
-    DesiredState, Envelope, Placement, Probe, RemoteRef, TitleId, TitleKind, VerifiedStagingHandle,
-    install, parse_placement,
+    Envelope, Placement, RemoteRef, TitleId, TitleKind, VerifiedStagingHandle, install,
+    parse_placement,
 };
-use mediaops_store::Store;
-use mediaops_sync::refuse_below_watermark;
 use mediaops_transfer::{
-    PullSpec, configure_pool, connect_home, grpc_source, list_entries, pool_status, probe_range,
-    pull_file_with_progress, stat_entry,
+    PullSpec, configure_pool, connect_home, grpc_source, list_entries, pull_file_with_progress,
+    stat_entry,
 };
 use serde::Serialize;
 
@@ -123,246 +121,46 @@ pub async fn pull(
     tls_dir: Option<PathBuf>,
     config_dir: Option<PathBuf>,
     state_db: Option<PathBuf>,
-    desired_state: Option<PathBuf>,
     do_install: bool,
     title: Option<String>,
     year: Option<u16>,
     season: Option<u8>,
     episode: Option<u8>,
 ) -> Result<String, AppError> {
-    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
     let socket = socket.unwrap_or_else(bootstrap::default_socket);
-    let state_db = crate::api_legacy::state_db_path(state_db);
+    let state_db = crate::home_library::state_db_path(state_db);
     let lock_path = state_db
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("mediaops.lock");
     let _lock = bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?;
-    if use_home {
-        let home = crate::api_legacy::HomeLibrary::load().await?;
-        let id = TitleId::parse(&title_id).map_err(|err| AppError::Usage(err.to_string()))?;
-        let placement = if do_install {
-            Some(placement_for(
-                &id, &path, &name, title, year, season, episode,
-            )?)
-        } else {
-            None
-        };
-        let remote = RemoteRef::from_wire_parts(root, path)
-            .map_err(|err| AppError::Usage(err.to_string()))?;
-        return pull_home(
-            json,
-            home,
-            ManualPull {
-                title_id: id,
-                remote,
-                name,
-                placement,
-                library_root,
-                socket,
-                tls_dir,
-            },
-        )
-        .await;
-    }
-    let desired_state =
-        desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
-    let store = Store::open(&state_db)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let library_root = match library_root {
-        Some(p) => p,
-        None => store
-            .get_machine("library_root")
-            .await
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                AppError::Usage("pass --library-root or run mediaops library bootstrap".into())
-            })?,
-    };
-    let library_root = if library_root.exists() {
-        std::fs::canonicalize(&library_root).unwrap_or(library_root)
-    } else {
-        library_root
-    };
-    let ds_text =
-        std::fs::read_to_string(&desired_state).map_err(|err| AppError::Runtime(err.into()))?;
-    let ds = DesiredState::from_toml(&ds_text).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    if ds.lock() {
-        return Err(AppError::Policy(
-            "config lock is set; pull is frozen".into(),
-        ));
-    }
-    let title_id = TitleId::parse(&title_id).map_err(|err| AppError::Usage(err.to_string()))?;
+    let home = crate::home_library::HomeLibrary::load().await?;
+    let id = TitleId::parse(&title_id).map_err(|err| AppError::Usage(err.to_string()))?;
     let placement = if do_install {
         Some(placement_for(
-            &title_id, &path, &name, title, year, season, episode,
+            &id, &path, &name, title, year, season, episode,
         )?)
     } else {
         None
     };
     let remote =
         RemoteRef::from_wire_parts(root, path).map_err(|err| AppError::Usage(err.to_string()))?;
-
-    let channel = connect_home(&socket, &tls_dir)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let (fingerprint, _) = pool_status(channel.clone())
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let n = match store
-        .get_probe(&fingerprint)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?
-    {
-        Some(probe) => probe.range_concurrency,
-        None => {
-            let n = probe_range(channel.clone(), 32)
-                .await
-                .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-            store
-                .put_probe(&Probe {
-                    endpoint_fingerprint: fingerprint.clone(),
-                    range_concurrency: n,
-                })
-                .await
-                .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-            n
-        }
-    };
-    configure_pool(channel.clone(), n)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let entry = stat_entry(channel.clone(), &remote)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    if entry.len() > ds.max_copy().get() {
-        return Err(AppError::Policy(format!(
-            "file len {} exceeds max_copy {}",
-            entry.len(),
-            ds.max_copy().get()
-        )));
-    }
-    let watermark_path = if library_root.exists() {
-        library_root.clone()
-    } else {
-        library_root
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| library_root.clone())
-    };
-    let free = refuse_below_watermark(&watermark_path, ds.min_free()).map_err(|err| match err {
-        mediaops_sync::LibraryError::Watermark { .. } => AppError::Policy(err.to_string()),
-        other => AppError::Runtime(anyhow_err(other)),
-    })?;
-    if free.saturating_sub(entry.len()) < ds.min_free().get() {
-        return Err(AppError::Policy(format!(
-            "copy of {} bytes would breach min_free {}",
-            entry.len(),
-            ds.min_free().get()
-        )));
-    }
-
-    let spec = PullSpec {
-        library_root: library_root.clone(),
-        title_id: title_id.clone(),
-        final_name: name.clone(),
-        remote,
-        file_len: entry.len(),
-        range_len: ds.range_len().get(),
-        concurrency: n as usize,
-    };
-    let pull_label = placement
-        .as_ref()
-        .map(crate::out::human_placement)
-        .unwrap_or_else(|| name.clone());
-    let mut meter = (!json).then(|| PullMeter::new(pull_label.clone()));
-    let outcome = pull_file_with_progress(grpc_source(channel), &spec, |done, total| {
-        if let Some(m) = meter.as_mut() {
-            m.update(done, total);
-        }
-    })
+    pull_home(
+        json,
+        home,
+        ManualPull {
+            title_id: id,
+            remote,
+            name,
+            placement,
+            library_root,
+            socket,
+            tls_dir,
+        },
+    )
     .await
-    .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    if let Some(m) = meter.as_mut() {
-        m.finish();
-    }
-
-    let job = store
-        .create_job(mediaops_core::JobKind::Pull, &title_id, None)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    store
-        .advance(
-            job.id(),
-            mediaops_core::JobEvent::Pull(mediaops_core::PullEvent::Start),
-        )
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    store
-        .advance(
-            job.id(),
-            mediaops_core::JobEvent::Pull(mediaops_core::PullEvent::FinishRanges),
-        )
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-
-    let mut installed = None;
-    let mut whole_file_b3 = {
-        let file = std::fs::File::open(&outcome.staged)
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-        mediaops_core::Blake3Hex::of_reader(file)
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?
-    };
-    if do_install {
-        let placement = placement.expect("validated before pull");
-        let handle = VerifiedStagingHandle::verify(
-            &library_root,
-            &title_id,
-            outcome.staged.clone(),
-            &placement,
-        )
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-        let placed = install(&library_root, &title_id, &handle)
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-        whole_file_b3 = placed.whole_file_b3.clone();
-        store
-            .record_install(
-                &title_id,
-                &placed.whole_file_b3,
-                handle.dest_rel().to_str().unwrap_or(""),
-            )
-            .await
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-        store
-            .advance(
-                job.id(),
-                mediaops_core::JobEvent::Pull(mediaops_core::PullEvent::Install),
-            )
-            .await
-            .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-        installed = Some(placed.path.display().to_string());
-    }
-
-    let data = PullData {
-        staged: outcome.staged.display().to_string(),
-        whole_file_b3: whole_file_b3.to_string(),
-        installed,
-        job_id: Some(job.id().get()),
-        resumed_ranges: outcome
-            .resumed_ranges
-            .into_iter()
-            .map(|(offset, len)| ResumedRange { offset, len })
-            .collect(),
-    };
-    if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-    } else {
-        Ok(format_pull(&data, &pull_label))
-    }
 }
 
 struct ManualPull {
@@ -377,7 +175,7 @@ struct ManualPull {
 
 async fn pull_home(
     json: bool,
-    mut home: crate::api_legacy::HomeLibrary,
+    mut home: crate::home_library::HomeLibrary,
     request: ManualPull,
 ) -> Result<String, AppError> {
     let root = home.root(request.library_root)?;
@@ -390,7 +188,7 @@ async fn pull_home(
     if let Some(placement) = &request.placement {
         let destination = root.join(
             mediaops_core::render(&request.title_id, placement)
-                .map_err(crate::api_legacy::error)?,
+                .map_err(crate::home_library::error)?,
         );
         match std::fs::symlink_metadata(&destination) {
             Ok(_) => {
@@ -400,15 +198,15 @@ async fn pull_home(
                 )));
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(crate::api_legacy::error(err)),
+            Err(err) => return Err(crate::home_library::error(err)),
         }
     }
     let channel = connect_home(&request.socket, &request.tls_dir)
         .await
-        .map_err(crate::api_legacy::error)?;
+        .map_err(crate::home_library::error)?;
     let entry = stat_entry(channel.clone(), &request.remote)
         .await
-        .map_err(crate::api_legacy::error)?;
+        .map_err(crate::home_library::error)?;
     let label = request
         .placement
         .as_ref()
@@ -429,7 +227,7 @@ async fn pull_home(
         check_manual_budget(&spec, &cluster)?;
         configure_pool(channel.clone(), spec.concurrency as u32)
             .await
-            .map_err(crate::api_legacy::error)?;
+            .map_err(crate::home_library::error)?;
         let mut meter = (!json).then(|| PullMeter::new(label.clone()));
         let copied = pull_file_with_progress(grpc_source(channel), &spec, |done, total| {
             if let Some(meter) = meter.as_mut() {
@@ -437,20 +235,20 @@ async fn pull_home(
             }
         })
         .await
-        .map_err(crate::api_legacy::error)?;
+        .map_err(crate::home_library::error)?;
         if let Some(meter) = meter.as_mut() {
             meter.finish();
         }
         let digest = mediaops_core::Blake3Hex::of_reader(
-            std::fs::File::open(&copied.staged).map_err(crate::api_legacy::error)?,
+            std::fs::File::open(&copied.staged).map_err(crate::home_library::error)?,
         )
-        .map_err(crate::api_legacy::error)?;
+        .map_err(crate::home_library::error)?;
         Ok::<_, AppError>((copied, digest))
     }
     .await;
     let (copied, digest) = match staged {
         Ok(copied) => copied,
-        Err(err) => return Err(crate::api_legacy::maintenance_failure(err)),
+        Err(err) => return Err(crate::home_library::maintenance_failure(err)),
     };
     let installed = if let Some(placement) = request.placement {
         let handle = match VerifiedStagingHandle::verify(
@@ -461,8 +259,8 @@ async fn pull_home(
         ) {
             Ok(handle) => handle,
             Err(err) => {
-                return Err(crate::api_legacy::maintenance_failure(
-                    crate::api_legacy::error(err),
+                return Err(crate::home_library::maintenance_failure(
+                    crate::home_library::error(err),
                 ));
             }
         };
@@ -473,8 +271,8 @@ async fn pull_home(
         let placed = match install(&root, &request.title_id, &handle) {
             Ok(placed) => placed,
             Err(err) => {
-                return Err(crate::api_legacy::maintenance_failure(
-                    crate::api_legacy::error(err),
+                return Err(crate::home_library::maintenance_failure(
+                    crate::home_library::error(err),
                 ));
             }
         };
@@ -490,8 +288,8 @@ async fn pull_home(
             )
             .await
         {
-            return Err(crate::api_legacy::maintenance_failure(
-                crate::api_legacy::error(format!(
+            return Err(crate::home_library::maintenance_failure(
+                crate::home_library::error(format!(
                     "installed file retained at {}; Home proof publication failed: {err}; run library reindex to recover its proof",
                     placed.path.display(),
                 )),
@@ -514,7 +312,7 @@ async fn pull_home(
             .collect(),
     };
     if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(crate::api_legacy::error)
+        serde_json::to_string(&Envelope::ok(data)).map_err(crate::home_library::error)
     } else {
         Ok(format_pull(&data, &label))
     }
@@ -549,7 +347,7 @@ fn check_manual_install(
         spec.file_len,
         cluster.min_free.get(),
     );
-    if !mediaops_core::install_fits(&job).map_err(crate::api_legacy::error)? {
+    if !mediaops_core::install_fits(&job).map_err(crate::home_library::error)? {
         return Err(AppError::Policy(
             "manual install would exceed destination filesystem free-space reserve".into(),
         ));
@@ -561,7 +359,7 @@ fn check_manual_budget(
     spec: &PullSpec,
     cluster: &mediaops_core::ClusterSpec,
 ) -> Result<(), AppError> {
-    let free = mediaops_core::free_bytes(&spec.library_root).map_err(crate::api_legacy::error)?;
+    let free = mediaops_core::free_bytes(&spec.library_root).map_err(crate::home_library::error)?;
     let remaining = remaining_staging_bytes(spec)?;
     if (cluster.max_copy.get() > 0 && spec.file_len > cluster.max_copy.get())
         || !mediaops_core::pull_fits(free, cluster.min_free.get(), 0, 0, remaining)
@@ -577,7 +375,7 @@ fn remaining_staging_bytes(spec: &PullSpec) -> Result<u64, AppError> {
     use std::os::unix::fs::MetadataExt;
     let staged = spec.library_root.join(
         mediaops_core::staging_path(&spec.title_id, &spec.final_name)
-            .map_err(crate::api_legacy::error)?,
+            .map_err(crate::home_library::error)?,
     );
     let mut partial = staged.clone();
     partial.as_mut_os_string().push(".partial");
@@ -595,7 +393,7 @@ fn remaining_staging_bytes(spec: &PullSpec) -> Result<u64, AppError> {
                     path.display()
                 ))),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(largest),
-                Err(err) => Err(crate::api_legacy::error(err)),
+                Err(err) => Err(crate::home_library::error(err)),
             },
         )?;
     Ok(spec.file_len.saturating_sub(allocated))
@@ -697,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn manual_home_pull_publishes_proof_and_restores_scheduling() {
         let _serial = crate::test_support::serial_net();
-        let (home, dir, server) = crate::api_legacy::test_home("manual-home-pull").await;
+        let (home, dir, server) = crate::home_library::test_home("manual-home-pull").await;
         let api = home.api.clone();
         let library_root = home.root(None).expect("root");
         let pair =
@@ -797,7 +595,7 @@ mod tests {
     }
 
     async fn prepare_dest_watermark(
-        home: &mut crate::api_legacy::HomeLibrary,
+        home: &mut crate::home_library::HomeLibrary,
     ) -> Option<DestFixture> {
         let original = home.root(None).expect("root");
         let (orig_dev, orig_free) = fs_info(&original)?;
@@ -845,7 +643,9 @@ mod tests {
             panic!("Cluster");
         };
         spec.library_root = library_root.display().to_string();
-        spec.min_free = mediaops_core::Bytes::new(dest_free);
+        // Leave room on both sides: unrelated test cleanup can increase free
+        // space between measuring the destination and checking publication.
+        spec.min_free = mediaops_core::Bytes::new(dest_free + (root_free - dest_free) / 2);
         home.cluster = home.api.patch(cluster, "spec").await.expect("cluster");
         Some(DestFixture { extra })
     }
@@ -853,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn manual_install_dest_watermark_refuses_before_publication() {
         let _serial = crate::test_support::serial_net();
-        let (mut home, dir, server) = crate::api_legacy::test_home("manual-dest-watermark").await;
+        let (mut home, dir, server) = crate::home_library::test_home("manual-dest-watermark").await;
         let api = home.api.clone();
         let Some(_dest) = prepare_dest_watermark(&mut home).await else {
             server.abort();
@@ -912,7 +712,8 @@ mod tests {
     #[tokio::test]
     async fn manual_staging_only_pull_does_not_consult_dest_fs() {
         let _serial = crate::test_support::serial_net();
-        let (mut home, dir, server) = crate::api_legacy::test_home("manual-stage-only-dest").await;
+        let (mut home, dir, server) =
+            crate::home_library::test_home("manual-stage-only-dest").await;
         let Some(_dest) = prepare_dest_watermark(&mut home).await else {
             server.abort();
             let _ = std::fs::remove_dir_all(dir);
@@ -1066,191 +867,5 @@ mod tests {
 seedbox
       10 B  a.bin"
         );
-    }
-
-    #[tokio::test]
-    async fn pull_stages_without_install_and_records_job() {
-        let _serial = crate::test_support::serial_net();
-        let lb = crate::test_support::start_pair(Some("a.bin"), b"abcdefghij").await;
-        let dir = crate::test_support::scratch("pull-stage");
-        let library = crate::test_support::library_root(&dir);
-        let store = crate::test_support::open_store(&dir).await;
-        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
-        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
-        let json = pull(
-            true,
-            "seedbox".into(),
-            PathBuf::from("a.bin"),
-            "movie:key:thematrix.1999".into(),
-            "The.Matrix.(1999).mkv".into(),
-            Some(library.clone()),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            None,
-            Some(dir.join("state.db")),
-            Some(ds),
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("pull");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["ok"], true);
-        assert!(value["data"]["installed"].is_null());
-        let staged = value["data"]["staged"].as_str().expect("staged");
-        assert!(staged.contains("_incoming"), "{staged}");
-        assert!(std::path::Path::new(staged).is_file());
-        let jobs = store.list_jobs().await.expect("jobs");
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].kind(), mediaops_core::JobKind::Pull);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn pull_install_uses_schema_path_parse_placement() {
-        let _serial = crate::test_support::serial_net();
-        let lb =
-            crate::test_support::start_pair(Some(crate::test_support::MOVIE_REL), b"abcdefghij")
-                .await;
-        let dir = crate::test_support::scratch("pull-install");
-        let library = crate::test_support::library_root(&dir);
-        let store = crate::test_support::open_store(&dir).await;
-        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
-        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
-        let json = pull(
-            true,
-            "seedbox".into(),
-            PathBuf::from(crate::test_support::MOVIE_REL),
-            "movie:key:thematrix.1999".into(),
-            "The.Matrix.(1999).mkv".into(),
-            Some(library.clone()),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            None,
-            Some(dir.join("state.db")),
-            Some(ds),
-            true,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("install");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["ok"], true);
-        let installed = value["data"]["installed"].as_str().expect("installed");
-        assert!(installed.contains("The.Matrix.(1999).mkv"), "{installed}");
-        assert!(std::path::Path::new(installed).is_file());
-        let title = store
-            .get_title(&TitleId::movie_key("The.Matrix", 1999).expect("id"))
-            .await
-            .expect("title")
-            .into_iter()
-            .next()
-            .expect("indexed");
-        assert!(!title.path_missing());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn pull_lock_true_is_policy_refusal() {
-        let dir = crate::test_support::scratch("pull-lock");
-        let library = crate::test_support::library_root(&dir);
-        let _store = crate::test_support::open_store(&dir).await;
-        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_LOCKED);
-        let err = pull(
-            true,
-            "seedbox".into(),
-            PathBuf::from("a.bin"),
-            "movie:key:thematrix.1999".into(),
-            "The.Matrix.(1999).mkv".into(),
-            Some(library),
-            Some(dir.join("missing.sock")),
-            Some(dir.join("tls")),
-            None,
-            Some(dir.join("state.db")),
-            Some(ds),
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect_err("lock");
-        assert!(
-            matches!(err, AppError::Policy(ref m) if m.contains("lock")),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn pull_over_max_copy_is_policy() {
-        let _serial = crate::test_support::serial_net();
-        let lb = crate::test_support::start_pair(Some("a.bin"), b"abcdefghij").await;
-        let dir = crate::test_support::scratch("pull-max");
-        let library = crate::test_support::library_root(&dir);
-        let store = crate::test_support::open_store(&dir).await;
-        crate::test_support::seed_probe(&store, &lb.fingerprint).await;
-        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_MAX_COPY_ZERO);
-        let err = pull(
-            true,
-            "seedbox".into(),
-            PathBuf::from("a.bin"),
-            "movie:key:thematrix.1999".into(),
-            "The.Matrix.(1999).mkv".into(),
-            Some(library),
-            Some(lb.sock.clone()),
-            Some(lb.tls_dir.clone()),
-            None,
-            Some(dir.join("state.db")),
-            Some(ds),
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect_err("max_copy");
-        assert!(
-            matches!(err, AppError::Policy(ref m) if m.contains("max_copy")),
-            "{err}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn pull_without_library_root_is_usage() {
-        let dir = crate::test_support::scratch("pull-usage");
-        let _store = crate::test_support::open_store(&dir).await;
-        let ds = crate::test_support::write_ds(&dir, crate::test_support::DS_UNLOCKED);
-        let err = pull(
-            true,
-            "seedbox".into(),
-            PathBuf::from("a.bin"),
-            "movie:key:thematrix.1999".into(),
-            "The.Matrix.(1999).mkv".into(),
-            None,
-            Some(dir.join("missing.sock")),
-            Some(dir.join("tls")),
-            None,
-            Some(dir.join("state.db")),
-            Some(ds),
-            false,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect_err("usage");
-        assert!(matches!(err, AppError::Usage(_)), "{err}");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

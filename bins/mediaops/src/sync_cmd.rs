@@ -43,9 +43,7 @@ pub(crate) fn render_sync(
     }
     match output {
         Output::Json => serde_json::to_string(obj).map_err(|err| AppError::Runtime(err.into())),
-        Output::LegacyJson => serde_json::to_string(&mediaops_core::Envelope::ok(obj))
-            .map_err(|err| AppError::Runtime(err.into())),
-        Output::Table | Output::Wide => format_human(request_id, dry_run, obj)
+        Output::Auto | Output::Table | Output::Wide => format_human(request_id, dry_run, obj)
             .ok_or_else(|| AppError::Runtime(anyhow!("sync `{request_id}`: unexpected response"))),
     }
 }

@@ -27,11 +27,15 @@ document or a stale copy of `config.toml`.
 | --------------- | -------------- |
 | CLI `plan` / `run` and a periodic run timer | Explicit one-shot `sync` requests or persistent Wants, with per-file Pull Jobs executed by the always-on Home roles |
 | `mediaopsd --role home` | Separate `mediaops-api` and `mediaops-gateway` processes |
-| `state.db` as the home catalog | `api.db`, opened only by `mediaops-api`; `state.db` remains for supported legacy capabilities |
+| `state.db` as the home catalog | `api.db`, opened only by `mediaops-api`; `state.db` stores local GPU capabilities and maintenance bookkeeping |
 | `config.toml` as the copy loop's live configuration | Cluster settings imported into the API and snapshotted when each Job is created |
-| One JSON envelope for every command | Raw Home API `-o json` output and the separate legacy `--json` envelope |
+| One JSON envelope for every command | One raw `-o json` format for all CLI commands |
 | One title-wide copy result | Installation and current digests for individual episode, track, or movie placements |
 | A library flock coordinating the normal copy loop | Job bind and status for unattended copying; explicit CLI maintenance still has its own locking rules |
+
+The v0.2.0 CLI has one Home interface. Retired `--json`, `import-legacy`, custom
+Home `--state-db` selection, and `--enable-timer` syntax are rejected. Use
+`-o json`, current export/import bundles, and `--enable-service`.
 
 Use [Setup](setup.md#3-bootstrap-the-home-library) for the actual upgrade steps.
 Do not run commands copied from old demos to migrate an installation.

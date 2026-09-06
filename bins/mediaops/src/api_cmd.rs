@@ -1,47 +1,47 @@
-//! Home API client verbs: get / apply / delete / watch-objects / reconcile / import-legacy.
+//! Home API client verbs: get / apply / delete / watch-objects / reconcile.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::collections::BTreeSet;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use mediaops_core::{
-    Actor, CLUSTER_NAME, DesiredState, HoldDecisionSpec, HoldSpec, HomeObject, Kind, SECRET_NAME,
-    Spec, StatusBody, TitleId, TitleSpec, WantSpec,
+    Actor, HoldDecisionSpec, HomeObject, Kind, Spec, StatusBody, TitleId, TitleSpec, WantSpec,
 };
 use mediaops_home_client::{ClientError, HomeApi, default_api_socket};
-use mediaops_store::Store;
 use serde::Serialize;
 use unicode_width::UnicodeWidthStr;
 
 use crate::AppError;
-use crate::bootstrap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Output {
+    Auto,
     Table,
     Wide,
     Json,
-    LegacyJson,
 }
 
 impl Output {
-    pub fn parse(raw: Option<&str>, json_flag: bool) -> Result<Self, AppError> {
-        if json_flag {
-            if raw.is_some() {
-                return Err(AppError::Usage("use either --json or -o, not both".into()));
-            }
-            return Ok(Self::LegacyJson);
+    pub fn parse(raw: Option<&str>) -> Result<Self, AppError> {
+        match raw {
+            None => Ok(Self::Auto),
+            Some("json") => Ok(Self::Json),
+            Some("wide") => Ok(Self::Wide),
+            Some("table" | "") => Ok(Self::Table),
+            Some(other) => Err(AppError::Usage(format!("unknown -o `{other}`"))),
         }
-        match raw.unwrap_or("table") {
-            "json" => Ok(Self::Json),
-            "wide" => Ok(Self::Wide),
-            "table" | "" => Ok(Self::Table),
-            other => Err(AppError::Usage(format!("unknown -o `{other}`"))),
+    }
+
+    fn for_objects(self, terminal: bool) -> Self {
+        match self {
+            Self::Auto if terminal => Self::Wide,
+            Self::Auto => Self::Table,
+            explicit => explicit,
         }
     }
 
     fn is_json(self) -> bool {
-        matches!(self, Self::Json | Self::LegacyJson)
+        self == Self::Json
     }
 }
 
@@ -52,9 +52,7 @@ fn render_payload<T: Serialize>(
 ) -> Result<String, AppError> {
     match output {
         Output::Json => serde_json::to_string(payload).map_err(|err| AppError::Runtime(err.into())),
-        Output::LegacyJson => serde_json::to_string(&mediaops_core::Envelope::ok(payload))
-            .map_err(|err| AppError::Runtime(err.into())),
-        Output::Table | Output::Wide => Ok(tsv),
+        Output::Auto | Output::Table | Output::Wide => Ok(tsv),
     }
 }
 
@@ -106,11 +104,7 @@ pub async fn watch_kind(
     output: Output,
     socket: Option<PathBuf>,
 ) -> Result<(), AppError> {
-    if output == Output::LegacyJson {
-        return Err(AppError::Usage(
-            "streaming output uses -o json (one object per line)".into(),
-        ));
-    }
+    let output = output.for_objects(std::io::stdout().is_terminal());
     let kind = match kind.as_deref() {
         None | Some("") => None,
         Some(raw) => Some(Kind::parse(raw).map_err(|e| AppError::Usage(e.to_string()))?),
@@ -130,12 +124,21 @@ pub async fn watch_kind(
         }
         let line = if output.is_json() {
             render_one(&obj, output)
+        } else if output == Output::Wide {
+            format!(
+                "{}  {}  {}  {}  {}",
+                watch_type(ev.r#type),
+                obj.kind.as_str(),
+                crate::out::inert(&obj.metadata.name),
+                wide_phase(&obj, unix_now()),
+                crate::out::inert(&wide_details(&obj, unix_now()))
+            )
         } else {
             format!(
                 "{}\t{}\t{}",
                 watch_type(ev.r#type),
                 obj.kind.as_str(),
-                obj.metadata.name
+                crate::out::inert(&obj.metadata.name)
             )
         };
         // Flush each event. A quiet watch must not wait for an arbitrary batch
@@ -240,27 +243,33 @@ pub async fn watch_title(
         .map(|id| crate::out::human_title_id(&id))
         .unwrap_or_else(|_| title_id.clone());
     let meta = if already { "already" } else { "" };
-    Ok(crate::watch::format_watch_line(&label, &title_id, meta))
+    Ok(format_watch_line(&label, &title_id, meta))
 }
 
 pub async fn status_pretty(output: Output, socket: Option<PathBuf>) -> Result<String, AppError> {
     let api = connect(socket, Actor::Cli).await?;
-    let mut items = api.list(Some(Kind::Want)).await.map_err(map_client)?;
-    items.extend(api.list(Some(Kind::Job)).await.map_err(map_client)?);
-    items.extend(api.list(Some(Kind::Node)).await.map_err(map_client)?);
+    // One snapshot keeps pause, worker readiness and work mutually consistent.
+    let items: Vec<_> = api
+        .list(None)
+        .await
+        .map_err(map_client)?
+        .into_iter()
+        .filter(|obj| {
+            matches!(
+                obj.kind,
+                Kind::Want | Kind::Job | Kind::Node | Kind::Cluster | Kind::Title
+            )
+        })
+        .collect();
     if output.is_json() {
         return Ok(render_list(&items, output));
     }
-    let free = match api.get(Kind::Cluster, CLUSTER_NAME).await {
-        Ok(cluster) => match cluster.spec {
-            Spec::Cluster(cs) if !cs.library_root.is_empty() => {
-                mediaops_core::free_bytes(std::path::Path::new(&cs.library_root)).ok()
-            }
-            _ => None,
-        },
-        Err(err) if err.is_not_found() => None,
-        Err(err) => return Err(map_client(err)),
-    };
+    let free = items.iter().find_map(|obj| match &obj.spec {
+        Spec::Cluster(cs) if !cs.library_root.is_empty() => {
+            mediaops_core::free_bytes(std::path::Path::new(&cs.library_root)).ok()
+        }
+        _ => None,
+    });
     Ok(format_status(&items, free))
 }
 
@@ -269,19 +278,15 @@ fn format_status(items: &[HomeObject], free: Option<u64>) -> String {
     for obj in items {
         match (&obj.spec, &obj.status) {
             (Spec::Want(s), StatusBody::Want(st)) if st.phase == mediaops_core::WantPhase::Open => {
-                lines.push(format!("want      {}", human_title(&s.title_id)));
+                lines.push(format!(
+                    "want      {}",
+                    crate::out::inert(&title_label(&s.title_id, items))
+                ));
             }
             (Spec::Job(s), StatusBody::Job(st))
                 if st.phase != mediaops_core::JobPhase::Installed =>
             {
-                lines.push(format!(
-                    "pull      {}  {}",
-                    human_title(&s.title_id),
-                    st.phase.as_str()
-                ));
-                if !st.message.is_empty() {
-                    lines.push(format!("          {}", st.message));
-                }
+                lines.extend(job_lines(obj, s, st));
             }
             _ => {}
         }
@@ -289,11 +294,136 @@ fn format_status(items: &[HomeObject], free: Option<u64>) -> String {
     if lines.is_empty() {
         lines.push("nothing happening".into());
     }
-    if let Some(free) = free {
-        lines.push(String::new());
-        lines.push(format!("disk      {} free", crate::out::fmt_bytes(free)));
-    }
+    lines.push(String::new());
+    lines.extend(control_lines(items));
+    lines.push(String::new());
+    lines.push(match free {
+        Some(free) => format!("disk      {} free", crate::out::fmt_bytes(free)),
+        None => "disk      free space unavailable".into(),
+    });
     lines.join("\n")
+}
+
+fn control_lines(items: &[HomeObject]) -> Vec<String> {
+    use mediaops_core::WorkerKind;
+    let mut lines = Vec::new();
+    match items.iter().find_map(|obj| match &obj.spec {
+        Spec::Cluster(s) => Some(s),
+        _ => None,
+    }) {
+        Some(cluster) => {
+            lines.push(format!(
+                "scheduler {}",
+                if cluster.lock {
+                    "paused (Cluster lock)"
+                } else {
+                    "enabled"
+                }
+            ));
+            if cluster.encode_pause {
+                lines.push("encode    paused".into());
+            }
+        }
+        None => lines.push("config    Cluster unavailable".into()),
+    }
+    let now = unix_now();
+    let mut unavailable = false;
+    for worker in [
+        WorkerKind::Scheduler,
+        WorkerKind::Inventory,
+        WorkerKind::Pull,
+    ] {
+        let status = items.iter().find_map(|obj| match (&obj.spec, &obj.status) {
+            (Spec::Node(s), StatusBody::Node(st)) if s.worker_kind == worker => Some(st),
+            _ => None,
+        });
+        let state = match status {
+            Some(st) if mediaops_core::node_is_ready(st.ready, st.last_heartbeat_unix, now) => {
+                "ready".into()
+            }
+            Some(st) => {
+                unavailable = true;
+                if st.last_heartbeat_unix > 0 {
+                    format!(
+                        "not ready; last heartbeat {} ago",
+                        crate::out::fmt_age(
+                            now.saturating_sub(st.last_heartbeat_unix).max(0) as u64
+                        )
+                    )
+                } else {
+                    "not ready; no heartbeat".into()
+                }
+            }
+            None => {
+                unavailable = true;
+                "missing".into()
+            }
+        };
+        lines.push(format!("worker    {}  {state}", worker.as_str()));
+    }
+    if unavailable {
+        lines.push("check     mediaops doctor".into());
+    }
+    lines
+}
+
+fn job_lines(
+    obj: &HomeObject,
+    spec: &mediaops_core::JobSpec,
+    status: &mediaops_core::JobStatus,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "pull      {}  {}  {}",
+        crate::out::inert(&object_label(obj).unwrap_or_else(|| human_title(&spec.title_id))),
+        status.phase.as_str(),
+        crate::out::fmt_progress(status.bytes_done, spec.file_len),
+    )];
+    lines.push(format!(
+        "          Job {}{}",
+        crate::out::inert(&obj.metadata.name),
+        if spec.node_name.is_empty() {
+            String::new()
+        } else {
+            format!("  worker {}", crate::out::inert(&spec.node_name))
+        }
+    ));
+    if !spec.dest_rel.is_empty() {
+        lines.push(format!("          {}", crate::out::inert(&spec.dest_rel)));
+    }
+    if !status.message.is_empty() {
+        lines.push(format!("          {}", crate::out::inert(&status.message)));
+    } else if status.phase == mediaops_core::JobPhase::Pending {
+        lines.push(format!(
+            "          {}",
+            if spec.node_name.is_empty() {
+                "waiting for scheduler"
+            } else {
+                "assigned; waiting for worker"
+            }
+        ));
+    }
+    if matches!(
+        status.phase,
+        mediaops_core::JobPhase::Failed | mediaops_core::JobPhase::Refused
+    ) {
+        lines.push(format!(
+            "inspect   mediaops get Job {} -o json",
+            shell_arg(&obj.metadata.name)
+        ));
+    }
+    lines
+}
+
+pub(crate) fn shell_arg(raw: &str) -> String {
+    if !raw.is_empty()
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/".contains(&byte))
+    {
+        raw.into()
+    } else {
+        format!("'{}'", crate::out::inert(raw).replace('\'', "'\"'\"'"))
+    }
 }
 
 pub async fn why_pretty(
@@ -303,22 +433,17 @@ pub async fn why_pretty(
 ) -> Result<String, AppError> {
     let api = connect(socket, Actor::Cli).await?;
     let title_id = resolve_title(&api, &title).await?;
-    let mut related = Vec::new();
-    for kind in [
-        Kind::Title,
-        Kind::Want,
-        Kind::Job,
-        Kind::Hold,
-        Kind::RemoteFile,
-    ] {
-        for obj in api.list(Some(kind)).await.map_err(map_client)? {
-            if title_id_of(&obj).as_deref() == Some(title_id.as_str())
+    let related: Vec<_> = api
+        .list(None)
+        .await
+        .map_err(map_client)?
+        .into_iter()
+        .filter(|obj| {
+            title_id_of(obj).as_deref() == Some(title_id.as_str())
                 || obj.metadata.name == title_id
-            {
-                related.push(obj);
-            }
-        }
-    }
+                || matches!(obj.kind, Kind::Cluster | Kind::Node)
+        })
+        .collect();
     if output.is_json() {
         return Ok(render_list(&related, output));
     }
@@ -326,9 +451,7 @@ pub async fn why_pretty(
 }
 
 fn format_why(title_id: &str, related: &[HomeObject]) -> String {
-    let label = TitleId::parse(title_id)
-        .map(|id| crate::out::human_title_id(&id))
-        .unwrap_or_else(|_| title_id.to_string());
+    let label = crate::out::inert(&title_label(title_id, related));
     let mut lines = vec![label, title_id.to_string(), String::new()];
     let mut facts = 0u32;
     let on_box = related.iter().any(|obj| obj.kind == Kind::RemoteFile);
@@ -339,7 +462,7 @@ fn format_why(title_id: &str, related: &[HomeObject]) -> String {
             {
                 lines.push(format!(
                     "hold      {}  {}",
-                    st.reason,
+                    crate::out::inert(&st.reason),
                     crate::out::fmt_bytes(st.size)
                 ));
                 facts += 1;
@@ -356,14 +479,7 @@ fn format_why(title_id: &str, related: &[HomeObject]) -> String {
                 facts += 1;
             }
             (Spec::Job(s), StatusBody::Job(st)) => {
-                lines.push(format!(
-                    "pull      {}  {}",
-                    human_title(&s.title_id),
-                    st.phase.as_str()
-                ));
-                if !st.message.is_empty() {
-                    lines.push(format!("          {}", st.message));
-                }
+                lines.extend(job_lines(obj, s, st));
                 facts += 1;
             }
             (Spec::Title(_), StatusBody::Title(st)) if st.drifted => {
@@ -374,7 +490,7 @@ fn format_why(title_id: &str, related: &[HomeObject]) -> String {
                 for file in st.observed_files() {
                     lines.push(format!(
                         "library   {}{}",
-                        file.path,
+                        crate::out::inert(&file.path),
                         if file.drifted { "  drifted" } else { "" }
                     ));
                     facts += 1;
@@ -385,6 +501,13 @@ fn format_why(title_id: &str, related: &[HomeObject]) -> String {
     }
     if facts == 0 {
         lines.push("quiet".into());
+    }
+    if related
+        .iter()
+        .any(|obj| matches!(obj.kind, Kind::Cluster | Kind::Node))
+    {
+        lines.push(String::new());
+        lines.extend(control_lines(related));
     }
     lines.join("\n")
 }
@@ -402,11 +525,7 @@ pub async fn hold_list(output: Output, socket: Option<PathBuf>) -> Result<String
     if output == Output::Json || output == Output::Wide {
         return Ok(render_list(&open, output));
     }
-    let live = open
-        .iter()
-        .map(hold_live_item)
-        .collect::<Result<Vec<_>, _>>()?;
-    crate::hold::render_live_list(&live, output == Output::LegacyJson)
+    Ok(format_hold_list(&open, unix_now()))
 }
 
 pub async fn hold_decide(
@@ -461,17 +580,7 @@ pub async fn hold_decide(
     if output == Output::Json || output == Output::Wide {
         return Ok(render_one(&written, output));
     }
-    crate::hold::render_live_decision(
-        &hold_live_item(&written)?,
-        match decision {
-            HoldDecisionSpec::Approved => mediaops_core::HoldDecision::Approved,
-            HoldDecisionSpec::Rejected => mediaops_core::HoldDecision::Rejected,
-            HoldDecisionSpec::Empty => {
-                return Err(AppError::Usage("hold decision required".into()));
-            }
-        },
-        output == Output::LegacyJson,
-    )
+    Ok(format_hold_decision(&written))
 }
 
 async fn published_holds(api: &HomeApi) -> Result<Vec<HomeObject>, AppError> {
@@ -513,24 +622,103 @@ async fn published_holds(api: &HomeApi) -> Result<Vec<HomeObject>, AppError> {
         .collect())
 }
 
-fn hold_live_item(obj: &HomeObject) -> Result<mediaops_core::HoldLiveItem, AppError> {
+fn format_watch_line(label: &str, title_id: &str, meta: &str) -> String {
+    use crate::out::{Style, Tone, finish, indent, inert, row};
+    let style = Style::stdout();
+    finish(vec![
+        row(style, "watching", Tone::Go, &inert(label), meta),
+        indent(style, &inert(title_id)),
+        row(style, "progress", Tone::Quiet, "", "mediaops status"),
+    ])
+}
+
+fn hold_label(spec: &mediaops_core::HoldSpec, status: &mediaops_core::HoldStatus) -> String {
+    status
+        .placement
+        .as_ref()
+        .map(crate::out::human_placement)
+        .unwrap_or_else(|| human_title(&spec.title_id))
+}
+
+fn format_hold_list(items: &[HomeObject], now: i64) -> String {
+    use crate::out::{Style, Tone, finish, fmt_age, fmt_bytes, inert, row};
+    if items.is_empty() {
+        return "nothing on hold".into();
+    }
+    let style = Style::stdout();
+    let mut lines = Vec::new();
+    for (index, obj) in items.iter().enumerate() {
+        let (Spec::Hold(spec), StatusBody::Hold(status)) = (&obj.spec, &obj.status) else {
+            continue;
+        };
+        let label = inert(&hold_label(spec, status));
+        lines.push(format!(
+            "{}.  {}  {}  {}",
+            index + 1,
+            style.bold(&label),
+            fmt_bytes(status.size),
+            fmt_age(now.saturating_sub(status.added_unix).max(0) as u64)
+        ));
+        lines.push(format!("    {}", style.dim(&inert(&spec.title_id))));
+        if !status.reason.is_empty() {
+            lines.push(format!("    {}", inert(&status.reason)));
+        }
+        if !status.release.is_empty() {
+            lines.push(format!("    {}", style.dim(&inert(&status.release))));
+        }
+        lines.push(String::new());
+    }
+    if let Some(HomeObject {
+        spec: Spec::Hold(spec),
+        ..
+    }) = items.first()
+    {
+        lines.push(row(
+            style,
+            "approve",
+            Tone::Go,
+            "",
+            &format!(
+                "mediaops hold approve {} {}",
+                shell_arg(&spec.title_id),
+                shell_arg(&spec.release_id)
+            ),
+        ));
+    }
+    finish(lines)
+}
+
+fn format_hold_decision(obj: &HomeObject) -> String {
+    use crate::out::{Style, Tone, finish, indent, inert, row};
     let (Spec::Hold(spec), StatusBody::Hold(status)) = (&obj.spec, &obj.status) else {
-        return Err(AppError::Usage("expected a Hold".into()));
+        return String::new();
     };
-    let key = mediaops_core::HoldKey::new(
-        TitleId::parse(&spec.title_id).map_err(|err| AppError::Usage(err.to_string()))?,
-        mediaops_core::ReleaseId::parse(&spec.release_id)
-            .map_err(|err| AppError::Usage(err.to_string()))?,
-    );
-    Ok(mediaops_core::HoldLiveItem {
-        key,
-        added_unix: status.added_unix,
-        size: status.size,
-        reason: status.reason.clone(),
-        remote: None,
-        placement: status.placement.clone(),
-        output_path: (!status.release.is_empty()).then(|| status.release.clone()),
-    })
+    let style = Style::stdout();
+    let approved = spec.decision == HoldDecisionSpec::Approved;
+    let mut lines = vec![
+        row(
+            style,
+            spec.decision.as_str(),
+            if approved { Tone::Go } else { Tone::Quiet },
+            &inert(&hold_label(spec, status)),
+            "",
+        ),
+        indent(style, &inert(&spec.title_id)),
+    ];
+    if approved {
+        lines.push(indent(
+            style,
+            "decision recorded; the controller will create a copy job",
+        ));
+        lines.push(row(
+            style,
+            "progress",
+            Tone::Quiet,
+            "",
+            "mediaops get Job -o wide",
+        ));
+    }
+    finish(lines)
 }
 
 pub async fn doctor_nodes(socket: Option<PathBuf>) -> Result<(), AppError> {
@@ -556,333 +744,6 @@ pub async fn doctor_nodes(socket: Option<PathBuf>) -> Result<(), AppError> {
     Ok(())
 }
 
-pub async fn import_legacy(
-    config: Option<PathBuf>,
-    state_db: Option<PathBuf>,
-    output: Output,
-    socket: Option<PathBuf>,
-) -> Result<String, AppError> {
-    let config_dir = bootstrap::default_config_dir();
-    let config = config.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
-    let state_db = state_db.unwrap_or_else(bootstrap::default_state_db);
-    let maintenance_db = if socket.is_none() {
-        bootstrap::default_state_db()
-    } else {
-        state_db.clone()
-    };
-    let api = connect(socket, Actor::Import).await?;
-    let _lock = bootstrap::exclusive_lock(&bootstrap::lock_path(&maintenance_db)).map_err(
-        |err| match err.exit_code() {
-            mediaops_core::ExitCode::LockConflict => AppError::LockConflict(err.to_string()),
-            _ => AppError::Runtime(anyhow::anyhow!(err.to_string())),
-        },
-    )?;
-    let source_lock = bootstrap::lock_path(&state_db);
-    let maintenance_lock = bootstrap::lock_path(&maintenance_db);
-    let _source_lock = if source_lock != maintenance_lock
-        && source_lock.canonicalize().ok() != maintenance_lock.canonicalize().ok()
-    {
-        Some(
-            bootstrap::exclusive_lock(&source_lock).map_err(|err| match err.exit_code() {
-                mediaops_core::ExitCode::LockConflict => AppError::LockConflict(err.to_string()),
-                _ => AppError::Runtime(anyhow::anyhow!(err.to_string())),
-            })?,
-        )
-    } else {
-        None
-    };
-    let store = if state_db.is_file() {
-        Some(
-            Store::open(&state_db)
-                .await
-                .map_err(crate::api_legacy::error)?,
-        )
-    } else {
-        None
-    };
-    let root = match &store {
-        Some(store) => store
-            .get_machine("library_root")
-            .await
-            .map_err(crate::api_legacy::error)?
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-    let mut objects = Vec::new();
-
-    if config.is_file() {
-        let raw = std::fs::read(&config).map_err(|e| AppError::Runtime(e.into()))?;
-        let ds = DesiredState::from_toml_bytes(&raw).map_err(|e| AppError::Usage(e.to_string()))?;
-        let mut cluster = cluster_from_desired(&ds);
-        if let Spec::Cluster(spec) = &mut cluster.spec {
-            spec.library_root = root.clone();
-            if let Some(store) = &store {
-                spec.encode_pause = store
-                    .get_machine("encode_pause")
-                    .await
-                    .map_err(crate::api_legacy::error)?
-                    .is_some_and(|v| v == "1" || v == "true");
-            }
-        }
-        objects.push(cluster);
-        if let Some(addr) = ds.seedbox_address() {
-            let secret = HomeObject::new(
-                Kind::Secret,
-                SECRET_NAME,
-                Spec::Secret(mediaops_core::SecretSpec {
-                    seedbox_address: addr.to_string(),
-                    ca_sha256: ds
-                        .tls()
-                        .map(|tls| tls.ca_sha256.clone())
-                        .unwrap_or_default(),
-                    server_sha256: ds
-                        .tls()
-                        .map(|tls| tls.server_sha256.clone())
-                        .unwrap_or_default(),
-                    client_sha256: ds
-                        .tls()
-                        .map(|tls| tls.client_sha256.clone())
-                        .unwrap_or_default(),
-                }),
-                StatusBody::Secret,
-            );
-            objects.push(secret);
-        }
-    }
-
-    if let Some(store) = &store {
-        let mut titles: BTreeMap<String, Vec<mediaops_core::TitleFileStatus>> = BTreeMap::new();
-        for row in store
-            .list_titles()
-            .await
-            .map_err(|e| AppError::Runtime(anyhow::anyhow!(e.to_string())))?
-        {
-            let path = std::path::Path::new(row.path());
-            let path = if path.is_absolute() {
-                path.strip_prefix(&root).map_err(|_| {
-                    AppError::Usage(format!(
-                        "legacy title is outside library root: {}",
-                        path.display()
-                    ))
-                })?
-            } else {
-                path
-            };
-            mediaops_core::parse_placement(path).map_err(|err| AppError::Usage(err.to_string()))?;
-            let drifted = match std::fs::File::open(std::path::Path::new(&root).join(path))
-                .and_then(mediaops_core::Blake3Hex::of_reader)
-            {
-                Ok(digest) => &digest != row.current_b3(),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                Err(err) => return Err(AppError::Runtime(err.into())),
-            };
-            titles.entry(row.title_id().render()).or_default().push(
-                mediaops_core::TitleFileStatus {
-                    path: path.to_string_lossy().into_owned(),
-                    install_b3: row.install_b3().clone(),
-                    current_b3: row.current_b3().clone(),
-                    drifted,
-                },
-            );
-        }
-        for (title_id, files) in titles {
-            let obj = HomeObject::new(
-                Kind::Title,
-                title_id.clone(),
-                Spec::Title(TitleSpec {
-                    title_id: title_id.clone(),
-                    desired_present: true,
-                }),
-                StatusBody::Title(mediaops_core::TitleStatus {
-                    drifted: files.iter().any(|file| file.drifted),
-                    files,
-                    ..mediaops_core::TitleStatus::default()
-                }),
-            );
-            objects.push(obj);
-        }
-        for job in store
-            .list_jobs()
-            .await
-            .map_err(|e| AppError::Runtime(anyhow::anyhow!(e.to_string())))?
-        {
-            if !matches!(
-                job.state(),
-                mediaops_core::JobState::Want(mediaops_core::WantState::Open)
-            ) {
-                continue;
-            }
-            let title_id = job.title_id().render();
-            let obj = HomeObject::new(
-                Kind::Want,
-                title_id.clone(),
-                Spec::Want(WantSpec {
-                    title_id: title_id.clone(),
-                }),
-                StatusBody::Want(mediaops_core::WantStatus {
-                    phase: mediaops_core::WantPhase::Open,
-                }),
-            );
-            objects.push(obj);
-        }
-        for key in store
-            .list_decided()
-            .await
-            .map_err(|e| AppError::Runtime(anyhow::anyhow!(e.to_string())))?
-        {
-            let name = format!("{}-{}", key.title_id.render(), key.release_id);
-            let decision = store
-                .get_hold(&key)
-                .await
-                .map_err(|e| AppError::Runtime(anyhow::anyhow!(e.to_string())))?;
-            let decision = match decision {
-                Some(mediaops_core::HoldDecision::Approved) => HoldDecisionSpec::Approved,
-                Some(mediaops_core::HoldDecision::Rejected) => HoldDecisionSpec::Rejected,
-                None => HoldDecisionSpec::Empty,
-            };
-            let obj = HomeObject::new(
-                Kind::Hold,
-                name,
-                Spec::Hold(HoldSpec {
-                    title_id: key.title_id.render(),
-                    release_id: key.release_id.to_string(),
-                    decision,
-                }),
-                StatusBody::Hold(mediaops_core::HoldStatus::default()),
-            );
-            objects.push(obj);
-        }
-    }
-
-    if objects.is_empty() {
-        return Err(AppError::Usage(
-            "no legacy config or state to import".into(),
-        ));
-    }
-    // Decode and validate the complete input before the first API mutation.
-    // Repeating the import only fills missing objects; current runtime settings
-    // and decisions always win over the old snapshot.
-    for obj in &objects {
-        obj.validate()
-            .map_err(|err| AppError::Usage(err.to_string()))?;
-    }
-    let mut maintenance = match api.get(Kind::Cluster, CLUSTER_NAME).await {
-        Ok(cluster) => Some(crate::api_legacy::HomeLibrary {
-            api: api.clone(),
-            cluster,
-        }),
-        Err(err) if err.is_not_found() => None,
-        Err(err) => return Err(map_client(err)),
-    };
-    let previous_lock = match &mut maintenance {
-        Some(home) => Some(home.begin_maintenance().await?),
-        None => None,
-    };
-    let result = async {
-        let mut applied: u64 = 0;
-        let mut unlock = None;
-        for mut obj in objects {
-            match api.get(obj.kind, &obj.metadata.name).await {
-                Ok(mut existing) => {
-                    if let (StatusBody::Title(previous), StatusBody::Title(incoming)) =
-                        (&existing.status, &obj.status)
-                    {
-                        let mut files = previous.observed_files();
-                        let mut changed = false;
-                        for file in incoming.observed_files() {
-                            let (_, placement) =
-                                mediaops_core::parse_placement(std::path::Path::new(&file.path))
-                                    .map_err(|err| AppError::Usage(err.to_string()))?;
-                            let present = files.iter().any(|current| {
-                                mediaops_core::parse_placement(std::path::Path::new(&current.path))
-                                    .is_ok_and(|(_, current)| {
-                                        current.file_key() == placement.file_key()
-                                    })
-                            });
-                            if !present {
-                                files.push(file);
-                                changed = true;
-                            }
-                        }
-                        if changed {
-                            existing.status = StatusBody::Title(mediaops_core::TitleStatus {
-                                drifted: files.iter().any(|file| file.drifted),
-                                files,
-                                ..mediaops_core::TitleStatus::default()
-                            });
-                            api.patch(existing, "status").await.map_err(map_client)?;
-                            applied += 1;
-                        }
-                    } else if let (Spec::Hold(previous), Spec::Hold(incoming)) =
-                        (&mut existing.spec, &obj.spec)
-                        && previous.decision == HoldDecisionSpec::Empty
-                        && incoming.decision != HoldDecisionSpec::Empty
-                    {
-                        previous.decision = incoming.decision;
-                        api.patch(existing, "spec").await.map_err(map_client)?;
-                        applied += 1;
-                    }
-                    continue;
-                }
-                Err(err) if err.is_not_found() => {}
-                Err(err) => return Err(map_client(err)),
-            }
-            if let Spec::Cluster(spec) = &mut obj.spec
-                && !spec.lock
-            {
-                spec.lock = true;
-                unlock = Some(false);
-            }
-            api.apply(obj).await.map_err(map_client)?;
-            applied += 1;
-        }
-        if unlock.is_some() {
-            let mut cluster = api
-                .get(Kind::Cluster, CLUSTER_NAME)
-                .await
-                .map_err(map_client)?;
-            if let Spec::Cluster(spec) = &mut cluster.spec {
-                spec.lock = false;
-            }
-            api.patch(cluster, "spec").await.map_err(map_client)?;
-        }
-        Ok::<_, AppError>(applied)
-    }
-    .await;
-    let applied = result.map_err(crate::api_legacy::maintenance_failure)?;
-    if let (Some(home), Some(previous)) = (&mut maintenance, previous_lock) {
-        home.finish_maintenance(previous).await?;
-    }
-    #[derive(Serialize)]
-    struct ImportOut {
-        imported: u64,
-    }
-    render_payload(
-        &ImportOut { imported: applied },
-        format!("imported\t{applied}"),
-        output,
-    )
-}
-
-fn cluster_from_desired(ds: &DesiredState) -> HomeObject {
-    HomeObject::new(
-        Kind::Cluster,
-        CLUSTER_NAME,
-        Spec::Cluster(mediaops_core::ClusterSpec {
-            max_copy: ds.max_copy(),
-            min_free: ds.min_free(),
-            range_len: ds.range_len(),
-            range_concurrency: ds.range_concurrency(),
-            grabber: ds.grabber(),
-            lock: ds.lock(),
-            encode_pause: false,
-            library_root: String::new(),
-            roots: ds.paths().to_vec(),
-        }),
-        StatusBody::Cluster(mediaops_core::ClusterStatus::default()),
-    )
-}
-
 async fn resolve_title(api: &HomeApi, raw: &str) -> Result<String, AppError> {
     if mediaops_core::TitleId::parse(raw).is_ok() {
         return Ok(raw.to_string());
@@ -906,8 +767,19 @@ fn resolve_from_objects(items: &[HomeObject], raw: &str) -> Result<String, AppEr
                     }
                 }
                 StatusBody::RemoteFile(st) => hints.push_str(&st.rel_path),
-                StatusBody::Title(st) => hints.push_str(&st.path),
+                StatusBody::Title(st) => {
+                    for file in st.observed_files() {
+                        hints.push(' ');
+                        hints.push_str(&file.path);
+                    }
+                }
                 _ => {}
+            }
+            if let Spec::Job(spec) = &obj.spec {
+                hints.push(' ');
+                hints.push_str(&spec.dest_rel);
+                hints.push(' ');
+                hints.push_str(&spec.remote_path);
             }
             (!needle.is_empty() && mediaops_core::title_key(&hints).contains(&needle)).then_some(id)
         })
@@ -929,6 +801,28 @@ fn human_title(title_id: &str) -> String {
         .unwrap_or_else(|_| title_id.to_string())
 }
 
+fn title_label(title_id: &str, items: &[HomeObject]) -> String {
+    items
+        .iter()
+        .filter(|obj| title_id_of(obj).as_deref() == Some(title_id))
+        .find_map(object_label)
+        .unwrap_or_else(|| human_title(title_id))
+}
+
+fn object_label(obj: &HomeObject) -> Option<String> {
+    match (&obj.spec, &obj.status) {
+        (_, StatusBody::Hold(st)) => st.placement.as_ref().map(crate::out::human_placement),
+        (_, StatusBody::Title(st)) => st
+            .observed_files()
+            .iter()
+            .find_map(|file| crate::out::human_from_path(&file.path)),
+        (Spec::Job(spec), _) => crate::out::human_from_path(&spec.dest_rel)
+            .or_else(|| crate::out::human_from_path(&spec.remote_path)),
+        (_, StatusBody::RemoteFile(st)) => crate::out::human_from_path(&st.rel_path),
+        _ => None,
+    }
+}
+
 fn title_id_of(obj: &HomeObject) -> Option<String> {
     match &obj.spec {
         Spec::Title(s) => Some(s.title_id.clone()),
@@ -943,31 +837,29 @@ fn title_id_of(obj: &HomeObject) -> Option<String> {
 }
 
 fn render_one(obj: &HomeObject, output: Output) -> String {
-    match output {
+    match output.for_objects(std::io::stdout().is_terminal()) {
         Output::Json => serde_json::to_string(obj).expect("Home object serializes"),
-        Output::LegacyJson => serde_json::to_string(&mediaops_core::Envelope::ok(obj))
-            .expect("Home object envelope serializes"),
-        Output::Table => format_row(obj),
+        Output::Auto | Output::Table => format_row(obj),
         Output::Wide => render_wide(std::slice::from_ref(obj)),
     }
 }
 
 fn render_list(items: &[HomeObject], output: Output) -> String {
+    let output = output.for_objects(std::io::stdout().is_terminal());
     if output.is_json() {
         #[derive(Serialize)]
         struct List<'a> {
             items: &'a [HomeObject],
         }
         let list = List { items };
-        return if output == Output::LegacyJson {
-            serde_json::to_string(&mediaops_core::Envelope::ok(list))
-                .expect("Home list envelope serializes")
-        } else {
-            serde_json::to_string(&list).expect("Home list serializes")
-        };
+        return serde_json::to_string(&list).expect("Home list serializes");
     }
     if items.is_empty() {
-        return String::new();
+        return if output == Output::Wide {
+            "no objects found".into()
+        } else {
+            String::new()
+        };
     }
     if output == Output::Wide {
         return render_wide(items);
@@ -978,25 +870,34 @@ fn render_list(items: &[HomeObject], output: Output) -> String {
 fn format_row(obj: &HomeObject) -> String {
     let title = title_id_of(obj).unwrap_or_else(|| obj.metadata.name.clone());
     let phase = phase_of(obj);
-    format!("{title}\t{}\t{phase}", obj.kind.as_str())
+    format!(
+        "{}\t{}\t{}",
+        crate::out::inert(&title),
+        obj.kind.as_str(),
+        crate::out::inert(&phase)
+    )
 }
 
 fn render_wide(items: &[HomeObject]) -> String {
-    let rows: Vec<[String; 5]> = items
-        .iter()
-        .map(|obj| {
-            [
-                title_id_of(obj).unwrap_or_else(|| obj.metadata.name.clone()),
-                obj.kind.as_str().to_string(),
-                obj.metadata.name.clone(),
-                phase_of(obj),
-                obj.metadata.resource_version.to_string(),
-            ]
-        })
-        .collect();
-    // Measure the whole result once: tabs align to terminal stops, not to the
-    // longest cell. The final column needs no padding or trailing whitespace.
-    let widths: [usize; 4] = std::array::from_fn(|column| {
+    render_wide_at(items, unix_now())
+}
+
+fn render_wide_at(items: &[HomeObject], now: i64) -> String {
+    let mut rows: Vec<[String; 4]> = vec![[
+        "NAME".into(),
+        "KIND".into(),
+        "STATUS".into(),
+        "DETAILS".into(),
+    ]];
+    rows.extend(items.iter().map(|obj| {
+        [
+            crate::out::inert(&obj.metadata.name),
+            obj.kind.as_str().to_string(),
+            crate::out::inert(&wide_phase(obj, now)),
+            crate::out::inert(&wide_details(obj, now)),
+        ]
+    }));
+    let widths: [usize; 3] = std::array::from_fn(|column| {
         rows.iter()
             .map(|row| row[column].width())
             .max()
@@ -1011,18 +912,123 @@ fn render_wide(items: &[HomeObject]) -> String {
                 line.push_str(&" ".repeat(width - cell.width() + 2));
             }
         }
-        lines.push(line);
+        lines.push(line.trim_end().to_string());
     }
     lines.join("\n")
 }
 
+fn wide_phase(obj: &HomeObject, now: i64) -> String {
+    match &obj.spec {
+        Spec::Cluster(s) => if s.lock { "paused" } else { "enabled" }.into(),
+        Spec::Hold(s) => if s.decision == HoldDecisionSpec::Empty {
+            "open"
+        } else {
+            s.decision.as_str()
+        }
+        .into(),
+        _ => phase_of_at(obj, now),
+    }
+}
+
+fn wide_details(obj: &HomeObject, now: i64) -> String {
+    match (&obj.spec, &obj.status) {
+        (Spec::Job(s), StatusBody::Job(st)) => {
+            let mut details = format!(
+                "{}  {}",
+                object_label(obj).unwrap_or_else(|| human_title(&s.title_id)),
+                crate::out::fmt_progress(st.bytes_done, s.file_len)
+            );
+            if !s.node_name.is_empty() {
+                details.push_str(&format!("  worker {}", s.node_name));
+            }
+            if !st.message.is_empty() {
+                details.push_str(&format!("  {}", st.message));
+            } else if st.phase == mediaops_core::JobPhase::Pending {
+                details.push_str(if s.node_name.is_empty() {
+                    "  waiting for scheduler"
+                } else {
+                    "  waiting for worker"
+                });
+            }
+            details
+        }
+        (Spec::Node(s), StatusBody::Node(st)) => {
+            let mut details = if st.last_heartbeat_unix > 0 {
+                format!(
+                    "heartbeat {} ago",
+                    crate::out::fmt_age(now.saturating_sub(st.last_heartbeat_unix).max(0) as u64)
+                )
+            } else {
+                "no heartbeat".into()
+            };
+            if s.worker_kind == mediaops_core::WorkerKind::Inventory {
+                details.push_str(&if st.list_completed_unix > 0 {
+                    format!(
+                        "  inventory {} ago",
+                        crate::out::fmt_age(
+                            now.saturating_sub(st.list_completed_unix).max(0) as u64
+                        )
+                    )
+                } else {
+                    "  no completed inventory".into()
+                });
+            }
+            details
+        }
+        (Spec::Cluster(s), _) => format!(
+            "{}  reserve {}{}",
+            s.library_root,
+            crate::out::fmt_bytes(s.min_free.get()),
+            if s.encode_pause {
+                "  encode paused"
+            } else {
+                ""
+            }
+        ),
+        (Spec::Title(_), StatusBody::Title(st)) => {
+            let files = st.observed_files();
+            match files.as_slice() {
+                [file] => file.path.clone(),
+                _ => format!(
+                    "{} files  {} drifted",
+                    files.len(),
+                    files.iter().filter(|file| file.drifted).count()
+                ),
+            }
+        }
+        (Spec::Want(s), _) => human_title(&s.title_id),
+        (Spec::Hold(s), StatusBody::Hold(st)) => format!(
+            "{}  {}  {}",
+            human_title(&s.title_id),
+            crate::out::fmt_bytes(st.size),
+            st.reason
+        ),
+        (_, StatusBody::RemoteFile(st)) => format!(
+            "{}  {} / {}",
+            crate::out::fmt_bytes(st.len),
+            st.root_id,
+            st.rel_path
+        ),
+        (_, StatusBody::Sync(st)) => crate::sync_format::summary(st),
+        (_, StatusBody::Event(st)) => format!(
+            "{} {}  {}  {}",
+            st.involved_kind, st.involved_name, st.reason, st.message
+        ),
+        _ => String::new(),
+    }
+}
+
 fn phase_of(obj: &HomeObject) -> String {
+    phase_of_at(obj, unix_now())
+}
+
+fn phase_of_at(obj: &HomeObject, now: i64) -> String {
     match &obj.status {
         StatusBody::Sync(s) => s.phase.as_str().to_string(),
         StatusBody::Job(s) => s.phase.as_str().to_string(),
         StatusBody::Want(s) => s.phase.as_str().to_string(),
         StatusBody::Node(s) => {
-            if mediaops_core::node_is_ready(s.ready, s.last_heartbeat_unix, unix_now()) {
+            if mediaops_core::node_is_ready(s.ready, s.last_heartbeat_unix, now) {
                 "Ready".into()
             } else {
                 "NotReady".into()
@@ -1075,6 +1081,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_object_output_uses_terminal_tables_and_keeps_pipelines_deterministic() {
+        let auto = Output::parse(None).expect("automatic output");
+        assert_eq!(auto.for_objects(true), Output::Wide);
+        assert_eq!(auto.for_objects(false), Output::Table);
+        assert_eq!(
+            Output::parse(Some("table")).unwrap().for_objects(true),
+            Output::Table
+        );
+        assert_eq!(
+            Output::parse(Some("wide")).unwrap().for_objects(false),
+            Output::Wide
+        );
+        assert_eq!(
+            Output::parse(Some("json")).unwrap().for_objects(true),
+            Output::Json
+        );
+        assert!(Output::parse(Some("xml")).is_err());
+    }
+
+    #[test]
     fn get_sync_table_reports_its_planning_phase() {
         let obj = HomeObject::new(
             Kind::Sync,
@@ -1092,7 +1118,7 @@ mod tests {
 
     use mediaops_apiserver::{ApiConfig, serve_api};
     use mediaops_core::{
-        Bytes, ClusterSpec, ClusterStatus, JobPhase, JobStatus, NodeSpec, NodeStatus,
+        Bytes, CLUSTER_NAME, ClusterSpec, ClusterStatus, JobPhase, JobStatus, NodeSpec, NodeStatus,
         RemoteFileStatus, TitleKind, TitleStatus, VerifiedStagingHandle, WantPhase, WantStatus,
         WorkerKind, install, parse_placement, parse_remote, staging_path,
     };
@@ -1100,7 +1126,7 @@ mod tests {
         PullSpec, connect_home, grpc_source, list_entries, pull_file_with_progress,
     };
 
-    fn node_rows() -> Vec<HomeObject> {
+    fn node_rows(now: i64) -> Vec<HomeObject> {
         [
             (WorkerKind::Inventory, true, 13409),
             (WorkerKind::Pull, false, 3),
@@ -1114,7 +1140,7 @@ mod tests {
                 Spec::Node(NodeSpec { worker_kind }),
                 StatusBody::Node(NodeStatus {
                     ready,
-                    last_heartbeat_unix: unix_now(),
+                    last_heartbeat_unix: now,
                     ..NodeStatus::default()
                 }),
             );
@@ -1127,11 +1153,12 @@ mod tests {
     #[test]
     fn wide_node_screen_aligns_every_column_without_tabs() {
         assert_eq!(
-            render_list(&node_rows(), Output::Wide),
+            render_wide_at(&node_rows(1000), 1000),
             concat!(
-                "inventory  Node  inventory  Ready     13409\n",
-                "pull       Node  pull       NotReady  3\n",
-                "scheduler  Node  scheduler  Ready     13360"
+                "NAME       KIND  STATUS    DETAILS\n",
+                "inventory  Node  Ready     heartbeat 0s ago  no completed inventory\n",
+                "pull       Node  NotReady  heartbeat 0s ago\n",
+                "scheduler  Node  Ready     heartbeat 0s ago"
             )
         );
     }
@@ -1158,20 +1185,23 @@ mod tests {
         assert_eq!(
             render_list(&titles, Output::Wide),
             concat!(
-                "movie:key:東京.2026  Want  movie:key:東京.2026  open  0\n",
-                "movie:key:ab.2026    Want  movie:key:ab.2026    open  0\n",
-                "movie:key:e\u{301}.2026     Want  movie:key:e\u{301}.2026     open  0"
+                "NAME                 KIND  STATUS  DETAILS\n",
+                "movie:key:東京.2026  Want  open    東京 (2026)\n",
+                "movie:key:ab.2026    Want  open    Ab (2026)\n",
+                "movie:key:e\u{301}.2026     Want  open    movie:key:e\u{301}.2026"
             )
         );
     }
 
     #[test]
     fn wide_single_and_empty_screens_preserve_pipeline_and_json_contracts() {
-        let nodes = node_rows();
-        assert_eq!(render_list(&[], Output::Wide), "");
+        let now = unix_now();
+        let nodes = node_rows(now);
+        assert_eq!(render_list(&[], Output::Wide), "no objects found");
+        assert_eq!(render_list(&[], Output::Table), "");
         assert_eq!(
-            render_one(&nodes[1], Output::Wide),
-            "pull  Node  pull  NotReady  3"
+            render_wide_at(std::slice::from_ref(&nodes[1]), now),
+            "NAME  KIND  STATUS    DETAILS\npull  Node  NotReady  heartbeat 0s ago"
         );
         assert_eq!(
             render_list(&nodes, Output::Table),
@@ -1179,16 +1209,19 @@ mod tests {
         );
         let raw: serde_json::Value =
             serde_json::from_str(&render_list(&nodes, Output::Json)).expect("raw JSON");
-        let legacy: serde_json::Value =
-            serde_json::from_str(&render_list(&nodes, Output::LegacyJson)).expect("envelope");
         assert_eq!(raw["items"], serde_json::to_value(&nodes).unwrap());
-        assert_eq!(legacy["data"], raw);
-        assert_eq!(legacy["ok"], true);
     }
 
     #[test]
     fn home_human_screens_are_stable_and_do_not_hide_drift() {
-        assert_eq!(format_status(&[], None), "nothing happening");
+        assert_eq!(
+            format_status(&[], None),
+            concat!(
+                "nothing happening\n\nconfig    Cluster unavailable\n",
+                "worker    scheduler  missing\nworker    inventory  missing\n",
+                "worker    pull  missing\ncheck     mediaops doctor\n\ndisk      free space unavailable"
+            )
+        );
         let id = "movie:key:matrix.1999";
         let want = HomeObject::new(
             Kind::Want,
@@ -1200,7 +1233,11 @@ mod tests {
         );
         assert_eq!(
             format_status(std::slice::from_ref(&want), Some(1 << 30)),
-            "want      Matrix (1999)\n\ndisk      1.0 GiB free"
+            concat!(
+                "want      Matrix (1999)\n\nconfig    Cluster unavailable\n",
+                "worker    scheduler  missing\nworker    inventory  missing\n",
+                "worker    pull  missing\ncheck     mediaops doctor\n\ndisk      1.0 GiB free"
+            )
         );
         assert_eq!(
             format_why(id, std::slice::from_ref(&want)),
@@ -1229,6 +1266,127 @@ mod tests {
             format_why(id, &[title, want, remote]),
             "Matrix (1999)\nmovie:key:matrix.1999\n\nlibrary   drifted\nwant      open, listed on the box"
         );
+    }
+
+    #[test]
+    fn job_screens_expose_progress_failure_and_exact_object_name() {
+        let id = "movie:key:matrix.1999";
+        let job = HomeObject::new(
+            Kind::Job,
+            "pull-7",
+            Spec::Job(mediaops_core::JobSpec {
+                title_id: id.into(),
+                file_len: 1 << 30,
+                dest_rel: "movies/Matrix.(1999)/Matrix.(1999).mkv".into(),
+                node_name: "pull".into(),
+                ..Default::default()
+            }),
+            StatusBody::Job(JobStatus {
+                phase: JobPhase::Failed,
+                bytes_done: 1 << 29,
+                message: "disk reserve reached\ncheck storage".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            render_one(&job, Output::Wide),
+            concat!(
+                "NAME    KIND  STATUS  DETAILS\n",
+                "pull-7  Job   failed  Matrix (1999)  50%  512 MiB / 1.0 GiB  worker pull  disk reserve reached check storage"
+            )
+        );
+        assert_eq!(
+            format_why(id, std::slice::from_ref(&job)),
+            concat!(
+                "Matrix (1999)\nmovie:key:matrix.1999\n\n",
+                "pull      Matrix (1999)  failed  50%  512 MiB / 1.0 GiB\n",
+                "          Job pull-7  worker pull\n",
+                "          movies/Matrix.(1999)/Matrix.(1999).mkv\n",
+                "          disk reserve reached check storage\n",
+                "inspect   mediaops get Job pull-7 -o json"
+            )
+        );
+        assert_eq!(
+            render_one(&job, Output::Table),
+            "movie:key:matrix.1999\tJob\tfailed"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_one(&job, Output::Json)).unwrap();
+        assert_eq!(
+            json["status"]["message"],
+            "disk reserve reached\ncheck storage"
+        );
+    }
+
+    #[test]
+    fn paused_scheduling_and_unready_workers_are_visible_without_jobs() {
+        let mut items = node_rows(unix_now());
+        if let StatusBody::Node(status) = &mut items[1].status {
+            status.last_heartbeat_unix = 0;
+        }
+        items.push(HomeObject::new(
+            Kind::Cluster,
+            CLUSTER_NAME,
+            Spec::Cluster(ClusterSpec {
+                lock: true,
+                encode_pause: true,
+                ..Default::default()
+            }),
+            StatusBody::Cluster(ClusterStatus::default()),
+        ));
+        assert_eq!(
+            format_status(&items, Some(1 << 30)),
+            concat!(
+                "nothing happening\n\nscheduler paused (Cluster lock)\nencode    paused\n",
+                "worker    scheduler  ready\nworker    inventory  ready\n",
+                "worker    pull  not ready; no heartbeat\ncheck     mediaops doctor\n\ndisk      1.0 GiB free"
+            )
+        );
+    }
+
+    #[test]
+    fn hold_and_watch_screens_explain_the_next_step() {
+        assert_eq!(
+            format_watch_line("Matrix (1999)", "movie:tmdb:603", ""),
+            "watching  Matrix (1999)\n          movie:tmdb:603\nprogress  mediaops status"
+        );
+        let mut hold = HomeObject::new(
+            Kind::Hold,
+            "hold-1",
+            Spec::Hold(mediaops_core::HoldSpec {
+                title_id: "movie:tmdb:603".into(),
+                release_id: "deadbeef".into(),
+                ..Default::default()
+            }),
+            StatusBody::Hold(mediaops_core::HoldStatus {
+                added_unix: 1000,
+                size: 512,
+                placement: Some(mediaops_core::Placement::movie("Matrix", 1999, "mkv")),
+                reason: "Manual Import required.".into(),
+                release: "Matrix.1999.Release".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            format_hold_list(std::slice::from_ref(&hold), 1012),
+            concat!(
+                "1.  Matrix (1999)  512 B  12s\n    movie:tmdb:603\n",
+                "    Manual Import required.\n    Matrix.1999.Release\n\n",
+                "approve   mediaops hold approve movie:tmdb:603 deadbeef"
+            )
+        );
+        if let Spec::Hold(spec) = &mut hold.spec {
+            spec.decision = HoldDecisionSpec::Approved;
+        }
+        assert_eq!(
+            format_hold_decision(&hold),
+            concat!(
+                "approved  Matrix (1999)\n          movie:tmdb:603\n",
+                "          decision recorded; the controller will create a copy job\n",
+                "progress  mediaops get Job -o wide"
+            )
+        );
+        assert_eq!(format_hold_list(&[], 1012), "nothing on hold");
     }
 
     #[test]
@@ -1264,142 +1422,33 @@ mod tests {
     }
 
     #[test]
-    fn json_flag_and_output_json_have_distinct_contracts() {
-        let obj = HomeObject::new(
-            Kind::Want,
-            "movie:tmdb:603",
-            Spec::Want(WantSpec {
-                title_id: "movie:tmdb:603".into(),
-            }),
-            StatusBody::Want(WantStatus::default()),
-        );
-        let raw: serde_json::Value = serde_json::from_str(&render_one(
-            &obj,
-            Output::parse(Some("json"), false).unwrap(),
-        ))
-        .unwrap();
-        let legacy: serde_json::Value =
-            serde_json::from_str(&render_one(&obj, Output::parse(None, true).unwrap())).unwrap();
-        assert_eq!(raw["kind"], "Want");
-        assert!(raw.get("ok").is_none());
-        assert_eq!(legacy["ok"], true);
-        assert_eq!(legacy["data"]["kind"], "Want");
-        assert!(Output::parse(Some("json"), true).is_err());
-    }
-
-    #[tokio::test]
-    async fn legacy_import_merges_each_file_and_preserves_runtime_settings() {
-        let dir = crate::test_support::scratch("legacy-api-import");
-        let library = crate::test_support::library_root(&dir);
-        let socket = dir.join("api.sock");
-        let api_task = tokio::spawn(serve_api(ApiConfig {
-            socket: socket.clone(),
-            api_db: dir.join("api.db"),
-        }));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let api = loop {
-            if let Ok(api) = HomeApi::connect(&socket, Actor::Import).await {
-                break api;
-            }
-            assert!(tokio::time::Instant::now() < deadline, "API startup");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        let cluster = ClusterSpec {
-            library_root: library.display().to_string(),
-            encode_pause: true,
-            ..ClusterSpec::default()
-        };
-        api.apply(HomeObject::new(
-            Kind::Cluster,
-            CLUSTER_NAME,
-            Spec::Cluster(cluster.clone()),
-            StatusBody::Cluster(ClusterStatus::default()),
-        ))
-        .await
-        .expect("runtime cluster");
-        let id = TitleId::parse("album:key:yes.relayer").expect("album");
-        api.apply(HomeObject::new(
+    fn current_file_proofs_resolve_and_display_names_for_provider_ids() {
+        let title = HomeObject::new(
             Kind::Title,
-            id.render(),
+            "movie:tmdb:603",
             Spec::Title(TitleSpec {
-                title_id: id.render(),
+                title_id: "movie:tmdb:603".into(),
                 desired_present: true,
             }),
-            StatusBody::Title(TitleStatus::default()),
-        ))
-        .await
-        .expect("existing empty title");
-        let paths = [
-            "music/Yes/Relayer.(1974)/Relayer.(1974).01.The.Gates.Of.Delirium.flac",
-            "music/Yes/Relayer.(1974)/Relayer.(1974).02.Sound.Chaser.flac",
-        ];
-        std::fs::create_dir_all(library.join(paths[0]).parent().expect("parent"))
-            .expect("album folder");
-        std::fs::write(library.join(paths[0]), b"audio").expect("present file");
-        let digest = mediaops_core::Blake3Hex::of_reader(&b"audio"[..]).expect("digest");
-        let state_db = dir.join("state.db");
-        let store = Store::open(&state_db).await.expect("legacy store");
-        store
-            .put_machine("library_root", &library.display().to_string())
-            .await
-            .expect("root");
-        for path in paths {
-            store
-                .record_install(&id, &digest, path)
-                .await
-                .expect("legacy proof");
-        }
-        let config = Some(dir.join("absent-config.toml"));
+            StatusBody::Title(TitleStatus {
+                files: vec![mediaops_core::TitleFileStatus {
+                    path: "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv".into(),
+                    install_b3: mediaops_core::Blake3Hex::of_bytes(b"movie"),
+                    current_b3: mediaops_core::Blake3Hex::of_bytes(b"movie"),
+                    drifted: false,
+                }],
+                ..Default::default()
+            }),
+        );
+        let items = [title];
         assert_eq!(
-            import_legacy(
-                config.clone(),
-                Some(state_db.clone()),
-                Output::Table,
-                Some(socket.clone()),
-            )
-            .await
-            .expect("import"),
-            "imported\t1"
-        );
-        let title = api.get(Kind::Title, &id.render()).await.expect("title");
-        let StatusBody::Title(status) = title.status else {
-            panic!("title status")
-        };
-        let files = status.observed_files();
-        assert_eq!(
-            files.len(),
-            2,
-            "same-title files must not overwrite each other"
-        );
-        assert!(
-            !files
-                .iter()
-                .find(|f| f.path == paths[0])
-                .expect("first")
-                .drifted
-        );
-        assert!(
-            files
-                .iter()
-                .find(|f| f.path == paths[1])
-                .expect("missing")
-                .drifted
+            resolve_from_objects(&items, "The Matrix").unwrap(),
+            "movie:tmdb:603"
         );
         assert_eq!(
-            import_legacy(config, Some(state_db), Output::Table, Some(socket))
-                .await
-                .expect("repeat"),
-            "imported\t0"
+            format_why("movie:tmdb:603", &items),
+            "The Matrix (1999)\nmovie:tmdb:603\n\nlibrary   movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"
         );
-        let current = api.get(Kind::Cluster, CLUSTER_NAME).await.expect("cluster");
-        assert_eq!(
-            current.spec,
-            Spec::Cluster(cluster),
-            "maintenance restores lock without resetting runtime settings"
-        );
-        api_task.abort();
-        let _ = api_task.await;
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

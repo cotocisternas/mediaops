@@ -23,7 +23,7 @@ seedbox operations are authorized. Preserve the pre-existing untracked `.omo/`.
 
 Implement a complete separate `mediaops-tui` executable, not a replacement or
 subcommand of `mediaops`. Preserve the existing CLI source, help, formatters,
-exact-screen tests, raw `-o json`, envelope `--json`, stdout/stderr and exit codes.
+exact-screen tests, raw `-o json`, stdout/stderr and exit codes. The current CLI no longer supports the retired `--json` interface.
 The approved plan is a cohesive home-side visual management feature, including
 all seven read screens and exactly four scoped mutations, not a read-only draft.
 

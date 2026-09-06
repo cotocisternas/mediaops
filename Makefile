@@ -1,7 +1,7 @@
 # Operator shortcuts. `make help` lists targets.
 # Pass extra cargo flags with CARGO_FLAGS, extra CLI args with ARGS.
 # Example: make test OFFLINE=1
-#          make mediaops ARGS='status --json'
+#          make mediaops ARGS='status -o json'
 
 CARGO      ?= cargo
 PKG_CLI    ?= mediaops

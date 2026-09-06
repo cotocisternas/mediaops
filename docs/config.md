@@ -12,7 +12,7 @@ Every verb and every generated unit derives paths from the same functions, so th
 | Config | `<config-dir>/config.toml` |
 | mTLS PEMs | `<config-dir>/tls/` (never in a git work tree; bootstrap refuses) |
 | Home database | `$XDG_STATE_HOME/mediaops/api.db` (default `~/.local/state/mediaops/api.db`); only the API opens it |
-| Legacy capabilities + maintenance lock | `state.db` and `mediaops.lock` beside `api.db` |
+| Local capabilities + maintenance lock | `state.db` and `mediaops.lock` beside `api.db` |
 | Home API socket | `$XDG_RUNTIME_DIR/mediaops-api.sock` |
 | Range gateway socket | `$XDG_RUNTIME_DIR/mediaopsd.sock` |
 | On the box | `~/.local/bin/mediaopsd`, `~/.config/mediaops/{config.toml,tls/}`, `~/.config/systemd/user/mediaopsd.service` |
@@ -25,15 +25,15 @@ Without an absolute `XDG_RUNTIME_DIR`, both sockets live in the application stat
 
 | Commands | Home API address | Gateway address |
 | -------- | ---------------- | --------------- |
-| `get`, `apply`, `delete`, `watch`, `reconcile`, `import-legacy` | `--socket` | Not selected by these commands |
+| `get`, `apply`, `delete`, `watch`, `reconcile`, `sync`, `status`, `why`, `hold` | `--socket` | Not selected by these commands |
 | `list`, `pull` | `pull` uses the default Home API address | `--socket`; these commands do not accept `--api-socket` |
-| `status`, `why`, `hold` | `--api-socket` on the Home path | `--socket` on the explicit legacy path |
 | `doctor` | `--api-socket` for its Home readiness checks | `--socket` for its edge/credential checks |
 
-`status`, `why`, and `hold` do not redirect their Home API connection when only
-`--socket` is supplied. The explicit offline `--state-db` workflow is for isolated
-legacy state, not a fallback when the API is unavailable. It does not turn
-gateway-dependent commands into offline operations.
+Home workflows always use the API. `state.db` stores local GPU capabilities and
+maintenance bookkeeping; it cannot select another catalog or command interface.
+Home maintenance shares the default `mediaops.lock` beside `api.db`. The `--state-db`
+override exists only on seedbox and edge maintenance commands. Use the XDG state
+and runtime directories to isolate an entire installation.
 
 After bootstrap/import, runtime settings live in the Cluster object. Editing `config.toml` does not change an active Job. Inspect and update the Cluster through `get` / `apply`; each new Job snapshots its library root, budgets, and Range settings.
 
@@ -54,7 +54,7 @@ mediaops apply -f cluster.json
 ```
 
 Creation uses resourceVersion zero; updates must use the exact current version.
-Bootstrap and `import-legacy` translate `config.toml` into Home objects. Secret
+Library bootstrap translates `config.toml` into Home objects; `new-machine import` restores a current export bundle. Secret
 holds the gateway endpoint and credentials. The seedbox daemon, `seedbox apply`,
 and explicit edge maintenance still use `config.toml`; updating the Home Cluster
 does not rewrite the box's config or push grabber configuration.

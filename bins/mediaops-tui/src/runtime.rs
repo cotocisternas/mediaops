@@ -63,6 +63,11 @@ async fn run_loop<B: Backend>(
     let mut reconnect_at = None;
     session.bootstrap().await;
     loop {
+        ui.connection_message = if session.sync.writes_allowed() {
+            None
+        } else {
+            session.message.clone()
+        };
         if session.needs_reconnect && reconnect_at.is_none() {
             reconnect_at = Some(tokio::time::Instant::now() + session.backoff());
         }
@@ -135,7 +140,12 @@ async fn run_loop<B: Backend>(
                     Work::Prepared { mutation, target, result } => {
                         match (*result, session.api.clone()) {
                             (Ok(prepared), Some(api)) if mutation.allowed_on(ui.screen) && can_submit(&session, &ui, &target) => {
-                                ui.message = Some("submitting one versioned write".into());
+                                ui.message = Some(match mutation {
+                                    Mutation::ApplyWant => "applying Want",
+                                    Mutation::DeleteWant => "deleting Want",
+                                    Mutation::ApproveHold => "recording approval",
+                                    Mutation::RejectHold => "recording rejection",
+                                }.into());
                                 work.spawn(async move { Work::Finished(actions::submit(&api, prepared).await) });
                             }
                             (Err(outcome), _) => finish(&mut session, &mut ui, outcome).await,
@@ -194,8 +204,12 @@ async fn run_loop<B: Backend>(
                     let projection = project_ui(&session, &mut ui);
                     let observation = disk.observation();
                     let mut display = ui.clone();
-                    if !session.sync.writes_allowed() && !ui.mutation_pending && session.message.is_some() {
-                        display.message.clone_from(&session.message);
+                    if !session.sync.writes_allowed() && !ui.mutation_pending && !ui.sync_pending {
+                        display.message = Some(match (&session.message, reconnect_at) {
+                            (Some(message), Some(at)) => format!("retry in {}s; actions disabled; {message}", at.saturating_duration_since(tokio::time::Instant::now()).as_secs().saturating_add(1)),
+                            (Some(message), None) => format!("reconnecting; actions disabled; {message}"),
+                            (None, _) => "loading Home API state; actions disabled".into(),
+                        });
                     }
                     terminal.draw(|frame| crate::view::render(frame, &display, session.sync, &projection, &observation, color, session.list_failed))
                         .map_err(|e| anyhow::anyhow!("{e}"))?;

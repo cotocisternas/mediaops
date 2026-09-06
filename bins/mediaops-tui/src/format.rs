@@ -39,6 +39,33 @@ pub fn fmt_age(secs: u64) -> String {
     }
 }
 
+pub fn fmt_percent(done: u64, total: u64) -> String {
+    if total == 0 {
+        return "n/a".into();
+    }
+    // Floor until all bytes arrive; a rounded 100% implies completion too early.
+    format!("{}%", u128::from(done.min(total)) * 100 / u128::from(total))
+}
+
+pub fn fmt_progress(done: u64, total: u64) -> String {
+    format!(
+        "{} / {} ({})",
+        fmt_bytes(done),
+        fmt_bytes(total),
+        fmt_percent(done, total)
+    )
+}
+
+pub fn fmt_observed_age(timestamp: i64, now: i64) -> String {
+    if timestamp <= 0 {
+        "never".into()
+    } else if timestamp > now {
+        "clock ahead".into()
+    } else {
+        format!("{} ago", fmt_age((now - timestamp) as u64))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +75,13 @@ mod tests {
         assert_eq!(fmt_bytes((71 * 1024 * 1024 * 1024) / 10), "7.1 GiB");
         assert_eq!(fmt_age(21 * 60), "21m");
         assert_eq!(fmt_age(2), "2s");
+    }
+
+    #[test]
+    fn progress_handles_unknown_zero_and_large_sizes_without_false_completion() {
+        assert_eq!(fmt_percent(0, 0), "n/a");
+        assert_eq!(fmt_percent(999, 1000), "99%");
+        assert_eq!(fmt_percent(u64::MAX - 1, u64::MAX), "99%");
+        assert_eq!(fmt_percent(200, 100), "100%");
     }
 }

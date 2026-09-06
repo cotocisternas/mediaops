@@ -65,7 +65,7 @@ pull      The Matrix (1999)  pulling
 disk      693.1 GiB free
 ```
 
-Home API `-o json` is the raw object (no envelope). Legacy `--json` is one `{ok,data,error}` envelope on stdout; tracing on stderr. Human stdout is the operator UI: color only on a tty, sizes as `7.1 GiB`, ages as `21m`.
+CLI `-o json` is the raw object (no envelope) for every command. Human progress and tracing go to stderr. Human stdout is the operator UI: color only on a tty, sizes as `7.1 GiB`, ages as `21m`.
 
 See [Usage](docs/usage.md) for the rest of the verbs and [Setup](docs/setup.md) to bring up a new pair of machines.
 

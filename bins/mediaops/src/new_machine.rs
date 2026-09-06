@@ -4,11 +4,10 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use mediaops_core::{
-    Envelope, Kind, Spec, StatusBody, TitleFileStatus, TitleId, TitleIndexEntry, TitleIndexError,
-    TitleSpec, TitleStatus,
+    Envelope, Kind, Spec, StatusBody, TitleFileStatus, TitleId, TitleIndexEntry, TitleSpec,
+    TitleStatus,
 };
 use mediaops_ssh::refuse_git_work_tree;
-use mediaops_store::{Store, StoreError};
 use mediaops_sync::ensure_layout;
 use serde::Serialize;
 
@@ -43,65 +42,43 @@ pub async fn export_machine(
     tls_dir: Option<PathBuf>,
     state_db: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let desired_state =
         desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
-    let state_db = crate::api_legacy::state_db_path(state_db);
+    let state_db = crate::home_library::state_db_path(state_db);
     let _lock =
         bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
     refuse_bundle_git(&out, "export")?;
 
     let ds_bytes = fs::read(&desired_state).map_err(|err| AppError::Runtime(err.into()))?;
-    let home = if use_home {
-        Some(crate::api_legacy::HomeLibrary::load().await?)
-    } else {
-        None
-    };
-    let rows = if let Some(home) = &home {
-        home.rows(true).await?
-    } else {
-        Store::open(&state_db)
-            .await
-            .map_err(crate::api_legacy::error)?
-            .list_titles()
-            .await
-            .map_err(crate::api_legacy::error)?
-    };
-    let secret = if let Some(home) = &home {
-        match home
-            .api
-            .get(mediaops_core::Kind::Secret, mediaops_core::SECRET_NAME)
-            .await
-        {
-            Ok(secret) => Some(secret),
-            Err(err) if err.is_not_found() => None,
-            Err(err) => return Err(crate::api_legacy::error(err)),
-        }
-    } else {
-        None
+    let home = crate::home_library::HomeLibrary::load().await?;
+    let rows = home.rows(true).await?;
+    let secret = match home
+        .api
+        .get(mediaops_core::Kind::Secret, mediaops_core::SECRET_NAME)
+        .await
+    {
+        Ok(secret) => Some(secret),
+        Err(err) if err.is_not_found() => None,
+        Err(err) => return Err(crate::home_library::error(err)),
     };
     let index_json = serde_json::to_string(&rows).map_err(|err| AppError::Runtime(err.into()))?;
 
     private_directory(&out)?;
     write_private(&out.join(BUNDLE_DS), &ds_bytes)?;
     write_private(&out.join(BUNDLE_INDEX), index_json.as_bytes())?;
-    if let Some(home) = &home {
-        write_private(
-            &out.join(BUNDLE_CLUSTER),
-            &serde_json::to_vec_pretty(&home.cluster).map_err(crate::api_legacy::error)?,
-        )?;
-    } else if out.join(BUNDLE_CLUSTER).exists() {
-        fs::remove_file(out.join(BUNDLE_CLUSTER)).map_err(crate::api_legacy::error)?;
-    }
+    write_private(
+        &out.join(BUNDLE_CLUSTER),
+        &serde_json::to_vec_pretty(&home.cluster).map_err(crate::home_library::error)?,
+    )?;
     if let Some(secret) = secret {
         write_private(
             &out.join(BUNDLE_SECRET),
-            &serde_json::to_vec_pretty(&secret).map_err(crate::api_legacy::error)?,
+            &serde_json::to_vec_pretty(&secret).map_err(crate::home_library::error)?,
         )?;
     } else if out.join(BUNDLE_SECRET).exists() {
-        fs::remove_file(out.join(BUNDLE_SECRET)).map_err(crate::api_legacy::error)?;
+        fs::remove_file(out.join(BUNDLE_SECRET)).map_err(crate::home_library::error)?;
     }
     copy_tls_dir(&tls_dir, &out.join(BUNDLE_TLS))?;
 
@@ -128,82 +105,35 @@ pub async fn import_machine(
     tls_dir: Option<PathBuf>,
     state_db: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let use_home = crate::api_legacy::use_home(&state_db);
     let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
     let desired_state =
         desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
     let tls_dir = tls_dir.unwrap_or_else(|| bootstrap::default_tls_dir(&config_dir));
-    let state_db = crate::api_legacy::state_db_path(state_db);
+    let state_db = crate::home_library::state_db_path(state_db);
     let _lock =
         bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
     refuse_import_git(&config_dir, &desired_state, &tls_dir)?;
     crate::library::refuse_library_root(&library_root)?;
 
     let ds_bytes = fs::read(from.join(BUNDLE_DS)).map_err(|err| AppError::Runtime(err.into()))?;
-    mediaops_core::DesiredState::from_toml_bytes(&ds_bytes).map_err(crate::api_legacy::error)?;
+    mediaops_core::DesiredState::from_toml_bytes(&ds_bytes).map_err(crate::home_library::error)?;
     let index_bytes =
         fs::read(from.join(BUNDLE_INDEX)).map_err(|err| AppError::Runtime(err.into()))?;
     let rows: Vec<TitleIndexEntry> =
         serde_json::from_slice(&index_bytes).map_err(|err| AppError::Runtime(err.into()))?;
     refuse_non_schema_relative(&rows)?;
 
-    if use_home {
-        return import_home(
-            json,
-            &from,
-            library_root,
-            &config_dir,
-            &desired_state,
-            &tls_dir,
-            &ds_bytes,
-            &rows,
-        )
-        .await;
-    }
-
-    let store = Store::open(&state_db)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let existing = store
-        .list_titles()
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    if !existing.is_empty() {
-        return Err(map_store(StoreError::TitleIndex(TitleIndexError::NotEmpty)));
-    }
-
-    if let Some(parent) = desired_state.parent() {
-        fs::create_dir_all(parent).map_err(|err| AppError::Runtime(err.into()))?;
-    }
-    fs::write(&desired_state, ds_bytes).map_err(|err| AppError::Runtime(err.into()))?;
-    copy_tls_dir(&from.join(BUNDLE_TLS), &tls_dir)?;
-
-    ensure_layout(&library_root).map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    let library_root = fs::canonicalize(&library_root)
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("canonicalize library-root: {err}")))?;
-    store
-        .put_machine("library_root", &library_root.display().to_string())
-        .await
-        .map_err(|err| AppError::Runtime(anyhow_err(err)))?;
-    store.import_rows(&rows).await.map_err(map_store)?;
-
-    let data = ImportData {
-        config_dir: config_dir.display().to_string(),
-        library_root: library_root.display().to_string(),
-        titles: rows.len(),
-        dirs: mediaops_sync::SCHEMA_DIRS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    };
-    if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-    } else {
-        Ok(format!(
-            "new-machine import {} titles {}",
-            data.library_root, data.titles
-        ))
-    }
+    import_home(
+        json,
+        &from,
+        library_root,
+        &config_dir,
+        &desired_state,
+        &tls_dir,
+        &ds_bytes,
+        &rows,
+    )
+    .await
 }
 
 fn refuse_bundle_git(path: &Path, verb: &str) -> Result<(), AppError> {
@@ -264,7 +194,7 @@ fn copy_tls_dir(src: &Path, dest: &Path) -> Result<(), AppError> {
             let name = entry.file_name();
             if entry
                 .file_type()
-                .map_err(crate::api_legacy::error)?
+                .map_err(crate::home_library::error)?
                 .is_symlink()
             {
                 return Err(AppError::Policy(format!(
@@ -274,7 +204,7 @@ fn copy_tls_dir(src: &Path, dest: &Path) -> Result<(), AppError> {
             }
             write_private(
                 &dest.join(&name),
-                &fs::read(&path).map_err(crate::api_legacy::error)?,
+                &fs::read(&path).map_err(crate::home_library::error)?,
             )?;
             keep.insert(name);
         }
@@ -300,12 +230,12 @@ fn private_directory(path: &Path) -> Result<(), AppError> {
             path.display()
         )));
     }
-    fs::create_dir_all(path).map_err(crate::api_legacy::error)?;
+    fs::create_dir_all(path).map_err(crate::home_library::error)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(crate::api_legacy::error)?;
+            .map_err(crate::home_library::error)?;
     }
     Ok(())
 }
@@ -319,15 +249,15 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path).map_err(crate::api_legacy::error)?;
+    let mut file = options.open(path).map_err(crate::home_library::error)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(crate::api_legacy::error)?;
+            .map_err(crate::home_library::error)?;
     }
-    file.write_all(bytes).map_err(crate::api_legacy::error)?;
-    file.sync_all().map_err(crate::api_legacy::error)
+    file.write_all(bytes).map_err(crate::home_library::error)?;
+    file.sync_all().map_err(crate::home_library::error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -341,17 +271,14 @@ async fn import_home(
     ds_bytes: &[u8],
     rows: &[TitleIndexEntry],
 ) -> Result<String, AppError> {
-    let ds =
-        mediaops_core::DesiredState::from_toml_bytes(ds_bytes).map_err(crate::api_legacy::error)?;
-    let mut cluster = if from.join(BUNDLE_CLUSTER).is_file() {
-        mediaops_core::HomeObject::from_bytes(
-            &fs::read(from.join(BUNDLE_CLUSTER)).map_err(crate::api_legacy::error)?,
-        )
-        .map_err(crate::api_legacy::error)?
-    } else {
-        crate::api_legacy::cluster_from_config(&ds, &library_root)
-    };
-    cluster.validate().map_err(crate::api_legacy::error)?;
+    let cluster_bytes = fs::read(from.join(BUNDLE_CLUSTER)).map_err(|err| {
+        AppError::Usage(format!(
+            "current bundle requires readable cluster.json: {err}"
+        ))
+    })?;
+    let mut cluster = mediaops_core::HomeObject::from_bytes(&cluster_bytes)
+        .map_err(crate::home_library::error)?;
+    cluster.validate().map_err(crate::home_library::error)?;
     let originally_locked = match &cluster.spec {
         mediaops_core::Spec::Cluster(spec) => spec.lock,
         _ => {
@@ -360,18 +287,18 @@ async fn import_home(
             ));
         }
     };
-    let secret = imported_secret(from, &ds)?;
-    let api = crate::api_legacy::connect().await?;
+    let secret = imported_secret(from)?;
+    let api = crate::home_library::connect().await?;
     let mut previous_home = match api
         .get(mediaops_core::Kind::Cluster, mediaops_core::CLUSTER_NAME)
         .await
     {
-        Ok(cluster) => Some(crate::api_legacy::HomeLibrary {
+        Ok(cluster) => Some(crate::home_library::HomeLibrary {
             api: api.clone(),
             cluster,
         }),
         Err(err) if err.is_not_found() => None,
-        Err(err) => return Err(crate::api_legacy::error(err)),
+        Err(err) => return Err(crate::home_library::error(err)),
     };
     // Pause existing scheduling before compatibility preflight. Otherwise a Want
     // can create/bind work between those checks and replacement of the root.
@@ -383,7 +310,7 @@ async fn import_home(
         if !api
             .list(Some(Kind::Job))
             .await
-            .map_err(crate::api_legacy::error)?
+            .map_err(crate::home_library::error)?
             .is_empty()
         {
             return Err(AppError::Usage(
@@ -403,11 +330,11 @@ async fn import_home(
         }
     };
     ensure_layout(&library_root)
-        .map_err(crate::api_legacy::error)
-        .map_err(crate::api_legacy::maintenance_failure)?;
+        .map_err(crate::home_library::error)
+        .map_err(crate::home_library::maintenance_failure)?;
     let library_root = fs::canonicalize(&library_root)
-        .map_err(crate::api_legacy::error)
-        .map_err(crate::api_legacy::maintenance_failure)?;
+        .map_err(crate::home_library::error)
+        .map_err(crate::home_library::maintenance_failure)?;
     if let mediaops_core::Spec::Cluster(spec) = &mut cluster.spec {
         spec.lock = true;
         spec.library_root = library_root.display().to_string();
@@ -425,9 +352,9 @@ async fn import_home(
     let cluster = api
         .apply(cluster)
         .await
-        .map_err(crate::api_legacy::error)
-        .map_err(crate::api_legacy::maintenance_failure)?;
-    let mut home = crate::api_legacy::HomeLibrary { api, cluster };
+        .map_err(crate::home_library::error)
+        .map_err(crate::home_library::maintenance_failure)?;
+    let mut home = crate::home_library::HomeLibrary { api, cluster };
     home.begin_maintenance().await?;
 
     let outcome: Result<(), AppError> = async {
@@ -437,7 +364,7 @@ async fn import_home(
         write_private(desired_state, ds_bytes)?;
         copy_tls_dir(&from.join(BUNDLE_TLS), tls_dir)?;
         if let Some(secret) = secret {
-            crate::api_legacy::apply_spec(&home.api, secret).await?;
+            crate::home_library::apply_spec(&home.api, secret).await?;
         }
         if !missing.is_empty() {
             home.publish_rows(&missing, true).await?;
@@ -445,7 +372,7 @@ async fn import_home(
         Ok(())
     }
     .await;
-    outcome.map_err(crate::api_legacy::maintenance_failure)?;
+    outcome.map_err(crate::home_library::maintenance_failure)?;
     home.finish_maintenance(originally_locked).await?;
     let data = ImportData {
         config_dir: config_dir.display().to_string(),
@@ -457,7 +384,7 @@ async fn import_home(
             .collect(),
     };
     if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(crate::api_legacy::error)
+        serde_json::to_string(&Envelope::ok(data)).map_err(crate::home_library::error)
     } else {
         Ok(format!(
             "new-machine import {} titles {}",
@@ -551,19 +478,20 @@ async fn compatible_missing_rows(
     let titles = api
         .list(Some(Kind::Title))
         .await
-        .map_err(crate::api_legacy::error)?;
+        .map_err(crate::home_library::error)?;
     if !titles.is_empty() {
         let cluster = api
             .get(Kind::Cluster, mediaops_core::CLUSTER_NAME)
             .await
-            .map_err(crate::api_legacy::error)?;
+            .map_err(crate::home_library::error)?;
         let Spec::Cluster(spec) = &cluster.spec else {
             return Err(AppError::Usage(
                 "nonempty Title index requires a Cluster library root".into(),
             ));
         };
-        let configured = fs::canonicalize(&spec.library_root).map_err(crate::api_legacy::error)?;
-        let requested = fs::canonicalize(library_root).map_err(crate::api_legacy::error)?;
+        let configured =
+            fs::canonicalize(&spec.library_root).map_err(crate::home_library::error)?;
+        let requested = fs::canonicalize(library_root).map_err(crate::home_library::error)?;
         if configured != requested {
             return Err(AppError::Usage(
                 "--library-root must match Cluster.spec.libraryRoot; use library relocate to change it".into(),
@@ -581,7 +509,7 @@ async fn compatible_missing_rows(
                 title.metadata.name
             )));
         }
-        let id = TitleId::parse(&spec.title_id).map_err(crate::api_legacy::error)?;
+        let id = TitleId::parse(&spec.title_id).map_err(crate::home_library::error)?;
         if !bundle.keys().any(|(bundle_id, _)| bundle_id == &id) {
             return Err(AppError::Usage(format!(
                 "foreign Title is not in the bundle: {}",
@@ -620,41 +548,19 @@ async fn compatible_missing_rows(
     Ok(missing)
 }
 
-fn imported_secret(
-    from: &Path,
-    ds: &mediaops_core::DesiredState,
-) -> Result<Option<mediaops_core::HomeObject>, AppError> {
-    use mediaops_core::{HomeObject, Kind, SECRET_NAME, SecretSpec, Spec, StatusBody};
-    let secret = if from.join(BUNDLE_SECRET).is_file() {
-        HomeObject::from_bytes(
-            &fs::read(from.join(BUNDLE_SECRET)).map_err(crate::api_legacy::error)?,
-        )
-        .map_err(crate::api_legacy::error)?
-    } else if let Some(address) = ds.seedbox_address() {
-        let mut spec = SecretSpec {
-            seedbox_address: address.into(),
-            ..SecretSpec::default()
-        };
-        if let Some(tls) = ds.tls() {
-            spec.ca_sha256 = tls.ca_sha256.clone();
-            spec.server_sha256 = tls.server_sha256.clone();
-            spec.client_sha256 = tls.client_sha256.clone();
-        }
-        HomeObject::new(
-            Kind::Secret,
-            SECRET_NAME,
-            Spec::Secret(spec),
-            StatusBody::Secret,
-        )
-    } else {
-        return Ok(None);
+fn imported_secret(from: &Path) -> Result<Option<mediaops_core::HomeObject>, AppError> {
+    use mediaops_core::{HomeObject, Kind};
+    let secret = match fs::read(from.join(BUNDLE_SECRET)) {
+        Ok(bytes) => HomeObject::from_bytes(&bytes).map_err(crate::home_library::error)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(crate::home_library::error(err)),
     };
     if secret.kind != Kind::Secret {
         return Err(AppError::Usage(
             "bundle secret.json must contain a Secret".into(),
         ));
     }
-    secret.validate().map_err(crate::api_legacy::error)?;
+    secret.validate().map_err(crate::home_library::error)?;
     Ok(Some(secret))
 }
 
@@ -668,13 +574,6 @@ fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
         mediaops_core::ExitCode::PolicyRefusal => AppError::Policy(err.to_string()),
         mediaops_core::ExitCode::LockConflict => AppError::LockConflict(err.to_string()),
         _ => AppError::Runtime(anyhow_err(err)),
-    }
-}
-
-fn map_store(err: StoreError) -> AppError {
-    match err {
-        StoreError::TitleIndex(TitleIndexError::NotEmpty) => AppError::Usage(err.to_string()),
-        other => AppError::Runtime(anyhow_err(other)),
     }
 }
 
@@ -777,111 +676,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_import_restores_both_digests_without_media() {
-        let src = scratch("export-src");
-        let ds = src.join(BUNDLE_DS);
-        fs::write(&ds, DS).expect("ds");
-        let tls = src.join(BUNDLE_TLS);
-        fs::create_dir_all(&tls).expect("tls");
-        fs::write(tls.join("ca.pem"), b"ca").expect("pem");
-        fs::write(tls.join("client.key"), b"key").expect("key");
-        let db = src.join("state.db");
-        let store = Store::open(&db).await.expect("store");
-        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
-        let install = Blake3Hex::of_bytes(b"install");
-        let current = Blake3Hex::of_bytes(b"current");
-        let path = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
-        store
-            .import_rows(&[TitleIndexEntry::new(
-                title.clone(),
-                path,
-                install.clone(),
-                current.clone(),
-            )])
-            .await
-            .expect("seed");
-        drop(store);
-
-        let bundle = scratch("bundle");
-        export_machine(
-            true,
-            bundle.clone(),
-            Some(src.clone()),
-            Some(ds),
-            Some(tls),
-            Some(db),
-        )
-        .await
-        .expect("export");
-        assert!(bundle.join(BUNDLE_DS).is_file());
-        assert!(bundle.join(BUNDLE_INDEX).is_file());
-        assert!(bundle.join(BUNDLE_TLS).join("ca.pem").is_file());
-        assert!(bundle.join(BUNDLE_TLS).join("client.key").is_file());
-
-        let dest = scratch("import-dest");
-        let dest_db = dest.join("state.db");
-        let lib = dest.join("library");
-        fs::create_dir_all(dest.join(BUNDLE_TLS)).expect("dest tls");
-        fs::write(dest.join(BUNDLE_TLS).join("stale.key"), b"old").expect("stale");
-        let json = import_machine(
-            true,
-            bundle,
-            lib.clone(),
-            Some(dest.clone()),
-            None,
-            None,
-            Some(dest_db.clone()),
-        )
-        .await
-        .expect("import");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("json");
-        assert_eq!(value["ok"], true, "{json}");
-        assert_eq!(value["data"]["titles"], 1);
-        assert_eq!(fs::read(dest.join(BUNDLE_DS)).expect("ds"), DS);
-        assert_eq!(
-            fs::read(dest.join(BUNDLE_TLS).join("ca.pem")).expect("pem"),
-            b"ca"
-        );
-        assert_eq!(
-            fs::read(dest.join(BUNDLE_TLS).join("client.key")).expect("key"),
-            b"key"
-        );
-        assert!(
-            !dest.join(BUNDLE_TLS).join("stale.key").exists(),
-            "tls dest must replace, not merge"
-        );
-        for name in mediaops_sync::SCHEMA_DIRS {
-            assert!(lib.join(name).is_dir(), "{name}");
-        }
-        assert!(
-            !lib.join(path).exists(),
-            "layout must exist before any media"
-        );
-        let store = Store::open(&dest_db).await.expect("dest store");
-        let entry = store
-            .get_title(&title)
-            .await
-            .expect("get")
-            .into_iter()
-            .next()
-            .expect("row");
-        assert_eq!(entry.install_b3(), &install);
-        assert_eq!(entry.current_b3(), &current);
-        assert_ne!(entry.install_b3(), entry.current_b3());
-        let canon = fs::canonicalize(&lib).expect("canon lib");
-        assert_eq!(
-            store
-                .get_machine("library_root")
-                .await
-                .expect("machine")
-                .as_deref(),
-            Some(canon.to_str().expect("utf8"))
-        );
-        let _ = fs::remove_dir_all(src);
-        let _ = fs::remove_dir_all(dest);
-    }
-
-    #[tokio::test]
     async fn import_git_work_tree_writes_nothing() {
         let bundle = scratch("git-bundle");
         fs::write(bundle.join(BUNDLE_DS), DS).expect("ds");
@@ -906,120 +700,6 @@ mod tests {
         assert!(matches!(err, AppError::Policy(_)), "{err}");
         assert!(!dest.join(BUNDLE_DS).exists());
         assert!(!dest.join(BUNDLE_TLS).join("ca.pem").exists());
-        let _ = fs::remove_dir_all(bundle);
-        let _ = fs::remove_dir_all(dest);
-    }
-
-    #[tokio::test]
-    async fn import_non_empty_title_index_does_not_clobber() {
-        let bundle = scratch("clobber-bundle");
-        fs::write(bundle.join(BUNDLE_DS), DS).expect("ds");
-        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
-        let incoming = TitleIndexEntry::new(
-            title.clone(),
-            "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv",
-            Blake3Hex::of_bytes(b"new"),
-            Blake3Hex::of_bytes(b"new"),
-        );
-        fs::write(
-            bundle.join(BUNDLE_INDEX),
-            serde_json::to_vec(&[incoming]).expect("json"),
-        )
-        .expect("index");
-        fs::create_dir_all(bundle.join(BUNDLE_TLS)).expect("tls");
-
-        let dest = scratch("clobber-dest");
-        let dest_db = dest.join("state.db");
-        let store = Store::open(&dest_db).await.expect("store");
-        let existing = Blake3Hex::of_bytes(b"keep");
-        store
-            .import_rows(&[TitleIndexEntry::new(
-                title.clone(),
-                "movies/Keep.(1999)/Keep.(1999).mkv",
-                existing.clone(),
-                existing.clone(),
-            )])
-            .await
-            .expect("seed");
-        drop(store);
-
-        let err = import_machine(
-            true,
-            bundle.clone(),
-            dest.join("library"),
-            Some(dest.clone()),
-            None,
-            None,
-            Some(dest_db.clone()),
-        )
-        .await
-        .expect_err("non-empty");
-        assert!(matches!(err, AppError::Usage(_)), "{err}");
-        assert!(!dest.join(BUNDLE_DS).exists(), "must not clobber dest DS");
-        assert!(!dest.join(BUNDLE_TLS).join("ca.pem").exists());
-        let store = Store::open(&dest_db).await.expect("reopen");
-        let entry = store
-            .get_title(&title)
-            .await
-            .expect("get")
-            .into_iter()
-            .next()
-            .expect("row");
-        assert_eq!(entry.install_b3(), &existing);
-        assert_eq!(entry.path(), "movies/Keep.(1999)/Keep.(1999).mkv");
-        let _ = fs::remove_dir_all(bundle);
-        let _ = fs::remove_dir_all(dest);
-    }
-
-    #[tokio::test]
-    async fn import_retries_when_dest_layout_exists_and_index_is_empty() {
-        let bundle = scratch("retry-bundle");
-        fs::write(bundle.join(BUNDLE_DS), DS).expect("ds");
-        let title = TitleId::movie_key("The.Matrix", 1999).expect("title");
-        let digest = Blake3Hex::of_bytes(b"orig");
-        let path = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
-        fs::write(
-            bundle.join(BUNDLE_INDEX),
-            serde_json::to_vec(&[TitleIndexEntry::new(
-                title.clone(),
-                path,
-                digest.clone(),
-                digest.clone(),
-            )])
-            .expect("json"),
-        )
-        .expect("index");
-        fs::create_dir_all(bundle.join(BUNDLE_TLS)).expect("tls");
-        fs::write(bundle.join(BUNDLE_TLS).join("ca.pem"), b"ca").expect("pem");
-        fs::write(bundle.join(BUNDLE_TLS).join("client.key"), b"key").expect("key");
-
-        let dest = scratch("retry-dest");
-        fs::write(dest.join(BUNDLE_DS), b"stale").expect("old ds");
-        ensure_layout(&dest.join("library")).expect("layout");
-        let dest_db = dest.join("state.db");
-        let _ = Store::open(&dest_db).await.expect("empty index");
-
-        import_machine(
-            true,
-            bundle.clone(),
-            dest.join("library"),
-            Some(dest.clone()),
-            None,
-            None,
-            Some(dest_db.clone()),
-        )
-        .await
-        .expect("retry import");
-        let store = Store::open(&dest_db).await.expect("reopen");
-        let entry = store
-            .get_title(&title)
-            .await
-            .expect("get")
-            .into_iter()
-            .next()
-            .expect("row");
-        assert_eq!(entry.install_b3(), &digest);
-        assert_eq!(fs::read(dest.join(BUNDLE_DS)).expect("ds"), DS);
         let _ = fs::remove_dir_all(bundle);
         let _ = fs::remove_dir_all(dest);
     }
@@ -1089,11 +769,10 @@ mod tests {
         .await
         .expect_err("absolute");
         assert!(matches!(err, AppError::Usage(_)), "{err}");
-        if dest_db.exists() {
-            let store = Store::open(&dest_db).await.expect("open");
-            assert!(store.get_title(&title).await.expect("get").is_empty());
-            assert!(store.list_titles().await.expect("list").is_empty());
-        }
+        assert!(
+            !dest_db.exists(),
+            "invalid bundle must not create local state"
+        );
         let _ = fs::remove_dir_all(bundle);
         let _ = fs::remove_dir_all(dest);
     }

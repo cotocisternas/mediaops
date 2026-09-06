@@ -13,24 +13,26 @@ pub struct ColPlan {
 }
 
 pub fn numeric_header(header: &str) -> bool {
-    matches!(header, "BYTES" | "ATTEMPTS" | "SIZE" | "AGE")
+    matches!(header, "BYTES" | "ATTEMPTS" | "SIZE" | "AGE" | "PROGRESS")
 }
 
 fn min_width(header: &str) -> u16 {
     let preferred = match header {
         "TITLE" => 8,
-        "PHASE" => 7,
+        "PHASE" => 9,
+        "PROGRESS" => 8,
         "BYTES" => 9,
         "ATTEMPTS" => 8,
-        "NODE" => 4,
-        "FAILURE" => 4,
+        "NODE" => 7,
+        "FAILURE" | "MESSAGE" => 12,
         "SIZE" => 7,
         "AGE" => 3,
-        "READY" => 5,
+        "READY" => 9,
+        "HEARTBEAT" => 12,
         "ROOT" => 10,
         "PATH" => 6,
         "KIND" => 5,
-        "FACT" => 12,
+        "FACT" => 24,
         _ => 4,
     };
     preferred.max(u16::try_from(header.width()).unwrap_or(u16::MAX))
@@ -53,7 +55,8 @@ pub fn plan_columns(headers: &[&'static str], total: u16) -> Vec<ColPlan> {
                 .or_else(|| headers[..n].iter().position(|h| !numeric_header(h)))
                 .unwrap_or(0);
             widths[flex] = widths[flex].saturating_add(extra);
-            if widths.get(flex).copied().unwrap_or(0) >= 12 || n == 1 {
+            let readable_width = if headers[flex] == "TITLE" { 24 } else { 12 };
+            if widths.get(flex).copied().unwrap_or(0) >= readable_width || n == 1 {
                 return headers[..n]
                     .iter()
                     .enumerate()
@@ -117,6 +120,40 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
         used += cw;
     }
     lines.push(line);
+    lines
+}
+
+pub fn help_lines(ui: &crate::model::UiModel) -> Vec<String> {
+    let mut lines: Vec<String> = [
+        "1 Overview  2 Wants  3 Jobs  4 Holds  5 Titles  6 Nodes  7 Box",
+        "Tab / Shift-Tab  next/prev screen",
+        "j k arrows  PageUp PageDown  Home End  rows or scroll",
+        "Enter  detail   Esc  back   ?  help   q  quit",
+        "W apply Want   D delete Want   A approve Hold   X reject Hold",
+        "p preview copies   S fresh sync (not watching)",
+        "mutations only in selected detail; Enter never writes",
+        "100% copied still needs verification and installation",
+        "NOT CURRENT: reconnecting automatically; actions disabled",
+        "Service: systemctl --user status mediaops-home.service",
+        "Logs: journalctl --user -u mediaops-home.service -n 50",
+    ]
+    .into_iter()
+    .flat_map(|text| wrap_text(text, usize::from(ui.cols)))
+    .collect();
+    let message = ui.connection_message.as_ref().or(ui.message.as_ref());
+    if let Some(message) = message {
+        lines.push(String::new());
+        lines.extend(wrap_text(
+            &format!("Status: {message}"),
+            usize::from(ui.cols),
+        ));
+    } else if let Some(message) = &ui.last_message {
+        lines.push(String::new());
+        lines.extend(wrap_text(
+            &format!("Last status: {message}"),
+            usize::from(ui.cols),
+        ));
+    }
     lines
 }
 

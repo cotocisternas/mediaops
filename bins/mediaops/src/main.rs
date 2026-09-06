@@ -8,22 +8,20 @@ use mediaops_core::{ExitCode, ProviderKind};
 use mediaops_ssh::SystemExec;
 
 mod api_cmd;
-mod api_legacy;
 mod apply_cmd;
 mod bootstrap;
 mod doctor;
 mod encode_cmd;
-mod hold;
 mod home;
+mod home_library;
 mod library;
 mod new_machine;
 mod out;
+mod progress;
 mod reclaim;
 mod repair;
-mod status;
 mod sync_cmd;
 mod sync_format;
-mod watch;
 
 #[cfg(test)]
 mod test_support;
@@ -33,10 +31,7 @@ const BIN_NAME: &str = "mediaops";
 #[derive(Parser, Debug)]
 #[command(name = BIN_NAME, version)]
 struct Cli {
-    /// Emit a single JSON envelope on stdout (legacy verbs).
-    #[arg(long, global = true)]
-    json: bool,
-    /// Home API output: table (default), wide, or json (raw object).
+    /// Output: table (default), wide, or json (raw object).
     #[arg(short = 'o', long = "output", global = true)]
     output: Option<String>,
     #[command(subcommand)]
@@ -74,10 +69,6 @@ enum Command {
         #[arg(long)]
         config_dir: Option<PathBuf>,
         #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long = "config", value_name = "PATH")]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
         install: bool,
         #[arg(long)]
         title: Option<String>,
@@ -94,45 +85,17 @@ enum Command {
         title: String,
         #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
     },
     /// Show this title's recorded Want, Hold, Job, and library facts.
     Why {
         title: String,
         #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long = "config", value_name = "PATH")]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
-        library_root: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
-        #[arg(long = "api-socket")]
-        api_socket: Option<PathBuf>,
     },
-    /// Show Home activity and library disk space; legacy state requires explicit --state-db.
+    /// Show Home activity, worker readiness, and library disk space.
     Status {
         #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long)]
-        plans_dir: Option<PathBuf>,
-        #[arg(long = "config", value_name = "PATH")]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
-        library_root: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
-        #[arg(long = "api-socket")]
-        api_socket: Option<PathBuf>,
     },
     Encode(EncodeArgs),
     /// Ranked dry-run / exclusive unlink of surplus remotes after install_b3 proof.
@@ -200,15 +163,6 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Import old config.toml + state.db into the Home API.
-    ImportLegacy {
-        #[arg(long = "config", value_name = "PATH")]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long)]
-        socket: Option<PathBuf>,
-    },
 }
 
 #[derive(Args, Debug)]
@@ -259,8 +213,6 @@ enum ReclaimCommand {
     /// Ranked dry-run of surplus remotes. Lock-free.
     Preview {
         #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long)]
         library_root: Option<PathBuf>,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -271,8 +223,6 @@ enum ReclaimCommand {
     },
     /// Unlink ranked surplus remotes. Exclusive flock.
     Apply {
-        #[arg(long)]
-        state_db: Option<PathBuf>,
         #[arg(long)]
         library_root: Option<PathBuf>,
         #[arg(long)]
@@ -311,8 +261,6 @@ enum NewMachineCommand {
         desired_state: Option<PathBuf>,
         #[arg(long)]
         tls_dir: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
     },
     /// Restore a bundle into Home state, resuming compatible Title proofs.
     Import {
@@ -326,59 +274,32 @@ enum NewMachineCommand {
         desired_state: Option<PathBuf>,
         #[arg(long)]
         tls_dir: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
     },
 }
 
 #[derive(Subcommand, Debug)]
 enum HoldCommand {
-    /// List undecided import-blocked releases (live ⊖ decided). Lock-free.
+    /// List undecided import-blocked releases.
     List {
         #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long = "api-socket")]
-        api_socket: Option<PathBuf>,
     },
-    /// Persist Approved. Does not install; the next Pull Job copies. Lock-free.
+    /// Record approval; the Hold controller creates a Pull Job to install it.
     Approve {
-        /// Title id from `hold list` (`movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…`).
+        /// Title id or row number from `hold list`.
         target: String,
-        /// Release id. Only needed when the same title id is in the inbox twice.
+        /// Release id when the same title has several held releases.
         release_id: Option<String>,
         #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long = "api-socket")]
-        api_socket: Option<PathBuf>,
     },
-    /// Persist Rejected and tell *arr never-this-release. Lock-free.
+    /// Reject a held release and notify the grabber.
     Reject {
-        /// Title id from `hold list` (`movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…`).
+        /// Title id or row number from `hold list`.
         target: String,
-        /// Release id. Only needed when the same title id is in the inbox twice.
         release_id: Option<String>,
         #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long = "api-socket")]
-        api_socket: Option<PathBuf>,
     },
 }
 
@@ -388,14 +309,10 @@ enum EncodeCommand {
     Scan {
         #[arg(long)]
         library_root: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
     },
     /// Run ready encode jobs, or one title.
     Run {
         title: Option<String>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
         #[arg(long)]
         library_root: Option<PathBuf>,
         #[arg(long = "config", value_name = "PATH")]
@@ -403,12 +320,10 @@ enum EncodeCommand {
         #[arg(long)]
         config_dir: Option<PathBuf>,
     },
-    /// Set or clear Cluster.spec.encodePause; explicit legacy mode uses its machine flag.
+    /// Set or clear Cluster.spec.encodePause.
     Pause {
         #[arg(long)]
         off: bool,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
     },
 }
 
@@ -434,9 +349,8 @@ enum LibraryCommand {
         desired_state: Option<PathBuf>,
         #[arg(long)]
         config_dir: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long)]
+        /// Enable and start the always-on Home service.
+        #[arg(long = "enable-service")]
         enable_timer: bool,
         #[arg(long)]
         unit_dir: Option<PathBuf>,
@@ -445,13 +359,8 @@ enum LibraryCommand {
     Relocate {
         #[arg(long)]
         library_root: PathBuf,
-        #[arg(long = "config", value_name = "PATH")]
-        desired_state: Option<PathBuf>,
-        #[arg(long)]
-        config_dir: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
-        #[arg(long)]
+        /// Enable and start the always-on Home service.
+        #[arg(long = "enable-service")]
         enable_timer: bool,
         #[arg(long)]
         unit_dir: Option<PathBuf>,
@@ -460,8 +369,6 @@ enum LibraryCommand {
     Reindex {
         #[arg(long)]
         library_root: Option<PathBuf>,
-        #[arg(long)]
-        state_db: Option<PathBuf>,
     },
 }
 
@@ -550,21 +457,25 @@ enum ParseOutcome {
     HelpOrVersion,
 }
 
-fn json_token_requests_json(arg: &str) -> bool {
-    if arg == "--json" {
-        return true;
+fn args_request_json(args: impl IntoIterator<Item = String>) -> bool {
+    let mut output_value = false;
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if output_value && arg == "json" {
+            return true;
+        }
+        output_value = arg == "-o" || arg == "--output";
+        if arg == "--output=json" || arg == "-ojson" || arg == "-o=json" {
+            return true;
+        }
     }
-    let Some(value) = arg.strip_prefix("--json=") else {
-        return false;
-    };
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "true" | "t" | "yes" | "y" | "1" | "on"
-    )
+    false
 }
 
 fn json_requested() -> bool {
-    std::env::args_os().any(|arg| arg.to_str().is_some_and(json_token_requests_json))
+    args_request_json(std::env::args().skip(1))
 }
 
 fn init_tracing() {
@@ -588,6 +499,25 @@ fn to_exit_code(err: &AppError) -> ExitCode {
 }
 
 fn write_stdout(line: &str) -> Result<(), AppError> {
+    let normalized = serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .filter(|value| {
+            value.get("ok").is_some_and(serde_json::Value::is_boolean)
+                && value.get("data").is_some()
+                && value.get("error").is_some()
+        })
+        .map(|value| {
+            if value["ok"] == true {
+                value["data"].to_string()
+            } else {
+                let mut error = serde_json::json!({"error": value["error"]});
+                if !value["data"].is_null() {
+                    error["report"] = value["data"].clone();
+                }
+                error.to_string()
+            }
+        });
+    let line = normalized.as_deref().unwrap_or(line);
     let mut out = io::stdout().lock();
     writeln!(out, "{line}").map_err(|e| AppError::Runtime(e.into()))?;
     out.flush().map_err(|e| AppError::Runtime(e.into()))?;
@@ -620,7 +550,7 @@ fn finish_error(json_flag: bool, err: &AppError) -> ExitCode {
         return code;
     }
     if !json_flag {
-        tracing::error!(error = %err, "command failed");
+        eprintln!("error: {err}");
     }
     if let Err(emit_err) = emit_error(json_flag, code, err) {
         tracing::error!(error = %emit_err, "failed to emit error output");
@@ -639,6 +569,7 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
             _ => {
                 if !json_flag {
                     err.print().map_err(|e| AppError::Runtime(anyhow!(e)))?;
+                    return Err(AppError::Emitted(ExitCode::Usage));
                 }
                 Err(AppError::Usage(err.to_string()))
             }
@@ -647,8 +578,72 @@ fn parse_cli(json_flag: bool) -> Result<ParseOutcome, AppError> {
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
+    let output = api_cmd::Output::parse(cli.output.as_deref())?;
+    let label = match &cli.command {
+        Some(Command::Seedbox(_)) => Some("seedbox maintenance"),
+        Some(Command::Library(LibraryArgs {
+            command: LibraryCommand::Bootstrap { .. },
+        })) => Some("library bootstrap"),
+        Some(Command::Library(LibraryArgs {
+            command: LibraryCommand::Relocate { .. },
+        })) => Some("library relocate"),
+        Some(Command::Encode(EncodeArgs {
+            command: EncodeCommand::Scan { .. },
+        })) => Some("encode scan"),
+        Some(Command::Encode(EncodeArgs {
+            command: EncodeCommand::Run { .. },
+        })) => Some("encode run"),
+        Some(Command::Encode(EncodeArgs {
+            command: EncodeCommand::Pause { .. },
+        })) => Some("encode pause"),
+        Some(Command::Reclaim(_)) => Some("reclaim"),
+        Some(Command::NewMachine(_)) => Some("new-machine"),
+        Some(Command::Doctor { .. }) => Some("doctor"),
+        Some(Command::Repair(_)) => Some("edge repair"),
+        Some(Command::List { .. }) => Some("list remote files"),
+        Some(Command::Status { .. }) => Some("Home status"),
+        Some(Command::Why { .. }) => Some("title status"),
+        Some(Command::Hold(_)) => Some("hold"),
+        Some(Command::Sync { .. }) => Some("sync"),
+        Some(Command::Get { watch: false, .. }) => Some("get Home objects"),
+        Some(Command::Apply { .. }) => Some("apply Home object"),
+        Some(Command::Delete { .. }) => Some("delete Home object"),
+        Some(Command::Watch { .. }) => Some("record Want"),
+        Some(Command::Reconcile { .. }) => Some("reconcile"),
+        _ => None,
+    };
+    let mut progress = label
+        .map(|label| progress::OperationProgress::lines(output != api_cmd::Output::Json, label));
+    if let Some(progress) = progress.as_mut() {
+        progress.stage("working", "");
+    }
+    let result = dispatch(cli, output, &mut progress).await;
+    if result.is_ok()
+        && let Some(progress) = progress.as_mut()
+    {
+        progress.finish();
+    }
+    result
+}
+
+fn finish_output(
+    line: &str,
+    progress: &mut Option<progress::OperationProgress>,
+) -> Result<(), AppError> {
+    if let Some(progress) = progress.as_mut() {
+        progress.finish();
+    }
+    write_stdout(line)
+}
+
+async fn dispatch(
+    cli: Cli,
+    output: api_cmd::Output,
+    progress: &mut Option<progress::OperationProgress>,
+) -> Result<(), AppError> {
+    let json = output == api_cmd::Output::Json;
     match cli.command {
-        None => emit_success(cli.json),
+        None => emit_success(json),
         Some(Command::Seedbox(SeedboxArgs {
             command:
                 SeedboxCommand::Upgrade {
@@ -675,9 +670,9 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             };
             match bootstrap::upgrade(args, &SystemExec).await {
                 Ok(report) => {
-                    let line = bootstrap::render_upgrade(cli.json, &report)
+                    let line = bootstrap::render_upgrade(json, &report)
                         .map_err(|e| AppError::Runtime(anyhow!(e)))?;
-                    write_stdout(&line)
+                    finish_output(&line, progress)
                 }
                 Err(err) => {
                     let mapped = match err.exit_code() {
@@ -701,7 +696,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 },
         })) => {
             let line = apply_cmd::seedbox_apply(
-                cli.json,
+                json,
                 desired_state,
                 socket,
                 tls_dir,
@@ -709,7 +704,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 state_db,
             )
             .await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Seedbox(SeedboxArgs {
             command:
@@ -745,13 +740,14 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             };
             match bootstrap::bootstrap(args, &SystemExec).await {
                 Ok(report) => {
-                    let line = bootstrap::render_report(cli.json, &report)
+                    let line = bootstrap::render_report(json, &report)
                         .map_err(|e| AppError::Runtime(anyhow!(e)))?;
-                    write_stdout(&line)
+                    finish_output(&line, progress)
                 }
                 Err(bootstrap::BootstrapError::NeedsConfirm(report)) => {
-                    let line = bootstrap::render_needs_confirm(cli.json, &report)
+                    let line = bootstrap::render_needs_confirm(json, &report)
                         .map_err(|e| AppError::Runtime(anyhow!(e)))?;
+                    drop(progress.take());
                     write_stdout(&line)?;
                     Err(AppError::Emitted(ExitCode::PolicyRefusal))
                 }
@@ -771,8 +767,8 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             tls_dir,
             config_dir,
         }) => {
-            let line = home::list(cli.json, socket, tls_dir, config_dir).await?;
-            write_stdout(&line)
+            let line = home::list(json, socket, tls_dir, config_dir).await?;
+            finish_output(&line, progress)
         }
         Some(Command::Pull {
             root,
@@ -783,8 +779,6 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             socket,
             tls_dir,
             config_dir,
-            state_db,
-            desired_state,
             install,
             title,
             year,
@@ -792,7 +786,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             episode,
         }) => {
             let line = home::pull(
-                cli.json,
+                json,
                 root,
                 path,
                 title_id,
@@ -801,8 +795,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 socket,
                 tls_dir,
                 config_dir,
-                state_db,
-                desired_state,
+                None,
                 install,
                 title,
                 year,
@@ -810,7 +803,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 episode,
             )
             .await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Library(LibraryArgs {
             command:
@@ -818,140 +811,60 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     library_root,
                     desired_state,
                     config_dir,
-                    state_db,
                     enable_timer,
                     unit_dir,
                 },
         })) => {
             let line = library::bootstrap_library(
-                cli.json,
+                json,
                 library_root,
                 desired_state,
                 config_dir,
-                state_db,
+                None,
                 enable_timer,
                 unit_dir,
             )
             .await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Library(LibraryArgs {
             command:
                 LibraryCommand::Relocate {
                     library_root,
-                    desired_state,
-                    config_dir,
-                    state_db,
                     enable_timer,
                     unit_dir,
                 },
         })) => {
-            let line = library::relocate_library(
-                cli.json,
-                library_root,
-                desired_state,
-                config_dir,
-                state_db,
-                enable_timer,
-                unit_dir,
-            )
-            .await?;
-            write_stdout(&line)
+            let line =
+                library::relocate_library(json, library_root, None, enable_timer, unit_dir).await?;
+            finish_output(&line, progress)
         }
         Some(Command::Library(LibraryArgs {
-            command:
-                LibraryCommand::Reindex {
-                    library_root,
-                    state_db,
-                },
+            command: LibraryCommand::Reindex { library_root },
         })) => {
-            let line = library::reindex_library(cli.json, library_root, state_db).await?;
-            write_stdout(&line)
+            let line = library::reindex_library(json, library_root, None).await?;
+            finish_output(&line, progress)
         }
-        Some(Command::Watch {
-            title,
-            socket,
-            state_db,
-        }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let line = if !api_legacy::use_home(&state_db) && socket.is_none() {
-                watch::watch(cli.json, title, state_db).await?
-            } else {
-                api_cmd::watch_title(title, output, socket).await?
-            };
-            write_stdout(&line)
+        Some(Command::Watch { title, socket }) => finish_output(
+            &api_cmd::watch_title(title, output, socket).await?,
+            progress,
+        ),
+        Some(Command::Why { title, socket }) => {
+            finish_output(&api_cmd::why_pretty(title, output, socket).await?, progress)
         }
-        Some(Command::Why {
-            title,
-            state_db,
-            desired_state,
-            library_root,
-            config_dir,
-            socket,
-            tls_dir,
-            api_socket,
-        }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let line = if !api_legacy::use_home(&state_db) && api_socket.is_none() {
-                status::why(
-                    cli.json,
-                    title,
-                    state_db,
-                    desired_state,
-                    library_root,
-                    config_dir,
-                    socket,
-                    tls_dir,
-                )
-                .await?
-            } else {
-                api_cmd::why_pretty(title, output, api_socket).await?
-            };
-            write_stdout(&line)
-        }
-        Some(Command::Status {
-            state_db,
-            plans_dir,
-            desired_state,
-            library_root,
-            config_dir,
-            socket,
-            tls_dir,
-            api_socket,
-        }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let line = if !api_legacy::use_home(&state_db) && api_socket.is_none() {
-                status::status(
-                    cli.json,
-                    state_db,
-                    plans_dir,
-                    desired_state,
-                    library_root,
-                    config_dir,
-                    socket,
-                    tls_dir,
-                )
-                .await?
-            } else {
-                api_cmd::status_pretty(output, api_socket).await?
-            };
-            write_stdout(&line)
+        Some(Command::Status { socket }) => {
+            finish_output(&api_cmd::status_pretty(output, socket).await?, progress)
         }
         Some(Command::Encode(EncodeArgs {
-            command:
-                EncodeCommand::Scan {
-                    library_root,
-                    state_db,
-                },
+            command: EncodeCommand::Scan { library_root },
         })) => {
-            let line = encode_cmd::scan(&SystemExec, cli.json, library_root, state_db).await?;
-            write_stdout(&line)
+            let line = encode_cmd::scan(&SystemExec, json, library_root).await?;
+            finish_output(&line, progress)
         }
         Some(Command::Encode(EncodeArgs {
             command:
                 EncodeCommand::Run {
                     title,
-                    state_db,
                     library_root,
                     desired_state,
                     config_dir,
@@ -959,47 +872,38 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         })) => {
             let line = encode_cmd::run(
                 &SystemExec,
-                cli.json,
+                json,
                 title,
-                state_db,
+                None,
                 library_root,
                 desired_state,
                 config_dir,
             )
             .await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Encode(EncodeArgs {
-            command: EncodeCommand::Pause { off, state_db },
+            command: EncodeCommand::Pause { off },
         })) => {
-            let line = encode_cmd::pause(cli.json, off, state_db).await?;
-            write_stdout(&line)
+            let line = encode_cmd::pause(json, off).await?;
+            finish_output(&line, progress)
         }
         Some(Command::Reclaim(ReclaimArgs {
             command:
                 ReclaimCommand::Preview {
-                    state_db,
                     library_root,
                     socket,
                     tls_dir,
                     config_dir,
                 },
         })) => {
-            let line = reclaim::preview(
-                cli.json,
-                state_db,
-                library_root,
-                socket,
-                tls_dir,
-                config_dir,
-            )
-            .await?;
-            write_stdout(&line)
+            let line =
+                reclaim::preview(json, None, library_root, socket, tls_dir, config_dir).await?;
+            finish_output(&line, progress)
         }
         Some(Command::Reclaim(ReclaimArgs {
             command:
                 ReclaimCommand::Apply {
-                    state_db,
                     library_root,
                     socket,
                     tls_dir,
@@ -1007,109 +911,43 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     max,
                 },
         })) => {
-            let line = reclaim::apply(
-                cli.json,
-                state_db,
-                library_root,
-                socket,
-                tls_dir,
-                config_dir,
-                max,
-            )
-            .await?;
-            write_stdout(&line)
+            let line =
+                reclaim::apply(json, None, library_root, socket, tls_dir, config_dir, max).await?;
+            finish_output(&line, progress)
         }
-        Some(Command::Hold(HoldArgs {
-            command:
-                HoldCommand::List {
-                    socket,
-                    tls_dir,
-                    config_dir,
-                    state_db,
-                    api_socket,
-                },
-        })) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let line = if !api_legacy::use_home(&state_db) && api_socket.is_none() {
-                hold::list(cli.json, socket, tls_dir, config_dir, state_db).await?
-            } else {
-                api_cmd::hold_list(output, api_socket).await?
-            };
-            write_stdout(&line)
-        }
-        Some(Command::Hold(HoldArgs {
-            command:
+        Some(Command::Hold(HoldArgs { command })) => {
+            let line = match command {
+                HoldCommand::List { socket } => api_cmd::hold_list(output, socket).await?,
                 HoldCommand::Approve {
-                    target: title_id,
+                    target,
                     release_id,
                     socket,
-                    tls_dir,
-                    config_dir,
-                    state_db,
-                    api_socket,
-                },
-        })) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let line = if api_legacy::use_home(&state_db) || api_socket.is_some() {
-                api_cmd::hold_decide(
-                    title_id,
-                    release_id,
-                    mediaops_core::HoldDecisionSpec::Approved,
-                    output,
-                    api_socket,
-                )
-                .await?
-            } else {
-                hold::decide(
-                    cli.json,
-                    mediaops_core::HoldDecision::Approved,
-                    title_id,
-                    release_id,
-                    socket,
-                    tls_dir,
-                    config_dir,
-                    state_db,
-                )
-                .await?
-            };
-            write_stdout(&line)
-        }
-        Some(Command::Hold(HoldArgs {
-            command:
+                } => {
+                    api_cmd::hold_decide(
+                        target,
+                        release_id,
+                        mediaops_core::HoldDecisionSpec::Approved,
+                        output,
+                        socket,
+                    )
+                    .await?
+                }
                 HoldCommand::Reject {
-                    target: title_id,
+                    target,
                     release_id,
                     socket,
-                    tls_dir,
-                    config_dir,
-                    state_db,
-                    api_socket,
-                },
-        })) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let line = if api_legacy::use_home(&state_db) || api_socket.is_some() {
-                api_cmd::hold_decide(
-                    title_id,
-                    release_id,
-                    mediaops_core::HoldDecisionSpec::Rejected,
-                    output,
-                    api_socket,
-                )
-                .await?
-            } else {
-                hold::decide(
-                    cli.json,
-                    mediaops_core::HoldDecision::Rejected,
-                    title_id,
-                    release_id,
-                    socket,
-                    tls_dir,
-                    config_dir,
-                    state_db,
-                )
-                .await?
+                } => {
+                    api_cmd::hold_decide(
+                        target,
+                        release_id,
+                        mediaops_core::HoldDecisionSpec::Rejected,
+                        output,
+                        socket,
+                    )
+                    .await?
+                }
             };
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::NewMachine(NewMachineArgs {
             command:
@@ -1118,19 +956,12 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     config_dir,
                     desired_state,
                     tls_dir,
-                    state_db,
                 },
         })) => {
-            let line = new_machine::export_machine(
-                cli.json,
-                out,
-                config_dir,
-                desired_state,
-                tls_dir,
-                state_db,
-            )
-            .await?;
-            write_stdout(&line)
+            let line =
+                new_machine::export_machine(json, out, config_dir, desired_state, tls_dir, None)
+                    .await?;
+            finish_output(&line, progress)
         }
         Some(Command::NewMachine(NewMachineArgs {
             command:
@@ -1140,20 +971,19 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                     config_dir,
                     desired_state,
                     tls_dir,
-                    state_db,
                 },
         })) => {
             let line = new_machine::import_machine(
-                cli.json,
+                json,
                 from,
                 library_root,
                 config_dir,
                 desired_state,
                 tls_dir,
-                state_db,
+                None,
             )
             .await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Doctor {
             repair,
@@ -1166,12 +996,10 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             state_db,
             api_socket,
         }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let check_nodes = api_socket.is_some() || state_db.is_none();
             // Readiness supplements the edge/key/PEM checks; a running API
             // cannot turn those security checks into a successful Node list.
             let mut line = doctor::doctor(
-                cli.json || output == api_cmd::Output::Json,
+                json || output == api_cmd::Output::Json,
                 repair,
                 confirm,
                 pin,
@@ -1182,16 +1010,14 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 state_db,
             )
             .await?;
-            if check_nodes {
-                api_cmd::doctor_nodes(api_socket).await?;
-            }
+            api_cmd::doctor_nodes(api_socket).await?;
             if output == api_cmd::Output::Json {
                 let envelope: serde_json::Value =
                     serde_json::from_str(&line).map_err(|err| AppError::Runtime(err.into()))?;
                 line = serde_json::to_string(&envelope["data"])
                     .map_err(|err| AppError::Runtime(err.into()))?;
             }
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Repair(RepairArgs {
             command:
@@ -1208,7 +1034,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 },
         })) => {
             let line = repair::repair_edge(
-                cli.json,
+                json,
                 repair,
                 confirm,
                 pin,
@@ -1221,7 +1047,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 &SystemExec,
             )
             .await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Get {
             kind,
@@ -1229,7 +1055,6 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             watch,
             socket,
         }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
             if watch {
                 return api_cmd::watch_kind(Some(kind), name, output, socket).await;
             }
@@ -1238,40 +1063,27 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             } else {
                 api_cmd::list_kind(Some(kind), output, socket).await?
             };
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Apply { file, socket }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
             let line = api_cmd::apply_file(file, output, socket).await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Delete { kind, name, socket }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
             let line = api_cmd::delete(kind, name, output, socket).await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Reconcile { socket }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
             let line = api_cmd::reconcile(output, socket).await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
         Some(Command::Sync {
             dry_run,
             request_id,
             socket,
         }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
             let line = sync_cmd::run(dry_run, request_id, output, socket).await?;
-            write_stdout(&line)
-        }
-        Some(Command::ImportLegacy {
-            config,
-            state_db,
-            socket,
-        }) => {
-            let output = api_cmd::Output::parse(cli.output.as_deref(), cli.json)?;
-            let line = api_cmd::import_legacy(config, state_db, output, socket).await?;
-            write_stdout(&line)
+            finish_output(&line, progress)
         }
     }
 }
@@ -1279,13 +1091,12 @@ async fn run(cli: Cli) -> Result<(), AppError> {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
-    tracing::info!(bin = BIN_NAME, "start");
 
     let json_flag = json_requested();
     match parse_cli(json_flag) {
         Ok(ParseOutcome::HelpOrVersion) => ExitCode::Ok,
         Ok(ParseOutcome::Parsed(cli)) => {
-            let json = json_flag || cli.json;
+            let json = json_flag;
             match run(cli).await {
                 Ok(()) => ExitCode::Ok,
                 Err(err) => finish_error(json, &err),
@@ -1300,15 +1111,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_token_matches_clap_boolish_true() {
-        assert!(json_token_requests_json("--json"));
-        assert!(json_token_requests_json("--json=true"));
-        assert!(json_token_requests_json("--json=TRUE"));
-        assert!(json_token_requests_json("--json=1"));
-        assert!(!json_token_requests_json("--json=false"));
-        assert!(!json_token_requests_json("--json=0"));
-        assert!(!json_token_requests_json("--json=maybe"));
-        assert!(!json_token_requests_json("--help"));
+    fn json_detection_accepts_output_syntax_only() {
+        for args in [vec!["-o", "json"], vec!["--output=json"], vec!["-ojson"]] {
+            assert!(args_request_json(args.into_iter().map(str::to_owned)));
+        }
+        assert!(!args_request_json(["--json".to_owned()]));
+        assert!(!args_request_json(["--output=wide".to_owned()]));
+        assert!(!args_request_json(["--".to_owned(), "-ojson".to_owned()]));
     }
 
     #[test]

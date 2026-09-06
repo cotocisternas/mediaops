@@ -95,7 +95,7 @@ fn captured_dry_run_preview_is_exact_screen_with_job_dest() {
             "          preview\n",
             "          generation 4\n",
             "          copy 1  reuse 0  present 0  blocked 0  ineligible 0\n",
-            "copy       seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv\n",
+            "copy      seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv  100 B\n",
             "          movies/The.Matrix.(1999)/The.Matrix.(1999).mkv"
         )
     );
@@ -153,11 +153,4 @@ fn json_modes_match_home_object_contracts() {
             .expect("json");
     assert_eq!(raw["kind"], "Sync");
     assert!(raw.get("ok").is_none(), "{raw}");
-    let envelope: serde_json::Value = serde_json::from_str(
-        &render_sync("sync-1", true, &obj, Output::LegacyJson).expect("envelope json"),
-    )
-    .expect("envelope");
-    assert_eq!(envelope["ok"], true);
-    assert_eq!(envelope["data"]["kind"], "Sync");
-    assert_eq!(envelope.get("error"), Some(&serde_json::Value::Null));
 }

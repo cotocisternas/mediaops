@@ -61,6 +61,9 @@ pub(crate) fn why_facts(cache: &ObjectCache, title_id: &str, now_unix: i64) -> V
     let mut lines = vec![super::line("title_id", title_id)];
     let objects: Vec<&HomeObject> = cache.live().collect();
     let generation = committed_inventory_generation(objects.iter().copied(), now_unix);
+    if generation.is_none() {
+        lines.push(super::line("inventory", "unavailable; check 6 Nodes"));
+    }
     if let Some(generation) = generation {
         for hold in open_holds(objects.iter().copied(), generation) {
             if let (Spec::Hold(spec), StatusBody::Hold(st)) = (&hold.spec, &hold.status)
@@ -81,6 +84,9 @@ pub(crate) fn why_facts(cache: &ObjectCache, title_id: &str, now_unix: i64) -> V
         matches!((&obj.spec, &obj.status), (Spec::Want(spec), StatusBody::Want(st))
             if spec.title_id == title_id && st.phase == WantPhase::Open)
     });
+    if generation.is_none() && open_want {
+        lines.push(super::line("want", "open; waiting for a current listing"));
+    }
     if let Some(generation) = generation {
         let listed = current_remote_files(objects.iter().copied(), generation)
             .into_iter()

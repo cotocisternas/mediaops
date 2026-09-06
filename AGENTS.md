@@ -22,7 +22,7 @@ Pre-rewrite files under `_bmad-output/` are historical, including session prompt
 - Talk to the seedbox only through the home unix-socket gateway. The CLI never stores `seedbox_address` as something it dials.
 - Keep `grabber = "none"` a valid path: schema folder on the box, disk at home, no *arr HTTP.
 - Honor the exclusive flock on explicit CLI maintenance (manual pull, encode run, reclaim apply, library, new-machine, seedbox apply, edge repair). Lock conflict is exit 3, never silent 0. Unattended Home API copy concurrency is Job bind + Job status, not that flock.
-- Home API `-o json` is the raw object. Legacy `--json` is one `{ok,data,error}` envelope on stdout; tracing on stderr. Human stdout is the operator UI — update the exact-screen test when you change a formatter.
+- CLI `-o json` is the raw object for every command. Retired `--json`, `import-legacy`, and offline SQLite workflow selection are not supported. Progress and tracing go to stderr. Human stdout is the operator UI — update the exact-screen test when you change a formatter.
 - Add a new workspace Cargo edge to `crates/arch-tests` first (`ALLOWED_WORKSPACE_EDGES`). `make test-arch` enforces it.
 - Keep `crates/core` free of tokio, tonic, and rusqlite. `std::fs` in that crate is legal only in `walker.rs` and `install.rs`.
 - Discover *arr / SAB keys from the box config at runtime. Never commit them, never echo `********`.

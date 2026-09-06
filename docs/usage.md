@@ -4,17 +4,41 @@ After [setup](setup.md), `mediaops-home` keeps the control plane up. You apply a
 
 `why` and `watch` take a spoken name (`Hearts`, `Mr Robot`) or a title id. A name only resolves when the library, a job, the hold inbox, or a listing already knows it. Prefer a `TitleId` in scripts. `hold approve` / `reject` take the id from `hold list` (`movie:tmdb:4539`).
 
-Home API verbs (`get`, `apply`, `delete`) print a tab-separated pipeline table by default (TitleId when available, otherwise object name, in `$1`). `-o json` is the **raw object** (no `{ok,data,error}` envelope). `-o wide` adds columns, aligned with spaces for terminal reading. Legacy verbs still accept `--json` as one `{ok,data,error}` envelope. Tracing goes to stderr.
+Object commands (`get`, `apply`, `delete`) show headed, aligned columns in a
+terminal and tab-separated rows when piped. Use `-o table` for explicit TSV or
+`-o wide` for readable columns with Job IDs, progress, worker, and failure details.
+Every command accepts `-o json` for a raw result object or list. Errors use
+`{"error":{"code":"…","message":"…"}}` and a nonzero exit code. Progress and
+human errors go to stderr; JSON mode suppresses progress.
 
-The default Home-backed workflows require the Home API. An outage is an error,
-not an implicit switch to `state.db`. An isolated custom `--state-db` selects the
-supported legacy path; commands that need the gateway still need it. The default
-state file or a file beside `api.db` uses Home. Object commands use `--socket` for
-the API. `list` / `pull` use `--socket` for the gateway and do not accept
-`--api-socket`; manual pull uses the default Home API address. Home-backed
-`status` / `why` / `hold` use `--api-socket` and do not use `--socket` to select
-their API. `doctor` uses both endpoints for different checks. See the
+Home workflows require the Home API. Object commands and `status` / `why` / `hold`
+use `--socket` for the API. `list` / `pull` use `--socket` for the gateway; manual
+pull uses the default Home API address. `doctor` uses `--api-socket` for Home
+readiness and `--socket` for gateway checks. See the
 [socket-routing table](config.md#default-paths).
+
+The v0.2.0 CLI has one interface. Use `-o json`, `--enable-service`, and current
+`new-machine` bundles. Retired `--json`, `--enable-timer`, `import-legacy`, and Home
+`--state-db` selection fail with usage exit 2.
+
+### Progress
+
+Long commands report their start and elapsed activity on stderr. Reindex and pull
+update in place on a terminal; other operations and redirected logs use periodic
+lines. A stopped
+operation reports that it stopped before the error. The final result stays on
+stdout, so redirects and scripts can consume it separately.
+
+```bash
+mediaops library reindex --library-root /mnt/storage/videos
+mediaops library reindex --library-root /mnt/storage/videos -o json > reindex.json
+```
+
+Reindex shows discovery, hashing, and publication stages, the current file,
+verified bytes, percentage, and elapsed time. Its final human result includes the
+indexed file count, library path, and elapsed time. JSON returns `{"indexed":N}`.
+Pull progress also shows transfer rate and ETA when available. The library flag is
+`--library-root`.
 
 ## Home TUI
 
@@ -150,7 +174,7 @@ series:key:foundation.2021
 quiet
 ```
 
-Home `why` prints only facts that exist: `hold` (open inbox reason + size), `grab` (open Want, not listed), `want` (open Want, listed on the box), `pull` (Job phase), `library` (observed path or drifted), or `quiet`. There is no legacy `import` line.
+Home `why` prints only facts that exist: `hold` (open inbox reason + size), `grab` (open Want, not listed), `want` (open Want, listed on the box), `pull` (Job phase), `library` (observed path or drifted), or `quiet`.
 
 ## Occasional
 
@@ -166,7 +190,7 @@ mediaops encode run
 mediaops doctor
 ```
 
-Manual `pull` uses the current Cluster settings and requires the API. It pauses scheduling and refuses while a bound Job is active. With `--install`, success includes a verified Title file record; it does not create a legacy `job_id`. The normal unattended workflow is `watch` plus the pull worker.
+Manual `pull` uses the current Cluster settings and requires the API. It pauses scheduling and refuses while a bound Job is active. With `--install`, success includes a verified Title file record; the result identifies the staged and installed paths. The normal unattended workflow is `watch` plus the pull worker.
 
 ### `list`
 
@@ -201,7 +225,7 @@ copy       seedbox / movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
            movies/The.Matrix.(1999)/The.Matrix.(1999).mkv
 ```
 
-`-o json` is the raw Sync object. `--json` is one `{ok,data,error}` envelope.
+`-o json` is the raw Sync object.
 A transport error names the request ID so you can inspect or retry with
 `--request-id`. Dry-run and a no-queue result never print scheduled success.
 
@@ -234,7 +258,7 @@ Home GPU only. Not linked into `mediaopsd`. Empty is `nothing to encode`.
 encode    The Matrix (1999)
 ```
 
-`encode pause` / `encode pause --off` changes `Cluster.spec.encodePause`, checked between jobs. It is not a signal to a running ffmpeg. Explicit offline legacy mode keeps its machine flag.
+`encode pause` / `encode pause --off` changes `Cluster.spec.encodePause`, checked between jobs. It is not a signal to a running ffmpeg.
 
 Policy (hardcoded, not a config field):
 
@@ -249,11 +273,9 @@ The live file is replaced only after the convert succeeds. The original moves to
 
 ### `doctor` / `repair edge`
 
-`doctor` is read-only: edge invariant, key presence, and PEM-in-git scan. By
-default it also requires the Home API and Ready scheduler, inventory, and pull
-Nodes. `ok` means all checks passed. An explicit `--state-db` skips the additional
-Home readiness check unless `--api-socket` is also supplied; it does not skip the
-gateway's edge and credential checks.
+`doctor` is read-only: edge invariant, key presence, and PEM-in-git scan. It also
+requires the Home API and Ready scheduler, inventory, and pull Nodes. `ok` means
+all checks passed; local capability path overrides do not skip Home readiness.
 
 `mediaops repair edge --repair --confirm` performs nginx maintenance over SSH and
 edge apply/verification through the gateway Control API. Bare `repair edge`
@@ -273,7 +295,6 @@ explicit repair command when intending a write.
 | `get` / `apply` / `delete` | Home API. `-o json` is the raw object. |
 | `watch TITLE` | Record a Want. Exits 0; does not wait for playable. |
 | `reconcile` | Kick in-process controllers. |
-| `import-legacy` | One-shot Apply of old `config.toml` + `state.db`. |
 | `why TITLE` / `status` | Peek at Home API state. |
 | `list` | Allowlisted remotes through the home unix-socket gateway. |
 | `pull` | One remote file into `_incoming/` with `.partial` resume. Maintenance: pauses scheduling, refuses a bound Job. |
@@ -285,18 +306,20 @@ explicit repair command when intending a write.
 
 Relocation refuses incompatible nonterminal Jobs, including unbound Pending Jobs: their library root is an immutable snapshot. Let that work finish before relocating. A failed maintenance command can leave `Cluster.spec.lock` set; inspect and resolve the cause, then unlock explicitly with `get` / edit / `apply`. Do not treat a leftover lock as auto-cleared.
 
-`new-machine import` requires an empty Home Job list (including terminal Jobs). A retry of the same bundle is success: it publishes only missing Title rows and keeps newer `current_b3` / drift. A foreign Title, an extra path, or a changed `install_b3` is refused and the previous Cluster lock is restored. `--library-root` must already match `Cluster.spec.libraryRoot` when Titles exist.
+`new-machine import` requires a current bundle with `cluster.json`. It never
+reconstructs a missing `secret.json` from `config.toml`, and it requires an empty
+Home Job list (including terminal Jobs). A retry of the same bundle is success: it publishes only missing Title rows and keeps newer `current_b3` / drift. A foreign Title, an extra path, or a changed `install_b3` is refused and the previous Cluster lock is restored. `--library-root` must already match `Cluster.spec.libraryRoot` when Titles exist.
 
 ### Output shapes
 
 | Mode | What stdout is |
 | ---- | -------------- |
-| default table | TSV pipeline (TitleId when available, otherwise object name, in `$1`). Empty Job list is a blank table. |
-| `-o wide` | Space-aligned object columns for a terminal; maintenance counters retain their TSV output. |
-| `-o json` | Raw object or `{items:[…]}` list. No `{ok,data,error}` envelope. |
-| `--json` | One `{ok,data,error}` envelope. Do not combine with `-o`. |
+| default | Headed object columns on a terminal; TSV when piped. Dedicated status and maintenance commands keep their human summaries. |
+| `-o table` | Explicit TSV for object commands (TitleId when available, otherwise object name, in `$1`). |
+| `-o wide` | Headed, aligned object columns including Job IDs and activity details; maintenance commands retain their summaries. |
+| `-o json` | Raw result object or `{items:[…]}` list. |
 
-`reconcile` table is `reconcileGeneration\tN`. `import-legacy` table is `imported\tN`. `-o json` for those is `{"reconcileGeneration":N}` / `{"imported":N}`. Tracing stays on stderr.
+`reconcile` table is `reconcileGeneration\tN`; JSON is `{"reconcileGeneration":N}`. Diagnostic tracing stays on stderr.
 
 `TITLE` is `movie:key:<title>.<year>`, `series:key:<title>.<year>`, `album:key:<artist>.<album>`, or an *arr id `movie:tmdb:…` / `series:tvdb:…` / `album:mbid:…`. See [identity](config.md#identity).
 

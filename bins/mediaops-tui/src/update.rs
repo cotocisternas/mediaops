@@ -19,11 +19,30 @@ pub enum UpdateEffect {
 }
 
 pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
+    if !update.ui.mutation_pending
+        && !update.ui.sync_pending
+        && matches!(
+            command,
+            Command::Screen(_)
+                | Command::NextScreen
+                | Command::PrevScreen
+                | Command::RowDelta(_)
+                | Command::PageDelta(_)
+                | Command::RowHome
+                | Command::RowEnd
+                | Command::EnterDetail
+                | Command::Back
+        )
+        && let Some(message) = update.ui.message.take()
+    {
+        update.ui.last_message = Some(message);
+    }
     match command {
         Command::Ignore => UpdateEffect::None,
         Command::Quit => UpdateEffect::Quit,
         Command::Help => {
             update.ui.help = !update.ui.help;
+            update.ui.help_offset = 0;
             update.ui.rendered_target = None;
             UpdateEffect::None
         }
@@ -32,6 +51,7 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             update.ui.rows = rows;
             update.ui.rendered_target = None;
             clamp_report_offset(update.ui);
+            clamp_help_offset(update.ui);
             UpdateEffect::None
         }
         Command::Screen(screen) => {
@@ -53,6 +73,10 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
         }
         Command::RowDelta(delta) => {
             if update.ui.help {
+                let signed =
+                    i16::try_from(delta).unwrap_or(if delta < 0 { i16::MIN } else { i16::MAX });
+                update.ui.help_offset = update.ui.help_offset.saturating_add_signed(signed);
+                clamp_help_offset(update.ui);
                 return UpdateEffect::None;
             }
             if update.ui.report.is_some() {
@@ -85,7 +109,9 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             apply(update, Command::RowDelta(jump))
         }
         Command::RowHome => {
-            if update.ui.report.is_some() {
+            if update.ui.help {
+                update.ui.help_offset = 0;
+            } else if update.ui.report.is_some() {
                 update.ui.report_offset = 0;
             } else if update.ui.in_detail {
                 update.ui.detail_offset = 0;
@@ -96,7 +122,10 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             UpdateEffect::None
         }
         Command::RowEnd => {
-            if update.ui.report.is_some() {
+            if update.ui.help {
+                update.ui.help_offset = u16::MAX;
+                clamp_help_offset(update.ui);
+            } else if update.ui.report.is_some() {
                 update.ui.report_offset = u16::MAX;
                 clamp_report_offset(update.ui);
             } else if update.ui.in_detail {
@@ -110,7 +139,7 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
             UpdateEffect::None
         }
         Command::EnterDetail => {
-            if update.row_count > 0 {
+            if update.row_count > 0 && !update.ui.help && update.ui.report.is_none() {
                 update.ui.in_detail = true;
                 update.ui.rendered_target = None;
             }
@@ -144,9 +173,18 @@ pub fn apply(update: Update<'_>, command: Command) -> UpdateEffect {
                 return UpdateEffect::None;
             }
             update.ui.mutation_pending = true;
+            update.ui.pending_started = Some(std::time::Instant::now());
             UpdateEffect::RequestMutation(mutation)
         }
     }
+}
+
+fn clamp_help_offset(ui: &mut UiModel) {
+    let lines = crate::view_text::help_lines(ui).len();
+    let visible = usize::from(ui.rows.saturating_sub(5)).max(1);
+    ui.help_offset = ui
+        .help_offset
+        .min(u16::try_from(lines.saturating_sub(visible)).unwrap_or(u16::MAX));
 }
 
 fn clamp_report_offset(ui: &mut UiModel) {
@@ -168,5 +206,6 @@ fn request_sync(update: Update<'_>, dry_run: bool) -> UpdateEffect {
         update.ui.sync_key_held = true;
     }
     update.ui.sync_pending = true;
+    update.ui.pending_started = Some(std::time::Instant::now());
     UpdateEffect::RequestSync { dry_run }
 }

@@ -703,38 +703,6 @@ pub fn lock_path(state_db: &Path) -> PathBuf {
         .join("mediaops.lock")
 }
 
-pub fn default_plans_dir() -> PathBuf {
-    default_state_dir().join("plans")
-}
-
-/// If another process holds the exclusive flock, return the lockfile JSON.
-pub fn lock_holder_if_contended(path: &Path) -> Result<Option<serde_json::Value>, BootstrapError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(BootstrapError::Io(err.to_string())),
-    };
-    match fs4::FileExt::try_lock_shared(&file) {
-        Ok(()) => {
-            let _ = fs4::FileExt::unlock(&file);
-            Ok(None)
-        }
-        Err(fs4::TryLockError::WouldBlock) => {
-            let text =
-                std::fs::read_to_string(path).map_err(|err| BootstrapError::Io(err.to_string()))?;
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return Ok(Some(serde_json::json!({"unparsed": ""})));
-            }
-            match serde_json::from_str(trimmed) {
-                Ok(value) => Ok(Some(value)),
-                Err(_) => Ok(Some(serde_json::json!({ "unparsed": trimmed }))),
-            }
-        }
-        Err(err) => Err(BootstrapError::Io(err.to_string())),
-    }
-}
-
 pub fn exclusive_lock(path: &Path) -> Result<File, BootstrapError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| BootstrapError::Io(err.to_string()))?;

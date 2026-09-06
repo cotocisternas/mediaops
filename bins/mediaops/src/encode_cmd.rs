@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use mediaops_core::{
-    DesiredState, EncodeEvent, Envelope, ExecPort, Job, JobEvent, JobKind, JobState, TitleId,
-    encode_ready, parse_placement, render_placement,
-};
+use mediaops_core::{DesiredState, Envelope, ExecPort, TitleId, parse_placement};
 use mediaops_encode::{
     EncodeDecision, TranscodeSpec, classify, encode_to_converting, probe_media, replace_converting,
     session_cap, should_start_next,
@@ -15,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::AppError;
 use crate::bootstrap;
 use crate::out::{
-    Style, Tone, finish, hints_from_index, hints_from_jobs, human_from_path, human_title_id,
-    human_title_id_str, merge_hints, resolve_title, row,
+    Style, Tone, finish, hints_from_index, human_from_path, human_title_id, human_title_id_str,
+    resolve_title, row,
 };
 
 #[derive(Debug, Serialize)]
@@ -47,28 +44,18 @@ pub async fn scan(
     exec: &impl ExecPort,
     json: bool,
     library_root: Option<PathBuf>,
-    state_db: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    let library_root = if crate::api_legacy::use_home(&state_db) {
-        crate::api_legacy::HomeLibrary::load()
-            .await?
-            .root(library_root)?
-    } else {
-        let store = Store::open(state_db.unwrap_or_else(bootstrap::default_state_db))
-            .await
-            .map_err(crate::api_legacy::error)?;
-        match library_root {
-            Some(root) => root,
-            None => store
-                .get_machine("library_root")
-                .await
-                .map_err(crate::api_legacy::error)?
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    AppError::Usage("pass --library-root or library bootstrap".into())
-                })?,
-        }
-    };
+    let library_root = crate::home_library::HomeLibrary::load()
+        .await?
+        .root(library_root)?;
+    scan_root(exec, json, library_root).await
+}
+
+async fn scan_root(
+    exec: &impl ExecPort,
+    json: bool,
+    library_root: PathBuf,
+) -> Result<String, AppError> {
     let movies = library_root.join("movies");
     let mut files = Vec::new();
     if movies.is_dir() {
@@ -108,7 +95,7 @@ fn format_scan(files: &[ScanFile]) -> String {
         let (verb, tone, meta) = match file.decision.as_str() {
             "nvenc_h264" => ("encode", Tone::Go, ""),
             "keep" => ("keep", Tone::Quiet, ""),
-            "refuse" => ("skip", Tone::Quiet, "hdr"),
+            "refuse" => ("skip", Tone::Quiet, "protected by encode policy"),
             other => ("scan", Tone::Quiet, other),
         };
         lines.push(row(style, verb, tone, &title, meta));
@@ -116,46 +103,32 @@ fn format_scan(files: &[ScanFile]) -> String {
     finish(lines)
 }
 
-pub async fn pause(json: bool, off: bool, state_db: Option<PathBuf>) -> Result<String, AppError> {
-    if crate::api_legacy::use_home(&state_db) {
-        let mut home = crate::api_legacy::HomeLibrary::load().await?;
-        if let mediaops_core::Spec::Cluster(spec) = &mut home.cluster.spec {
-            spec.encode_pause = !off;
-        }
-        home.api
-            .patch(home.cluster, "spec")
-            .await
-            .map_err(crate::api_legacy::error)?;
-        return if json {
-            serde_json::to_string(&Envelope::ok(PauseData { encode_pause: !off }))
-                .map_err(crate::api_legacy::error)
-        } else {
-            Ok(if off {
-                "encode    running"
-            } else {
-                "encode    paused"
-            }
-            .into())
-        };
+pub async fn pause(json: bool, off: bool) -> Result<String, AppError> {
+    pause_home(json, off, crate::home_library::HomeLibrary::load().await?).await
+}
+
+async fn pause_home(
+    json: bool,
+    off: bool,
+    mut home: crate::home_library::HomeLibrary,
+) -> Result<String, AppError> {
+    if let mediaops_core::Spec::Cluster(spec) = &mut home.cluster.spec {
+        spec.encode_pause = !off;
     }
-    let state_db = crate::api_legacy::state_db_path(state_db);
-    let store = Store::open(&state_db)
+    home.api
+        .patch(home.cluster, "spec")
         .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let value = if off { "0" } else { "1" };
-    store
-        .put_machine("encode_pause", value)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let data = PauseData { encode_pause: !off };
+        .map_err(crate::home_library::error)?;
     if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
+        serde_json::to_string(&Envelope::ok(PauseData { encode_pause: !off }))
+            .map_err(crate::home_library::error)
     } else {
-        Ok(if data.encode_pause {
-            "encode    paused".into()
+        Ok(if off {
+            "encode    enabled"
         } else {
-            "encode    running".into()
-        })
+            "encode    paused"
+        }
+        .into())
     }
 }
 
@@ -168,208 +141,21 @@ pub async fn run(
     desired_state: Option<PathBuf>,
     config_dir: Option<PathBuf>,
 ) -> Result<String, AppError> {
-    if crate::api_legacy::use_home(&state_db) {
-        return run_home(
-            exec,
-            json,
-            title,
-            state_db,
-            library_root,
-            desired_state,
-            config_dir,
-        )
-        .await;
-    }
-    let config_dir = config_dir.unwrap_or_else(bootstrap::default_config_dir);
-    let state_db = crate::api_legacy::state_db_path(state_db);
-    let lock_path = bootstrap::lock_path(&state_db);
-    let _lock = bootstrap::exclusive_lock(&lock_path).map_err(map_bootstrap)?;
-    let desired_state =
-        desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
-    let store = Store::open(&state_db)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let library_root = match library_root {
-        Some(p) => p,
-        None => store
-            .get_machine("library_root")
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-            .map(PathBuf::from)
-            .ok_or_else(|| AppError::Usage("pass --library-root or library bootstrap".into()))?,
-    };
-    let ds_text =
-        std::fs::read_to_string(&desired_state).map_err(|err| AppError::Runtime(err.into()))?;
-    let ds = DesiredState::from_toml(&ds_text)
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let nvenc_cap = store
-        .get_machine("nvenc_cap")
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let hevc = nvenc_cap > 0;
-    let cap = session_cap(ds.max_nvenc(), nvenc_cap, hevc);
-    let paused = store
-        .get_machine("encode_pause")
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-        .as_deref()
-        == Some("1");
-    let ffmpeg = store
-        .get_machine("ffmpeg_path")
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "ffmpeg".into());
-
-    if let Some(raw) = title {
-        let title_id = resolve_encode_title(&store, &raw).await?;
-        if cap == 0 {
-            return Err(AppError::Policy("no NVENC capacity".into()));
-        }
-        let path = resolve_path(&store, &library_root, &title_id).await?;
-        let media = probe_media(exec, &path)
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        match classify(title_id.kind(), &media) {
-            EncodeDecision::Refuse => {
-                return Err(AppError::Policy(
-                    "encode refused by policy (HDR/DV/2160p)".into(),
-                ));
-            }
-            EncodeDecision::Keep => {
-                let data = EncodeRunData {
-                    ran: 0,
-                    skipped: 1,
-                    paused,
-                };
-                return if json {
-                    serde_json::to_string(&Envelope::ok(data))
-                        .map_err(|e| AppError::Runtime(e.into()))
-                } else {
-                    Ok(row(
-                        Style::stdout(),
-                        "keep",
-                        Tone::Quiet,
-                        &human_title_id(&title_id),
-                        "",
-                    ))
-                };
-            }
-            EncodeDecision::NvencH264 => {}
-        }
-        if paused {
-            let data = EncodeRunData {
-                ran: 0,
-                skipped: 1,
-                paused: true,
-            };
-            return if json {
-                serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-            } else {
-                Ok("encode    paused".into())
-            };
-        }
-        let (_, placement) = parse_placement(path.strip_prefix(&library_root).unwrap_or(&path))
-            .or_else(|_| parse_placement(&path))
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        let spec = TranscodeSpec {
-            library_root: &library_root,
-            title_id: &title_id,
-            placement: &placement,
-            ffmpeg: &ffmpeg,
-        };
-        let converting = encode_to_converting(exec, spec)
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        let (dest, digest) = replace_converting(spec, converting)
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        store
-            .record_replace(&library_rel(&library_root, &dest), &digest)
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        let data = EncodeRunData {
-            ran: 1,
-            skipped: 0,
-            paused: false,
-        };
-        return if json {
-            serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-        } else {
-            Ok(row(
-                Style::stdout(),
-                "encoded",
-                Tone::Go,
-                &human_title_id(&title_id),
-                "",
-            ))
-        };
-    }
-
-    if cap == 0 {
-        let data = EncodeRunData {
-            ran: 0,
-            skipped: 0,
-            paused,
-        };
-        return if json {
-            serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-        } else {
-            Ok("nothing to encode".into())
-        };
-    }
-
-    let jobs = store
-        .list_jobs()
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let mut ran = 0usize;
-    let mut skipped = 0usize;
-    for job in jobs {
-        if !matches!(job.state(), JobState::Encode(_)) {
-            continue;
-        }
-        if !should_start_next(paused, cap) {
-            skipped += 1;
-            continue;
-        }
-        let parent = match job.parent_job_id() {
-            Some(id) => store
-                .get_job(id)
-                .await
-                .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?,
-            None => None,
-        };
-        let indexed = !store
-            .get_title(job.title_id())
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-            .is_empty();
-        let retry = matches!(
-            job.state(),
-            JobState::Encode(mediaops_core::EncodeState::Encoding)
-                | JobState::Encode(mediaops_core::EncodeState::Replacing)
-        );
-        if !retry && !encode_ready(&job, parent.as_ref(), indexed) {
-            continue;
-        }
-        match encode_one(exec, &store, &library_root, &job, &ffmpeg).await {
-            Ok(()) => ran += 1,
-            Err(AppError::Policy(_)) => skipped += 1,
-            Err(err) => return Err(err),
-        }
-    }
-    let data = EncodeRunData {
-        ran,
-        skipped,
-        paused,
-    };
-    if json {
-        serde_json::to_string(&Envelope::ok(data)).map_err(|e| AppError::Runtime(e.into()))
-    } else {
-        Ok(format_encode_run(&data))
-    }
+    let state_db = crate::home_library::state_db_path(state_db);
+    let _lock =
+        bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
+    let home = crate::home_library::HomeLibrary::load().await?;
+    run_home(
+        exec,
+        json,
+        title,
+        state_db,
+        library_root,
+        desired_state,
+        config_dir,
+        home,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -377,15 +163,12 @@ async fn run_home(
     exec: &impl ExecPort,
     json: bool,
     title: Option<String>,
-    state_db: Option<PathBuf>,
+    state_db: PathBuf,
     library_root: Option<PathBuf>,
     desired_state: Option<PathBuf>,
     config_dir: Option<PathBuf>,
+    mut home: crate::home_library::HomeLibrary,
 ) -> Result<String, AppError> {
-    let state_db = crate::api_legacy::state_db_path(state_db);
-    let _lock =
-        bootstrap::exclusive_lock(&bootstrap::lock_path(&state_db)).map_err(map_bootstrap)?;
-    let mut home = crate::api_legacy::HomeLibrary::load().await?;
     let root = home.root(library_root)?;
     recover_encode_proofs(&home, &root).await?;
     let rows = home.rows(false).await?;
@@ -416,7 +199,7 @@ async fn run_home(
     let config = desired_state.unwrap_or_else(|| bootstrap::default_desired_state(&config_dir));
     let ds = DesiredState::from_toml(&std::fs::read_to_string(config).map_err(runtime_display)?)
         .map_err(runtime_display)?;
-    // The legacy database retains local GPU capabilities and ffmpeg discovery;
+    // The local database retains GPU capabilities and ffmpeg discovery;
     // all library proofs and the pause flag above come from Home.
     let capabilities = Store::open(state_db).await.map_err(runtime_display)?;
     let nvenc_cap = capabilities
@@ -521,7 +304,7 @@ async fn run_home(
     }.await;
     if let Err(err) = outcome {
         return Err(if maintenance.is_some() {
-            crate::api_legacy::maintenance_failure(err)
+            crate::home_library::maintenance_failure(err)
         } else {
             err
         });
@@ -582,7 +365,7 @@ fn persist_encode_proof(
 }
 
 async fn recover_encode_proofs(
-    home: &crate::api_legacy::HomeLibrary,
+    home: &crate::home_library::HomeLibrary,
     root: &std::path::Path,
 ) -> Result<(), AppError> {
     let directory = root.join("_incoming").join("encode-proofs");
@@ -600,7 +383,7 @@ async fn recover_encode_proofs(
         let proof: PendingEncodeProof =
             serde_json::from_slice(&std::fs::read(entry.path()).map_err(runtime_display)?)
                 .map_err(runtime_display)?;
-        let path = crate::api_legacy::schema_relative(root, &proof.path)?;
+        let path = crate::home_library::schema_relative(root, &proof.path)?;
         let row = rows
             .iter()
             .find(|row| row.path() == path && row.title_id().render() == proof.title_id)
@@ -653,144 +436,6 @@ fn format_encode_run(data: &EncodeRunData) -> String {
     )
 }
 
-async fn resolve_encode_title(store: &Store, raw: &str) -> Result<TitleId, AppError> {
-    if let Ok(id) = TitleId::parse(raw) {
-        return Ok(id);
-    }
-    let titles = store
-        .list_titles()
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let jobs = store
-        .list_jobs()
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    resolve_title(
-        raw,
-        &merge_hints(
-            hints_from_index(&titles)
-                .into_iter()
-                .chain(hints_from_jobs(&jobs))
-                .collect(),
-        ),
-    )
-    .map_err(AppError::Usage)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum AfterInstall {
-    Ran,
-    Skipped,
-}
-
-/// Post-install encode trigger. Deleting the `run` verb removed its only
-/// caller and `mediaops-pull` cannot take it over: `mediaops-encode` is barred
-/// from that binary's workspace closure. Kept, tested, and unwired until the
-/// new pipeline grows a place for it.
-#[allow(dead_code)]
-pub async fn after_install(
-    exec: &impl ExecPort,
-    store: &Store,
-    library_root: &std::path::Path,
-    title_id: &TitleId,
-    dest: &std::path::Path,
-    pull: &Job,
-    ffmpeg: &str,
-    cap: u32,
-    paused: bool,
-) -> Result<AfterInstall, AppError> {
-    if paused || cap == 0 {
-        return Ok(AfterInstall::Skipped);
-    }
-    let media = probe_media(exec, dest)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("probe_error: {err}")))?;
-    match classify(title_id.kind(), &media) {
-        EncodeDecision::NvencH264 => {}
-        EncodeDecision::Keep | EncodeDecision::Refuse => return Ok(AfterInstall::Skipped),
-    }
-    let encode = store
-        .create_job(JobKind::Encode, title_id, Some(pull.id()))
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    if !encode_ready(&encode, Some(pull), true) {
-        return Ok(AfterInstall::Skipped);
-    }
-    encode_one(exec, store, library_root, &encode, ffmpeg).await?;
-    Ok(AfterInstall::Ran)
-}
-
-async fn encode_one(
-    exec: &impl ExecPort,
-    store: &Store,
-    library_root: &std::path::Path,
-    job: &Job,
-    ffmpeg: &str,
-) -> Result<(), AppError> {
-    let path = resolve_path(store, library_root, job.title_id()).await?;
-    let rel = path.strip_prefix(library_root).unwrap_or(path.as_path());
-    let (_, placement) =
-        parse_placement(rel).map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    let spec = TranscodeSpec {
-        library_root,
-        title_id: job.title_id(),
-        placement: &placement,
-        ffmpeg,
-    };
-    let mut state = job.state();
-    if matches!(state, JobState::Encode(mediaops_core::EncodeState::Queued)) {
-        let started = store
-            .advance(job.id(), JobEvent::Encode(EncodeEvent::Start))
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        state = started.state();
-    }
-    if matches!(
-        state,
-        JobState::Encode(mediaops_core::EncodeState::Encoding)
-    ) {
-        let converting = encode_to_converting(exec, spec)
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        let _ = converting;
-        let next = store
-            .advance(job.id(), JobEvent::Encode(EncodeEvent::FinishEncode))
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        state = next.state();
-    }
-    if matches!(
-        state,
-        JobState::Encode(mediaops_core::EncodeState::Replacing)
-    ) {
-        let filename = placement_filename(&placement)?;
-        let converting = mediaops_encode::converting_path(library_root, job.title_id(), &filename)
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        let (dest, digest) = replace_converting(spec, converting)
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        store
-            .record_replace(&library_rel(library_root, &dest), &digest)
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-        store
-            .advance(job.id(), JobEvent::Encode(EncodeEvent::Replace))
-            .await
-            .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?;
-    }
-    Ok(())
-}
-
-/// The rendered file name of a placement: the one PathSchema produces.
-fn placement_filename(placement: &mediaops_core::Placement) -> Result<String, AppError> {
-    let rendered = render_placement(placement).map_err(runtime_display)?;
-    rendered
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_string)
-        .ok_or_else(|| AppError::Runtime(anyhow::anyhow!("placement renders no file name")))
-}
-
 /// Library-relative form of an absolute path under `library_root` (what the
 /// title index is keyed on).
 fn library_rel(library_root: &std::path::Path, abs: &std::path::Path) -> String {
@@ -798,30 +443,6 @@ fn library_rel(library_root: &std::path::Path, abs: &std::path::Path) -> String 
         .unwrap_or(abs)
         .to_string_lossy()
         .into_owned()
-}
-
-/// The library file for a title. Encode only ever targets movies, so a title
-/// is one file; the first indexed row wins, then the disk.
-async fn resolve_path(
-    store: &Store,
-    library_root: &std::path::Path,
-    title_id: &TitleId,
-) -> Result<PathBuf, AppError> {
-    if let Some(entry) = store
-        .get_title(title_id)
-        .await
-        .map_err(|err| AppError::Runtime(anyhow::anyhow!("{err}")))?
-        .into_iter()
-        .find(|entry| !entry.path_missing())
-    {
-        return Ok(library_root.join(entry.path()));
-    }
-    let found = scan_schema_files(library_root)
-        .map_err(runtime_display)?
-        .into_iter()
-        .find(|file| &file.title_id == title_id)
-        .map(|file| library_root.join(file.path));
-    found.ok_or_else(|| AppError::Usage(format!("no library file for {}", title_id.render())))
 }
 
 fn map_bootstrap(err: bootstrap::BootstrapError) -> AppError {
@@ -840,13 +461,13 @@ fn runtime_display(err: impl std::fmt::Display) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mediaops_core::{Blake3Hex, ExecCommand, ExecError, ExecOutput, Placement, render};
+    use mediaops_core::{Blake3Hex, ExecCommand, ExecError, ExecOutput};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     #[tokio::test]
     async fn interrupted_proof_publication_recovers_without_encoding_again() {
-        let (home, dir, server) = crate::api_legacy::test_home("encode-proof-recovery").await;
+        let (home, dir, server) = crate::home_library::test_home("encode-proof-recovery").await;
         let root = home.root(None).expect("root");
         let relative = "movies/The.Matrix.(1999)/The.Matrix.(1999).mkv";
         let path = root.join(relative);
@@ -977,23 +598,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_on_and_off_persists_and_json() {
-        let dir = crate::test_support::scratch("encode-pause");
-        let db = dir.join("state.db");
-        let on = pause(true, false, Some(db.clone())).await.expect("on");
+    async fn pause_on_and_off_updates_home_cluster() {
+        let (home, dir, server) = crate::home_library::test_home("pause").await;
+        let api = home.api.clone();
+        let on = pause_home(true, false, home).await.expect("on");
         let value: serde_json::Value = serde_json::from_str(&on).expect("json");
         assert_eq!(value["data"]["encode_pause"], true);
-        let store = Store::open(&db).await.expect("store");
-        assert_eq!(
-            store
-                .get_machine("encode_pause")
-                .await
-                .expect("get")
-                .as_deref(),
-            Some("1")
-        );
-        let off = pause(false, true, Some(db)).await.expect("off");
-        assert_eq!(off, "encode    running");
+        let cluster = api
+            .get(mediaops_core::Kind::Cluster, mediaops_core::CLUSTER_NAME)
+            .await
+            .expect("cluster");
+        assert!(matches!(&cluster.spec, mediaops_core::Spec::Cluster(spec) if spec.encode_pause));
+        let off = pause_home(
+            false,
+            true,
+            crate::home_library::HomeLibrary {
+                api: api.clone(),
+                cluster,
+            },
+        )
+        .await
+        .expect("off");
+        assert_eq!(off, "encode    enabled");
+        let cluster = api
+            .get(mediaops_core::Kind::Cluster, mediaops_core::CLUSTER_NAME)
+            .await
+            .expect("cluster");
+        assert!(matches!(&cluster.spec, mediaops_core::Spec::Cluster(spec) if !spec.encode_pause));
+        assert!(!dir.join("state.db").exists());
+        server.abort();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1001,20 +634,9 @@ mod tests {
     async fn scan_empty_and_movies_only_with_canned_probe() {
         let dir = crate::test_support::scratch("encode-scan");
         let library = crate::test_support::library_root(&dir);
-        let db = dir.join("state.db");
-        let store = Store::open(&db).await.expect("store");
-        store
-            .put_machine("library_root", &library.display().to_string())
+        let empty = scan_root(&probe(HEVC10), true, library.clone())
             .await
-            .expect("root");
-        let empty = scan(
-            &probe(HEVC10),
-            true,
-            Some(library.clone()),
-            Some(db.clone()),
-        )
-        .await
-        .expect("empty");
+            .expect("empty");
         let value: serde_json::Value = serde_json::from_str(&empty).expect("json");
         assert_eq!(value["data"]["files"].as_array().expect("files").len(), 0);
 
@@ -1023,20 +645,15 @@ mod tests {
             &library,
             "series/The.Wire.(2002)/Season.01/The.Wire.(2002).S01E01.mkv",
         );
-        let scanned = scan(
-            &probe(HEVC10),
-            true,
-            Some(library.clone()),
-            Some(db.clone()),
-        )
-        .await
-        .expect("scan");
+        let scanned = scan_root(&probe(HEVC10), true, library.clone())
+            .await
+            .expect("scan");
         let value: serde_json::Value = serde_json::from_str(&scanned).expect("json");
         let files = value["data"]["files"].as_array().expect("files");
         assert_eq!(files.len(), 1, "scan walks movies/ only: {files:?}");
         assert_eq!(files[0]["title_id"], "movie:key:thematrix.1999");
         assert_eq!(files[0]["decision"], "nvenc_h264");
-        let human = scan(&probe(HEVC10), false, Some(library), Some(db))
+        let human = scan_root(&probe(HEVC10), false, library)
             .await
             .expect("human");
         assert_eq!(human, "encode    The Matrix (1999)");
@@ -1059,8 +676,7 @@ mod tests {
         let dir = crate::test_support::scratch("encode-scan-probe-err");
         let library = crate::test_support::library_root(&dir);
         write_schema(&library, crate::test_support::MOVIE_REL);
-        let db = dir.join("state.db");
-        let err = scan(&FailExec, true, Some(library), Some(db))
+        let err = scan_root(&FailExec, true, library)
             .await
             .expect_err("probe");
         let msg = err.to_string();
@@ -1070,41 +686,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_install_ffprobe_error_is_not_silent_ok() {
-        let dir = crate::test_support::scratch("encode-after-probe-err");
-        let library = crate::test_support::library_root(&dir);
-        write_schema(&library, crate::test_support::MOVIE_REL);
-        let store = Store::open(dir.join("state.db")).await.expect("store");
-        let title_id = TitleId::movie_key("The.Matrix", 1999).expect("id");
-        let pull = store
-            .create_job(JobKind::Pull, &title_id, None)
-            .await
-            .expect("pull");
-        let dest = library.join(crate::test_support::MOVIE_REL);
-        let err = after_install(
-            &FailExec, &store, &library, &title_id, &dest, &pull, "ffmpeg", 1, false,
-        )
-        .await
-        .expect_err("probe");
-        let msg = err.to_string();
-        assert!(msg.contains("probe_error"), "{msg}");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
     async fn scan_keep_and_refuse_from_probe() {
         let dir = crate::test_support::scratch("encode-scan-decisions");
         let library = crate::test_support::library_root(&dir);
         write_schema(&library, crate::test_support::MOVIE_REL);
-        let db = dir.join("state.db");
-        let keep = scan(&probe(H264), true, Some(library.clone()), Some(db.clone()))
+        let keep = scan_root(&probe(H264), true, library.clone())
             .await
             .expect("keep");
         let value: serde_json::Value = serde_json::from_str(&keep).expect("json");
         assert_eq!(value["data"]["files"][0]["decision"], "keep");
-        let refuse = scan(&probe(HDR), true, Some(library), Some(db))
-            .await
-            .expect("refuse");
+        let refuse = scan_root(&probe(HDR), true, library).await.expect("refuse");
         let value: serde_json::Value = serde_json::from_str(&refuse).expect("json");
         assert_eq!(value["data"]["files"][0]["decision"], "refuse");
         let _ = std::fs::remove_dir_all(dir);
@@ -1117,41 +708,61 @@ mod tests {
         nvenc_cap: &str,
         paused: bool,
     ) -> Result<String, AppError> {
+        let (mut home, api_dir, server) = crate::home_library::test_home("encode-run").await;
         let library = crate::test_support::library_root(dir);
         write_schema(&library, crate::test_support::MOVIE_REL);
+        if let mediaops_core::Spec::Cluster(spec) = &mut home.cluster.spec {
+            spec.library_root = library.to_string_lossy().into_owned();
+            spec.encode_pause = paused;
+        }
+        home.cluster = home.api.patch(home.cluster, "spec").await.expect("cluster");
         let ds = crate::test_support::write_ds(dir, crate::test_support::DS_UNLOCKED);
-        let store = Store::open(dir.join("state.db")).await.expect("store");
-        store
-            .put_machine("library_root", &library.display().to_string())
+        let store = Store::open(dir.join("state.db"))
             .await
-            .expect("root");
+            .expect("capabilities");
         store
             .put_machine("nvenc_cap", nvenc_cap)
             .await
-            .expect("cap");
-        if paused {
-            store.put_machine("encode_pause", "1").await.expect("pause");
-        }
+            .expect("capacity");
         let title_id = TitleId::movie_key("The.Matrix", 1999).expect("id");
-        let rel = render(&title_id, &Placement::movie("The.Matrix", 1999, "mkv")).expect("rel");
-        store
-            .record_install(
-                &title_id,
-                &Blake3Hex::of_bytes(b"original-hevc"),
-                rel.to_str().unwrap(),
-            )
-            .await
-            .expect("index");
-        run(
+        home.publish_rows(
+            &[mediaops_core::TitleIndexEntry::new(
+                title_id,
+                crate::test_support::MOVIE_REL,
+                Blake3Hex::of_bytes(b"original-hevc"),
+                Blake3Hex::of_bytes(b"original-hevc"),
+            )],
+            false,
+        )
+        .await
+        .expect("proof");
+        let view = crate::home_library::HomeLibrary {
+            api: home.api.clone(),
+            cluster: home.cluster.clone(),
+        };
+        let result = run_home(
             exec,
             true,
-            title.map(str::to_string),
-            Some(dir.join("state.db")),
+            title.map(str::to_owned),
+            dir.join("state.db"),
             Some(library),
             Some(ds),
             Some(dir.to_path_buf()),
+            home,
         )
-        .await
+        .await;
+        if result.is_ok() && exec.write_converting {
+            let rows = view.rows(false).await.expect("Home proofs");
+            assert_eq!(rows[0].current_b3(), &Blake3Hex::of_bytes(b"encoded-h264"));
+            assert_eq!(rows[0].install_b3(), &Blake3Hex::of_bytes(b"original-hevc"));
+            assert!(
+                store.list_titles().await.expect("local state").is_empty(),
+                "proofs belong to Home"
+            );
+        }
+        server.abort();
+        let _ = std::fs::remove_dir_all(api_dir);
+        result
     }
 
     #[tokio::test]
@@ -1204,20 +815,9 @@ mod tests {
         assert_eq!(value["data"]["paused"], true);
         assert_eq!(value["data"]["skipped"], 1);
 
-        let missing = run(
-            &probe(HEVC10),
-            true,
-            Some("movie:tmdb:999".into()),
-            Some(dir.join("state.db")),
-            Some(crate::test_support::library_root(&dir)),
-            Some(crate::test_support::write_ds(
-                &dir,
-                crate::test_support::DS_UNLOCKED,
-            )),
-            Some(dir.to_path_buf()),
-        )
-        .await
-        .expect_err("missing");
+        let missing = seeded_run(&dir, &probe(HEVC10), Some("movie:tmdb:999"), "1", false)
+            .await
+            .expect_err("missing");
         assert!(matches!(missing, AppError::Usage(_)), "{missing}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1236,18 +836,6 @@ mod tests {
         .expect("nvenc");
         let value: serde_json::Value = serde_json::from_str(&json).expect("json");
         assert_eq!(value["data"]["ran"], 1);
-        let store = Store::open(dir.join("state.db")).await.expect("store");
-        let entry = store
-            .get_title(&TitleId::movie_key("The.Matrix", 1999).expect("id"))
-            .await
-            .expect("title")
-            .into_iter()
-            .next()
-            .expect("row");
-        assert_ne!(
-            entry.current_b3().as_str(),
-            Blake3Hex::of_bytes(b"original-hevc").as_str()
-        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

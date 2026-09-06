@@ -37,7 +37,7 @@ pub fn render(
     render_masthead(frame, chunks[0], ui, sync, disk, color);
     render_rule(frame, chunks[1]);
     if ui.help {
-        render_help(frame, chunks[2], color);
+        render_help(frame, chunks[2], ui);
     } else if let Some(report) = ui.report.as_ref() {
         render_report(frame, chunks[2], report, ui.report_offset);
     } else if ui.split_detail() {
@@ -59,6 +59,6 @@ pub fn render(
         render_table(frame, chunks[2], ui, projection, sync, color, list_failed);
     }
     render_rule(frame, chunks[3]);
-    render_status(frame, chunks[4], ui);
+    render_status(frame, chunks[4], ui, sync, projection, list_failed);
     render_footer(frame, chunks[5], ui, sync, color);
 }

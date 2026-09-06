@@ -188,11 +188,13 @@ pub fn identity_line(name: &str, version: &str) -> String {
 }
 
 pub fn render_success_json(name: &str, version: &str) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&Envelope::ok(Identity::new(name, version)))
+    serde_json::to_string(&Identity::new(name, version))
 }
 
 pub fn render_error_json(code: ExitCode, message: &str) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&Envelope::<Identity>::err(code, message))
+    serde_json::to_string(&serde_json::json!({
+        "error": { "code": code.error_code(), "message": message }
+    }))
 }
 
 /// Reserved capability tokens (CAP-11). No LLM runtime.

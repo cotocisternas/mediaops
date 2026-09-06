@@ -1,10 +1,10 @@
 //! Detail panes.
 
-use mediaops_core::{HomeObject, Kind, Spec, StatusBody, node_is_ready};
+use mediaops_core::{HomeObject, JobPhase, Kind, Spec, StatusBody, node_is_ready};
 
 use super::{DetailLine, TableRow, line};
 use crate::cache::ObjectCache;
-use crate::format::fmt_bytes;
+use crate::format::{fmt_bytes, fmt_observed_age, fmt_progress};
 
 pub(crate) fn want_detail(obj: &HomeObject) -> Vec<DetailLine> {
     let title = match &obj.spec {
@@ -20,10 +20,7 @@ pub(crate) fn want_detail(obj: &HomeObject) -> Vec<DetailLine> {
         line("title_id", title),
         line("phase", phase),
         line("uid", &obj.metadata.uid),
-        line(
-            "resourceVersion",
-            &obj.metadata.resource_version.to_string(),
-        ),
+        line("version", &obj.metadata.resource_version.to_string()),
     ]
 }
 
@@ -57,15 +54,29 @@ pub(crate) fn job_detail_for(
                 ),
                 _ => ("", 0, String::new(), ""),
             };
-            let bytes = format!("{} / {}", fmt_bytes(done), fmt_bytes(total));
+            let bytes = fmt_progress(done, total);
+            let stage = match &obj.status {
+                StatusBody::Job(st) => match st.phase {
+                    JobPhase::Pending if node.is_empty() => {
+                        "waiting for scheduler; see Overview / Nodes"
+                    }
+                    JobPhase::Pending => "assigned; waiting for pull worker",
+                    JobPhase::Pulling => "copying from the box to home",
+                    JobPhase::Verifying => "verifying data and completing installation",
+                    JobPhase::Installed => "verified and installed in the library",
+                    JobPhase::Failed | JobPhase::Refused => "stopped; inspect message below",
+                },
+                _ => "unknown",
+            };
             vec![
                 line("name", &obj.metadata.name),
                 line("title_id", title),
                 line("phase", phase),
+                line("stage", stage),
                 line("bytes", &bytes),
                 line("attempts", &attempts),
-                line("node", node),
-                line("failure", failure),
+                line("node", if node.is_empty() { "unbound" } else { node }),
+                line("message", if failure.is_empty() { "none" } else { failure }),
                 line("dest", dest),
             ]
         })
@@ -135,19 +146,73 @@ pub(crate) fn node_detail_for(
                         "not-ready"
                     },
                     st.list_generation.to_string(),
-                    st.last_heartbeat_unix.to_string(),
+                    fmt_observed_age(st.last_heartbeat_unix, now_unix),
                 ),
                 _ => ("", String::new(), String::new()),
             };
-            vec![
+            let mut lines = vec![
                 line("name", &obj.metadata.name),
                 line("worker", worker),
                 line("ready", ready),
-                line("list_generation", &generation),
+                line("generation", &generation),
                 line("heartbeat", &beat),
-            ]
+            ];
+            if let StatusBody::Node(st) = &obj.status {
+                if !node_is_ready(st.ready, st.last_heartbeat_unix, now_unix) {
+                    lines.push(line(
+                        "reason",
+                        if st.last_heartbeat_unix <= 0 {
+                            "no heartbeat received"
+                        } else if !st.ready {
+                            "worker reported not ready"
+                        } else {
+                            "heartbeat expired or clock is ahead"
+                        },
+                    ));
+                    lines.push(line(
+                        "inspect",
+                        "systemctl --user status mediaops-home.service",
+                    ));
+                }
+                if worker == "inventory" {
+                    lines.push(line(
+                        "last listing",
+                        &fmt_observed_age(st.list_completed_unix, now_unix),
+                    ));
+                }
+            }
+            lines
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn cluster_detail(obj: &HomeObject) -> Vec<DetailLine> {
+    let Spec::Cluster(spec) = &obj.spec else {
+        return Vec::new();
+    };
+    vec![
+        line("name", &obj.metadata.name),
+        line(
+            "scheduling",
+            if spec.lock {
+                "paused; new Jobs and bindings are blocked"
+            } else {
+                "enabled"
+            },
+        ),
+        line(
+            "encoding",
+            if spec.encode_pause {
+                "paused between jobs"
+            } else {
+                "enabled"
+            },
+        ),
+        line("library root", &spec.library_root),
+        line("max copy", &fmt_bytes(spec.max_copy.get())),
+        line("min free", &fmt_bytes(spec.min_free.get())),
+        line("inspect", "mediaops get Cluster"),
+    ]
 }
 
 pub(crate) fn remotefile_detail_for(

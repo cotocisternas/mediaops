@@ -1,15 +1,15 @@
 //! Human stdout: one operator, their machines.
 //!
 //! Color and bold only when stdout is a tty. Progress writes to stderr and
-//! only when that is a tty. `--json` never calls these helpers.
+//! only when that is a tty. JSON output never calls these helpers.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use mediaops_core::{
-    HoldLiveItem, Job, Placement, TitleId, TitleIndexEntry, TitleKind, TitleSource,
-    parse_placement, parse_remote, title_key,
+    Placement, TitleId, TitleIndexEntry, TitleKind, TitleSource, parse_placement, parse_remote,
+    title_key,
 };
 
 const RESET: &str = "\x1b[0m";
@@ -29,7 +29,9 @@ pub struct Style {
 impl Style {
     pub fn stdout() -> Self {
         Self {
-            color: io::stdout().is_terminal(),
+            color: io::stdout().is_terminal()
+                && std::env::var_os("NO_COLOR").is_none()
+                && std::env::var("TERM").as_deref() != Ok("dumb"),
         }
     }
 
@@ -39,10 +41,11 @@ impl Style {
     }
 
     fn paint(self, code: &str, text: &str) -> String {
+        let text = inert(text);
         if self.color && !text.is_empty() {
             format!("{code}{text}{RESET}")
         } else {
-            text.to_string()
+            text
         }
     }
 
@@ -114,6 +117,28 @@ pub fn fmt_age(secs: u64) -> String {
     }
 }
 
+/// Single-line operator text must not execute terminal controls from filenames
+/// or remote diagnostics. JSON retains the original values.
+pub fn inert(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+pub fn fmt_progress(done: u64, total: u64) -> String {
+    if total == 0 {
+        return format!("{} / unknown", fmt_bytes(done));
+    }
+    let percent = u128::from(done.min(total)) * 100 / u128::from(total);
+    format!("{percent}%  {} / {}", fmt_bytes(done), fmt_bytes(total))
+}
+
 /// `Hearts of Darkness A Filmmaker's Apocalypse (1991)`, `Mr Robot (2015) S01E02`.
 pub fn human_placement(placement: &Placement) -> String {
     match placement {
@@ -156,14 +181,6 @@ pub fn human_from_path(path: &str) -> Option<String> {
     placement_from_path(path).as_ref().map(human_placement)
 }
 
-/// Show / album / movie — not a single episode. For `why` of a TitleId.
-pub fn human_title_from_placement(placement: &Placement) -> String {
-    match placement {
-        Placement::Episode { title, year, .. } => format!("{} ({year})", undot(title)),
-        other => human_placement(other),
-    }
-}
-
 /// Best-effort headline from a TitleId when no placement is around.
 pub fn human_title_id(id: &TitleId) -> String {
     if id.source() != TitleSource::Key {
@@ -194,25 +211,6 @@ pub fn human_title_id_str(rendered: &str) -> String {
     TitleId::parse(rendered)
         .map(|id| human_title_id(&id))
         .unwrap_or_else(|_| rendered.to_string())
-}
-
-/// Dotted schema labels (`Mr.Robot.(2015) S01E02`) → the same human form.
-pub fn humanize_schema_label(s: &str) -> String {
-    if let Some((head, rest)) = s.split_once(" S")
-        && looks_like_episode(rest)
-    {
-        return format!("{} S{rest}", undot_year(head));
-    }
-    undot_year(s).replace('/', " / ")
-}
-
-fn looks_like_episode(rest: &str) -> bool {
-    let bytes = rest.as_bytes();
-    bytes.len() >= 5 && bytes[0].is_ascii_digit() && rest.contains('E')
-}
-
-fn undot_year(s: &str) -> String {
-    undot(&s.replace(".(", " ("))
 }
 
 fn undot(s: &str) -> String {
@@ -246,7 +244,7 @@ pub fn row(style: Style, verb: &str, tone: Tone, title: &str, meta: &str) -> Str
         if !title.is_empty() {
             line.push_str("  ");
         }
-        line.push_str(meta);
+        line.push_str(&inert(meta));
     }
     line
 }
@@ -287,18 +285,6 @@ pub fn hint_from_path(id: TitleId, path: &str) -> TitleHint {
     TitleHint { id, names }
 }
 
-pub fn hint_from_placement(id: TitleId, placement: &Placement) -> TitleHint {
-    TitleHint {
-        id: id.clone(),
-        names: vec![
-            human_placement(placement),
-            human_title_id(&id),
-            id.render(),
-            placement.label(),
-        ],
-    }
-}
-
 pub fn hints_from_index(titles: &[TitleIndexEntry]) -> Vec<TitleHint> {
     titles
         .iter()
@@ -310,44 +296,6 @@ pub fn hints_from_index(titles: &[TitleIndexEntry]) -> Vec<TitleHint> {
             }
         })
         .collect()
-}
-
-pub fn hints_from_jobs(jobs: &[Job]) -> Vec<TitleHint> {
-    jobs.iter()
-        .map(|job| hint_from_id(job.title_id().clone()))
-        .collect()
-}
-
-pub fn hints_from_holds(holds: &[HoldLiveItem]) -> Vec<TitleHint> {
-    holds
-        .iter()
-        .map(|item| match &item.placement {
-            Some(placement) => hint_from_placement(item.key.title_id.clone(), placement),
-            None => {
-                let mut hint = hint_from_id(item.key.title_id.clone());
-                if let Some(path) = &item.output_path {
-                    hint.names.push(path.clone());
-                }
-                hint
-            }
-        })
-        .collect()
-}
-
-pub fn merge_hints(hints: Vec<TitleHint>) -> Vec<TitleHint> {
-    let mut out: Vec<TitleHint> = Vec::new();
-    for hint in hints {
-        if let Some(existing) = out.iter_mut().find(|h| h.id == hint.id) {
-            for name in hint.names {
-                if !existing.names.contains(&name) {
-                    existing.names.push(name);
-                }
-            }
-        } else {
-            out.push(hint);
-        }
-    }
-    out
 }
 
 pub fn resolve_title(query: &str, hints: &[TitleHint]) -> Result<TitleId, String> {
@@ -379,15 +327,6 @@ pub fn resolve_title(query: &str, hints: &[TitleHint]) -> Result<TitleId, String
     }
 }
 
-pub fn names_for(id: &TitleId, hints: &[TitleHint]) -> String {
-    hints
-        .iter()
-        .find(|h| h.id == *id)
-        .and_then(|h| h.names.first())
-        .cloned()
-        .unwrap_or_else(|| human_title_id(id))
-}
-
 /// `\r` progress on stderr. No-op when stderr is not a tty.
 pub struct PullMeter {
     title: String,
@@ -395,16 +334,18 @@ pub struct PullMeter {
     last: Instant,
     last_len: usize,
     painted: bool,
+    baseline: Option<(Instant, u64)>,
 }
 
 impl PullMeter {
     pub fn new(title: impl Into<String>) -> Self {
         Self {
-            title: title.into(),
-            active: io::stderr().is_terminal(),
+            title: inert(&title.into()),
+            active: io::stderr().is_terminal() && std::env::var("TERM").as_deref() != Ok("dumb"),
             last: Instant::now(),
             last_len: 0,
             painted: false,
+            baseline: None,
         }
     }
 
@@ -413,6 +354,7 @@ impl PullMeter {
             return;
         }
         let now = Instant::now();
+        let baseline = *self.baseline.get_or_insert((now, done));
         let due = !self.painted
             || done >= total
             || now.duration_since(self.last) >= Duration::from_millis(100);
@@ -421,14 +363,14 @@ impl PullMeter {
         }
         self.last = now;
         self.painted = true;
-        let line = format!(
-            "pull    {}  {} / {}",
-            self.title,
-            fmt_bytes(done),
-            fmt_bytes(total)
-        );
-        let width = self.last_len.max(line.len());
-        eprint!("\r{line:<width$}");
+        let mut line = format!("pull      {}  {}", self.title, fmt_progress(done, total),);
+        line.push_str(&transfer_rate(
+            done,
+            total,
+            baseline.1,
+            now.duration_since(baseline.0),
+        ));
+        eprint!("\r{}", crate::progress::terminal_line(&line));
         let _ = io::stderr().flush();
         self.last_len = line.len();
         if total > 0 && done >= total {
@@ -445,23 +387,29 @@ impl PullMeter {
     }
 }
 
-pub fn lock_command(lock: &serde_json::Value) -> String {
-    lock.get("command")
-        .and_then(|v| v.as_str())
-        .map(|s| s.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            lock.get("unparsed")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "mediaops".into())
+impl Drop for PullMeter {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn transfer_rate(done: u64, total: u64, baseline: u64, elapsed: Duration) -> String {
+    let transferred = done.saturating_sub(baseline);
+    if elapsed < Duration::from_secs(1) || transferred == 0 {
+        return String::new();
+    }
+    let rate = transferred as f64 / elapsed.as_secs_f64();
+    let mut text = format!("  {}/s", fmt_bytes(rate as u64));
+    if total > done {
+        let remaining = ((total - done) as f64 / rate).ceil() as u64;
+        text.push_str(&format!("  ~{} left", fmt_age(remaining)));
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mediaops_core::{HoldKey, ReleaseId};
 
     #[test]
     fn bytes_and_age_are_what_an_operator_says() {
@@ -478,6 +426,30 @@ mod tests {
         assert_eq!(fmt_age(4_000), "66m");
         assert_eq!(fmt_age(8_000), "2h");
         assert_eq!(fmt_age(200_000), "2d");
+    }
+
+    #[test]
+    fn transfer_progress_does_not_count_resumed_bytes_as_speed() {
+        assert_eq!(fmt_progress(512, 1024), "50%  512 B / 1 KiB");
+        assert_eq!(
+            fmt_progress(u64::MAX, u64::MAX),
+            "100%  16777216 TiB / 16777216 TiB"
+        );
+        assert_eq!(fmt_progress(999, 1000), "99%  999 B / 1000 B");
+        assert_eq!(fmt_progress(0, 0), "0 B / unknown");
+        assert_eq!(transfer_rate(900, 1000, 900, Duration::from_secs(1)), "");
+        assert_eq!(
+            transfer_rate(950, 1000, 900, Duration::from_secs(5)),
+            "  10 B/s  ~5s left"
+        );
+        assert_eq!(
+            transfer_rate(1000, 1000, 900, Duration::from_secs(5)),
+            "  20 B/s"
+        );
+        assert_eq!(
+            inert("remote\u{1b}[31m\nfile\tname"),
+            "remote [31m file name"
+        );
     }
 
     #[test]
@@ -507,23 +479,12 @@ mod tests {
             "Yes / Relayer (2013) 01"
         );
         assert_eq!(
-            humanize_schema_label("Mr.Robot.(2015) S01E02"),
-            "Mr Robot (2015) S01E02"
-        );
-        assert_eq!(
             human_title_id(&TitleId::series_key("Foundation", 2021).expect("id")),
             "Foundation (2021)"
         );
         assert_eq!(
             human_from_path("movies/The.Matrix.(1999)/The.Matrix.(1999).mkv").as_deref(),
             Some("The Matrix (1999)")
-        );
-        assert_eq!(
-            human_title_from_placement(&placement_from_path(
-                "Mr.Robot.(2015)/Season.01/Mr.Robot.(2015).S01E02.eps1.1_ones-and-zer0es.mpeg.mkv"
-            )
-            .expect("remote episode")),
-            "Mr Robot (2015)"
         );
     }
 
@@ -549,9 +510,9 @@ mod tests {
     #[test]
     fn resolve_title_accepts_id_or_unique_name() {
         let id = TitleId::movie("4539").expect("id");
-        let hints = [hint_from_placement(
+        let hints = [hint_from_path(
             id.clone(),
-            &Placement::movie("Hearts.of.Darkness.A.Filmmaker's.Apocalypse", 1991, "mkv"),
+            "movies/Hearts.of.Darkness.A.Filmmaker's.Apocalypse.(1991)/Hearts.of.Darkness.A.Filmmaker's.Apocalypse.(1991).mkv",
         )];
         assert_eq!(resolve_title("movie:tmdb:4539", &hints).expect("id"), id);
         assert_eq!(
@@ -560,30 +521,5 @@ mod tests {
         );
         assert!(resolve_title("Silo", &hints).is_err());
         assert!(resolve_title("not-a-title", &[]).is_err());
-    }
-
-    #[test]
-    fn hold_hint_uses_placement() {
-        let mut item = HoldLiveItem::new(
-            HoldKey::new(
-                TitleId::movie("4539").expect("id"),
-                ReleaseId::parse("deadbeef").expect("rel"),
-            ),
-            0,
-            1,
-            "blocked",
-        );
-        item.placement = Some(Placement::movie(
-            "Hearts.of.Darkness.A.Filmmaker's.Apocalypse",
-            1991,
-            "mkv",
-        ));
-        let hints = hints_from_holds(&[item]);
-        assert_eq!(
-            resolve_title("Hearts of Darkness", &hints)
-                .expect("hit")
-                .render(),
-            "movie:tmdb:4539"
-        );
     }
 }

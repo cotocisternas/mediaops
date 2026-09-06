@@ -107,7 +107,7 @@ directly so its sibling role binaries are current.
 
 Human stdout is the operator UI. Changing a formatter means adding or updating an exact-screen test next to it.
 
-Home API `-o json` is the raw object. Legacy `--json` envelopes stay stable unless the change needs a new field.
+CLI `-o json` emits the raw result for every command. Human progress belongs on stderr and is disabled in JSON mode. Update exact-screen tests when changing human formatting.
 
 ## Conventions
 

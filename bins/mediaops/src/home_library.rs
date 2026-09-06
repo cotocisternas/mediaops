@@ -1,8 +1,4 @@
-//! Bridge the remaining operator commands to the authoritative Home API.
-//!
-//! An explicit `--state-db` selects the offline legacy workflow. The default
-//! workflow must connect to Home; an outage must never become a successful
-//! mutation of an unused sqlite database.
+//! Library maintenance and per-file proof through the authoritative Home API.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,36 +34,10 @@ pub(crate) fn maintenance_failure(err: AppError) -> AppError {
     }
 }
 
-pub(crate) fn use_home(state_db: &Option<PathBuf>) -> bool {
-    match state_db {
-        None => true,
-        Some(path) => {
-            let path = resolved_state_path(path);
-            path == resolved_state_path(&crate::bootstrap::default_state_db())
-                || path
-                    .parent()
-                    .is_some_and(|parent| parent.join("api.db").exists())
-        }
-    }
-}
-
-fn resolved_state_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| match (path.parent(), path.file_name()) {
-        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
-            .map(|parent| parent.join(name))
-            .unwrap_or_else(|_| path.to_path_buf()),
-        _ => path.to_path_buf(),
-    })
-}
-
-/// Every operation using the default Home API shares the same legacy flock and
-/// local capability store, including callers that supplied an alias path.
+/// Local capability storage and maintenance flock. This never selects a backend.
+/// Public Home commands use the default; an explicit path isolates internal tests.
 pub(crate) fn state_db_path(requested: Option<PathBuf>) -> PathBuf {
-    if use_home(&requested) {
-        crate::bootstrap::default_state_db()
-    } else {
-        requested.expect("offline state requires an explicit path")
-    }
+    requested.unwrap_or_else(crate::bootstrap::default_state_db)
 }
 
 pub(crate) async fn connect() -> Result<HomeApi, AppError> {
@@ -247,6 +217,16 @@ impl HomeLibrary {
         rows: &[TitleIndexEntry],
         allow_missing: bool,
     ) -> Result<(), AppError> {
+        self.publish_rows_with_progress(rows, allow_missing, None)
+            .await
+    }
+
+    async fn publish_rows_with_progress(
+        &self,
+        rows: &[TitleIndexEntry],
+        allow_missing: bool,
+        progress: Option<&crate::progress::OperationProgress>,
+    ) -> Result<(), AppError> {
         let root = self.root(None)?;
         let mut grouped: BTreeMap<String, Vec<&TitleIndexEntry>> = BTreeMap::new();
         for row in rows {
@@ -255,7 +235,12 @@ impl HomeLibrary {
                 .or_default()
                 .push(row);
         }
-        for (title_id, rows) in grouped {
+        let title_count = grouped.len();
+        for (index, (title_id, rows)) in grouped.into_iter().enumerate() {
+            let stage = format!("publishing {}/{title_count} titles", index + 1);
+            if let Some(progress) = progress {
+                progress.stage(&stage, &title_id);
+            }
             for attempt in 0..5 {
                 let mut object = match self.api.get(Kind::Title, &title_id).await {
                     Ok(object) => object,
@@ -283,8 +268,12 @@ impl HomeLibrary {
                 let mut files = status.observed_files();
                 for row in &rows {
                     let path = schema_relative(&root, row.path())?;
-                    let current =
-                        std::fs::File::open(root.join(&path)).and_then(Blake3Hex::of_reader);
+                    let current = if let Some(progress) = progress {
+                        progress.stage("verifying proof", &path);
+                        crate::progress::hash_file(&root.join(&path), progress)
+                    } else {
+                        std::fs::File::open(root.join(&path)).and_then(Blake3Hex::of_reader)
+                    };
                     let drifted = match current {
                         Ok(digest) => &digest != row.current_b3(),
                         Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => {
@@ -318,6 +307,9 @@ impl HomeLibrary {
                     files,
                     ..TitleStatus::default()
                 });
+                if let Some(progress) = progress {
+                    progress.stage(&stage, format!("{title_id} · waiting for API verification"));
+                }
                 match self.api.patch(object, "status").await {
                     Ok(_) => break,
                     Err(err) if err.is_conflict() && attempt < 4 => continue,
@@ -328,23 +320,40 @@ impl HomeLibrary {
         Ok(())
     }
 
-    pub async fn reindex(&self) -> Result<usize, AppError> {
+    pub async fn reindex(
+        &self,
+        progress: &crate::progress::OperationProgress,
+    ) -> Result<usize, AppError> {
         let root = self.root(None)?;
+        if !std::fs::metadata(&root)
+            .map_err(|err| error(format!("library root {}: {err}", root.display())))?
+            .is_dir()
+        {
+            return Err(error(format!(
+                "library root is not a directory: {}",
+                root.display()
+            )));
+        }
+        progress.stage("loading existing proof", root.display().to_string());
         let existing = self.rows(true).await?;
-        let files = mediaops_sync::scan_schema_files(&root).map_err(error)?;
+        progress.stage("scanning schema files", root.display().to_string());
+        let mut files = mediaops_sync::scan_schema_files(&root).map_err(error)?;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let count = files.len();
+        let existing: BTreeMap<_, _> = existing.iter().map(|row| (row.path(), row)).collect();
         let mut rows = Vec::with_capacity(files.len());
-        for file in files {
-            let digest =
-                Blake3Hex::of_reader(std::fs::File::open(root.join(&file.path)).map_err(error)?)
-                    .map_err(error)?;
-            if let Some(previous) = existing.iter().find(|row| row.path() == file.path) {
+        for (index, file) in files.into_iter().enumerate() {
+            progress.stage(&format!("hashing {}/{count} files", index + 1), &file.path);
+            let digest = crate::progress::hash_file(&root.join(&file.path), progress)
+                .map_err(|err| error(format!("{}: {err}", file.path)))?;
+            if let Some(previous) = existing.get(file.path.as_str()) {
                 if previous.current_b3() != &digest {
                     return Err(AppError::DriftVerify(format!(
                         "library file changed: {}",
                         file.path
                     )));
                 }
-                rows.push(previous.clone());
+                rows.push((**previous).clone());
             } else {
                 rows.push(TitleIndexEntry::new(
                     file.title_id,
@@ -354,7 +363,8 @@ impl HomeLibrary {
                 ));
             }
         }
-        self.publish_rows(&rows, false).await?;
+        self.publish_rows_with_progress(&rows, false, Some(progress))
+            .await?;
         Ok(rows.len())
     }
 }
@@ -486,21 +496,6 @@ mod tests {
         assert!(schema_relative(Path::new("/library"), "../movies/A.(2000)/A.(2000).mkv").is_err());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_cannot_select_offline_writes_to_a_migrated_database() {
-        let dir = crate::test_support::scratch("api-routing");
-        let migrated = dir.join("migrated");
-        std::fs::create_dir_all(&migrated).expect("directory");
-        std::fs::write(migrated.join("state.db"), b"").expect("state");
-        std::fs::write(migrated.join("api.db"), b"").expect("migration marker");
-        let link = dir.join("offline.db");
-        std::os::unix::fs::symlink(migrated.join("state.db"), &link).expect("symlink");
-        assert!(use_home(&Some(link)));
-        assert!(!use_home(&Some(dir.join("fixture.db"))));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[tokio::test]
     async fn reindex_preserves_install_digest_after_encoding() {
         let (home, dir, server) = test_home("api-reindex").await;
@@ -517,8 +512,31 @@ mod tests {
         home.publish_rows(std::slice::from_ref(&row), false)
             .await
             .expect("import proof");
-        assert_eq!(home.reindex().await.expect("reindex"), 1);
-        assert_eq!(home.rows(false).await.expect("proofs"), vec![row]);
+        assert_eq!(
+            home.reindex(&crate::progress::OperationProgress::new(false, "reindex"))
+                .await
+                .expect("reindex"),
+            1
+        );
+        assert_eq!(home.rows(false).await.expect("proofs"), vec![row.clone()]);
+        std::fs::write(root.join(path), b"unexpected change").expect("change");
+        let err = home
+            .reindex(&crate::progress::OperationProgress::new(false, "reindex"))
+            .await
+            .expect_err("drift");
+        assert!(matches!(err, AppError::DriftVerify(_)), "{err}");
+        assert_eq!(home.rows(true).await.expect("retained proof"), vec![row]);
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reindex_missing_root_is_an_error_and_empty_root_is_zero() {
+        let (home, dir, server) = test_home("api-reindex-empty").await;
+        let progress = crate::progress::OperationProgress::new(false, "reindex");
+        assert_eq!(home.reindex(&progress).await.expect("empty"), 0);
+        std::fs::remove_dir_all(home.root(None).expect("root")).expect("remove root");
+        assert!(home.reindex(&progress).await.is_err());
         server.abort();
         let _ = std::fs::remove_dir_all(dir);
     }
