@@ -16,6 +16,14 @@ the API. `list` / `pull` use `--socket` for the gateway and do not accept
 their API. `doctor` uses both endpoints for different checks. See the
 [socket-routing table](config.md#default-paths).
 
+## Home TUI
+
+`mediaops-tui` is a separate binary. It does not replace these verbs. See [TUI](tui.md).
+
+```bash
+mediaops-tui --api-socket "$XDG_RUNTIME_DIR/mediaops-api.sock"
+```
+
 ## Daily
 
 ```bash

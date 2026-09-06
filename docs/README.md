@@ -9,6 +9,7 @@ BMAD material is historical, not an alternative runbook or active backlog.
 | [Usage](usage.md) | Daily commands and what they print |
 | [Config](config.md) | `config.toml`, default paths, library layout |
 | [Architecture](architecture.md) | Two machines, the wire, the crate graph |
+| [TUI](tui.md) | Additive Home API terminal UI |
 | [Development](development.md) | Build, test, conventions |
 | [Documentation status](documentation-status.md) | Current sources of truth, superseded behavior, and BMAD history |
 

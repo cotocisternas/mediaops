@@ -81,13 +81,14 @@ Home API `-o json` is the raw object. Legacy `--json` envelopes stay stable unle
 - `core` stays free of tokio, tonic, and rusqlite. New `std::fs` in `crates/core/src` is only legal in `walker.rs` and `install.rs`.
 - PathSchema (`crates/core/src/pathschema.rs`) is the only writer of library paths. Do not format a dest path by hand.
 - Identity is a `TitleId`, never a path string.
-- No TUI, no prompts, no auto-approve.
+- No prompts, no auto-approve. The additive `mediaops-tui` binary is the only TUI; do not add one to `mediaops` or the daemon.
 
 ## Layout
 
 ```
 bins/mediaops            CLI (Home API client)
 bins/mediaops-home       supervisor (execs the five roles)
+bins/mediaops-tui        additive Home API TUI (library + binary)
 bins/mediaops-api        apiserver
 bins/mediaops-scheduler  Job bind
 bins/mediaops-gateway    mTLS attach
@@ -119,4 +120,4 @@ artifacts and should not be mass-edited to reflect this architecture change.
 
 ## What is not in the tree
 
-No TUI. No `docs render`. No in-process agent. Those are out of scope until they exist.
+No `docs render`. No in-process agent. The additive Home TUI is `mediaops-tui` ([tui.md](tui.md)).

@@ -11,7 +11,8 @@ Home is a Kubernetes-shaped control plane. The seedbox is still a dumb disk plus
         ├── mediaops-inventory    List/HoldList → RemoteFile / Hold
         └── mediaops-pull         Range pull, sidecar, BLAKE3, PathSchema install
 
-  mediaops CLI  ──UDS──►  mediaops-api
+  mediaops CLI      ──UDS──►  mediaops-api
+  mediaops-tui      ──UDS──►  mediaops-api
   inventory/pull         ──UDS──►  mediaops-gateway  ──mTLS──►  mediaopsd --role seedbox
 ```
 
@@ -76,6 +77,7 @@ Cargo workspace. Edges are allowlisted and tested in `crates/arch-tests` (`make 
 | Crate | Role |
 | ----- | ---- |
 | `bins/mediaops` | CLI client |
+| `bins/mediaops-tui` | Additive Home TUI. Depends on core + home-client only |
 | `bins/mediaops-home` | supervisor |
 | `bins/mediaops-api` | apiserver binary |
 | `bins/mediaops-scheduler` | bind |

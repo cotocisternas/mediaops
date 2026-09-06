@@ -15,7 +15,7 @@ endif
 .DEFAULT_GOAL := help
 
 .PHONY: help fetch build release check test test-arch test-live coverage clippy fmt fmt-check \
-	proto proto-breaking run mediaops daemon musl ci install clean
+	proto proto-breaking run mediaops daemon tui musl ci install clean
 
 help: ## Show this list
 	@awk 'BEGIN {FS = ":.*##"; printf "mediaops\n\nTargets:\n"} \
@@ -73,6 +73,9 @@ mediaops: ## cargo run -p mediaops -- $(ARGS)
 daemon: ## cargo run -p mediaopsd -- $(ARGS)
 	$(CARGO) run -p $(PKG_DAEMON) $(CARGO_FLAGS) -- $(if $(ARGS),$(ARGS),--help)
 
+tui: ## cargo run -p mediaops-tui -- $(ARGS)
+	$(CARGO) run -p mediaops-tui $(CARGO_FLAGS) -- $(if $(ARGS),$(ARGS),--help)
+
 MUSL_TARGET := x86_64-unknown-linux-musl
 
 musl: ## Link musl-static mediaopsd (needs musl-gcc). Not part of make test.
@@ -85,7 +88,7 @@ ci: fetch ## Same sequence as .github/workflows/ci.yml
 	$(MAKE) test OFFLINE=1
 	$(MAKE) musl OFFLINE=1
 
-install: ## Install CLI, daemon, supervisor and all home roles into ~/.cargo/bin
+install: ## Install CLI, daemon, supervisor, home roles and TUI into ~/.cargo/bin
 	$(CARGO) install --path bins/mediaops $(CARGO_FLAGS) --force
 	$(CARGO) install --path bins/mediaopsd $(CARGO_FLAGS) --force
 	$(CARGO) install --path bins/mediaops-api $(CARGO_FLAGS) --force
@@ -94,6 +97,7 @@ install: ## Install CLI, daemon, supervisor and all home roles into ~/.cargo/bin
 	$(CARGO) install --path bins/mediaops-inventory $(CARGO_FLAGS) --force
 	$(CARGO) install --path bins/mediaops-pull $(CARGO_FLAGS) --force
 	$(CARGO) install --path bins/mediaops-home $(CARGO_FLAGS) --force
+	$(CARGO) install --path bins/mediaops-tui $(CARGO_FLAGS) --force
 
 clean: ## cargo clean
 	$(CARGO) clean

@@ -15,6 +15,7 @@ Home disk is the library. The seedbox is disposable buffer. The CLI talks to a l
 | [Usage](docs/usage.md) | Daily commands and what they print |
 | [Config](docs/config.md) | `config.toml`, default paths, library layout |
 | [Architecture](docs/architecture.md) | Two machines, the wire, the crate graph |
+| [TUI](docs/tui.md) | Additive Home API terminal UI |
 | [Development](docs/development.md) | Build, test, conventions |
 | [AGENTS.md](AGENTS.md) | Rules for agents working in this repo |
 | [Documentation status](docs/documentation-status.md) | Current architecture versus historical BMAD artifacts |
@@ -32,7 +33,7 @@ sudo apt-get install -y protobuf-compiler musl-tools cmake
 make install
 ```
 
-`make install` puts these on `~/.cargo/bin`: `mediaops`, `mediaopsd`, `mediaops-home`, `mediaops-api`, `mediaops-scheduler`, `mediaops-gateway`, `mediaops-inventory`, `mediaops-pull`.
+`make install` puts these on `~/.cargo/bin`: `mediaops`, `mediaopsd`, `mediaops-home`, `mediaops-api`, `mediaops-scheduler`, `mediaops-gateway`, `mediaops-inventory`, `mediaops-pull`, `mediaops-tui`.
 
 `make help` lists the rest. Default `make test` never talks to a seedbox and never needs a GPU.
 
