@@ -44,7 +44,7 @@ Pre-rewrite files under `_bmad-output/` are historical, including session prompt
 
 ## Running and verifying
 
-`Makefile` is the entry point (`make test`, `make test-arch`, `make clippy`, `make fmt`, `make proto`). CI is `.github/workflows/ci.yml`: `make proto`, `cargo test --locked --offline --workspace`, then `make musl`. Default `make test` stays Cargo-only.
+`Makefile` is the entry point (`make test`, `make test-arch`, `make clippy`, `make fmt`, `make proto`). CI is `.github/workflows/ci.yml`: PRs, pushes to `main`, and manual dispatch run the `make ci` validation sequence (fmt, proto, fetch, offline workspace build/test, Clippy, musl). Keep the required sibling-binary build before tests. Default `make test` stays Cargo-only.
 
 Iterate on one crate with `cargo test -p <crate> --locked`. The live test (`cargo test -p mediaops --features live-box --test live`) is `#[ignore]` and still does not SSH or encode.
 
