@@ -14,7 +14,7 @@ Pre-rewrite files under `_bmad-output/` are historical, including session prompt
 - Treat a path string as identity. Use `TitleId` (`kind:source:id`).
 - Mint or write PEMs inside a git work tree. Bootstrap and `new-machine import` refuse; keep that.
 - Enable `live-box`, SSH to a seedbox, or run NVENC from a test or Make target. Default `make test` is the gate.
-- Add a TUI, a prompt, or an auto-approve path.
+- Add a prompt or an auto-approve path. The only TUI is the additive `mediaops-tui` binary (Home API unix socket, `Actor::Cli`). Do not add a TUI, prompt, or auto-approve path to `mediaops` or the daemon.
 - Hot-reload `config.toml` mid-copy. Each Pull Job snapshots library root, budgets, and Range settings at create.
 
 ## Do
