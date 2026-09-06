@@ -126,9 +126,10 @@ fn version_exits_ok() {
         .expect("run mediaopsd --version");
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).expect("utf8");
-    assert!(
-        stdout.contains("mediaopsd") && stdout.contains(env!("CARGO_PKG_VERSION")),
-        "version must print clap version, got: {stdout}"
+    assert_eq!(
+        stdout,
+        format!("mediaopsd {}\n", env!("CARGO_PKG_VERSION")),
+        "version must print the exact package version"
     );
     assert!(
         serde_json::from_str::<Value>(stdout.trim()).is_err(),
@@ -241,7 +242,7 @@ fn serve_home_without_upstream_exits_usage() {
     assert_eq!(
         output.status.code(),
         Some(2),
-        "home without --upstream/--config must exit usage, status={:?} stderr={}",
+        "role home must exit usage, status={:?} stderr={}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
