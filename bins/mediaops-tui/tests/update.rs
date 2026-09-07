@@ -203,7 +203,8 @@ fn report_end_clamps_offset_to_visible_page() {
         Command::RowEnd,
     );
     let report = ui.report.as_ref().expect("report");
-    let max = report.max_offset(60, 11);
+    let pane = mediaops_tui::geometry::Shell::for_ui(&ui).overlay.inner;
+    let max = report.max_offset(usize::from(pane.width), usize::from(pane.height));
     assert!(max > 0);
     assert_eq!(ui.report_offset, max);
     assert!(ui.report_offset < u16::MAX);

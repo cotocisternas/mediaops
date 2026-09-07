@@ -11,12 +11,11 @@ use tokio_stream::StreamExt;
 
 use crate::actions::{self, Mutation, MutationOutcome, MutationTarget, PreparedWrite};
 use crate::disk::DiskWatch;
-use crate::interaction::{can_submit, project_ui};
-use crate::keys::command_from_event;
+use crate::interaction::{can_submit, handle_event, project_ui};
 use crate::model::UiModel;
 use crate::report::SyncReport;
 use crate::session::Session;
-use crate::update::{Update, UpdateEffect, apply};
+use crate::update::UpdateEffect;
 
 enum Work {
     Prepared {
@@ -75,10 +74,7 @@ async fn run_loop<B: Backend>(
             _ = term_signal.recv() => return Ok(0),
             event = events.next() => {
                 let event = event.context("terminal event stream ended")??;
-                let command = command_from_event(&event);
-                let row_count = crate::projection::project(&session.cache, ui.screen, ui.selected, crate::clock::unix_now()).rows.len();
-                let page = usize::from(ui.rows.saturating_sub(6));
-                let effect = apply(Update { ui: &mut ui, sync: session.sync, row_count, page }, command);
+                let effect = handle_event(&session, &mut ui, &event);
                 match effect {
                     UpdateEffect::Quit => return Ok(0),
                     UpdateEffect::None => {},
@@ -158,22 +154,12 @@ async fn run_loop<B: Backend>(
                         dry_run,
                         result,
                     } => {
-                        ui.sync_pending = false;
-                        match result {
-                            Ok(obj) => {
-                                ui.report = Some(SyncReport::from_object(request_id, dry_run, &obj));
-                                ui.report_offset = 0;
-                                ui.message = None;
-                                if !dry_run && !ui.keyboard_event_types {
-                                    ui.message = Some("For another sync, restart TUI or use the CLI".into());
-                                }
-                                if !dry_run {
-                                    session.bootstrap().await;
-                                }
-                            }
-                            Err(message) => {
-                                ui.message = Some(message);
-                            }
+                        let refresh = result.is_ok() && !dry_run;
+                        crate::update::complete_sync(&mut ui, result.map(|obj| {
+                            SyncReport::from_object(request_id, dry_run, &obj)
+                        }));
+                        if refresh {
+                            session.bootstrap().await;
                         }
                     }
                 }
@@ -213,6 +199,9 @@ async fn run_loop<B: Backend>(
                     }
                     terminal.draw(|frame| crate::view::render(frame, &display, session.sync, &projection, &observation, color, session.list_failed))
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if !ui.undersize() && ui.input.is_none() && !ui.help && display.message == ui.message {
+                        ui.message_unseen = false;
+                    }
                     dirty = false;
                 }
             }
@@ -221,7 +210,7 @@ async fn run_loop<B: Backend>(
 }
 
 async fn finish(session: &mut Session, ui: &mut UiModel, outcome: MutationOutcome) {
-    ui.message = Some(outcome.message());
+    ui.completion_message(Some(outcome.message()));
     ui.mutation_pending = false;
     ui.clear_action_selection();
     session.bootstrap().await;

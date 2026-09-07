@@ -1,4 +1,4 @@
-//! Column plan and wrapping for the ledger.
+//! Column plan and wrapping for the resource browser.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -107,10 +107,20 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         if used + cw > width && used > 0 {
-            lines.push(std::mem::take(&mut line));
-            used = 0;
             if c == ' ' {
+                lines.push(line.trim_end().to_string());
+                line.clear();
+                used = 0;
                 continue;
+            }
+            if let Some(boundary) = line.rfind(' ') {
+                let remainder = line[boundary + 1..].to_string();
+                lines.push(line[..boundary].trim_end().to_string());
+                line = remainder;
+                used = line.width();
+            } else {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
             }
         }
         if cw > width {
@@ -124,11 +134,18 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 pub fn help_lines(ui: &crate::model::UiModel) -> Vec<String> {
+    let width = usize::from(crate::geometry::Shell::for_ui(ui).overlay.inner.width);
     let mut lines: Vec<String> = [
         "1 Overview  2 Wants  3 Jobs  4 Holds  5 Titles  6 Nodes  7 Box",
         "Tab / Shift-Tab  next/prev screen",
-        "j k arrows  PageUp PageDown  Home End  rows or scroll",
-        "Enter  detail   Esc  back   ?  help   q  quit",
+        "j k arrows  PageUp PageDown  Home End / g G  rows or scroll",
+        "Enter / d  detail   Esc  back   ?  help   q  quit",
+        "/ live literal filter; Enter keeps; Esc cancels editing",
+        "Esc in list clears filter; changing resource resets it",
+        ":overview :want(s) :job(s) :hold(s) :title(s) :node(s)",
+        ":box :help :quit / :q; navigation, help or quit only",
+        "Input: Backspace edits, Ctrl-U clears, Ctrl-C quits",
+        "Input letters are text; Enter never syncs or mutates",
         "W apply Want   D delete Want   A approve Hold   X reject Hold",
         "p preview copies   S fresh sync (not watching)",
         "mutations only in selected detail; Enter never writes",
@@ -138,21 +155,15 @@ pub fn help_lines(ui: &crate::model::UiModel) -> Vec<String> {
         "Logs: journalctl --user -u mediaops-home.service -n 50",
     ]
     .into_iter()
-    .flat_map(|text| wrap_text(text, usize::from(ui.cols)))
+    .flat_map(|text| wrap_text(text, width))
     .collect();
     let message = ui.connection_message.as_ref().or(ui.message.as_ref());
     if let Some(message) = message {
         lines.push(String::new());
-        lines.extend(wrap_text(
-            &format!("Status: {message}"),
-            usize::from(ui.cols),
-        ));
+        lines.extend(wrap_text(&format!("Status: {message}"), width));
     } else if let Some(message) = &ui.last_message {
         lines.push(String::new());
-        lines.extend(wrap_text(
-            &format!("Last status: {message}"),
-            usize::from(ui.cols),
-        ));
+        lines.extend(wrap_text(&format!("Last status: {message}"), width));
     }
     lines
 }
@@ -201,5 +212,17 @@ mod tests {
         let lines = wrap_text("one two three four five", 10);
         assert!(lines.len() >= 2);
         assert!(lines.iter().all(|l| l.width() <= 10));
+    }
+
+    #[test]
+    fn prose_prefers_words_and_long_unicode_identity_keeps_every_cell() {
+        assert_eq!(
+            wrap_text("see Overview / Nodes", 18),
+            ["see Overview /", "Nodes"]
+        );
+        let id = "movie:key:映画日本語.1999";
+        let lines = wrap_text(id, 9);
+        assert_eq!(lines.concat(), id);
+        assert!(lines.iter().all(|line| line.width() <= 9));
     }
 }

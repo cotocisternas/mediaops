@@ -10,7 +10,7 @@ use crate::cache::ObjectCache;
 use crate::format::{fmt_age, fmt_bytes, fmt_observed_age, fmt_percent};
 use crate::inventory::{committed_inventory_generation, current_remote_files, open_holds};
 
-pub(crate) fn wants(cache: &ObjectCache, selected: usize, now_unix: i64) -> Projection {
+pub(crate) fn wants(cache: &ObjectCache, now_unix: i64) -> Projection {
     let names = super::names::Names::from_cache(cache, now_unix);
     let mut rows: Vec<TableRow> = cache
         .live_kind(Kind::Want)
@@ -32,30 +32,16 @@ pub(crate) fn wants(cache: &ObjectCache, selected: usize, now_unix: i64) -> Proj
     } else {
         ListingKind::Rows
     };
-    let detail = rows
-        .get(selected)
-        .and_then(|r| {
-            cache
-                .get(&crate::cache::ObjectKey::new(r.kind, r.name.clone()))
-                .and_then(|e| e.object.as_ref())
-                .map(super::detail::want_detail)
-        })
-        .unwrap_or_default();
     Projection {
         listing,
         rows,
         headers: vec!["TITLE", "PHASE"],
-        detail,
+        detail: Vec::new(),
         hold_caption: false,
     }
 }
 
-pub(crate) fn jobs(
-    cache: &ObjectCache,
-    selected: usize,
-    active_only: bool,
-    now_unix: i64,
-) -> Projection {
+pub(crate) fn jobs(cache: &ObjectCache, active_only: bool, now_unix: i64) -> Projection {
     let names = super::names::Names::from_cache(cache, now_unix);
     let mut rows: Vec<TableRow> = cache
         .live_kind(Kind::Job)
@@ -103,19 +89,18 @@ pub(crate) fn jobs(
     } else {
         ListingKind::Rows
     };
-    let detail = super::detail::job_detail_for(cache, &rows, selected);
     Projection {
         listing,
         rows,
         headers: vec![
             "TITLE", "PHASE", "PROGRESS", "BYTES", "ATTEMPTS", "NODE", "MESSAGE",
         ],
-        detail,
+        detail: Vec::new(),
         hold_caption: false,
     }
 }
 
-pub(crate) fn holds(cache: &ObjectCache, selected: usize, now_unix: i64) -> Projection {
+pub(crate) fn holds(cache: &ObjectCache, now_unix: i64) -> Projection {
     let names = super::names::Names::from_cache(cache, now_unix);
     let objects: Vec<&HomeObject> = cache.live().collect();
     let Some(generation) = committed_inventory_generation(objects.iter().copied(), now_unix) else {
@@ -150,20 +135,16 @@ pub(crate) fn holds(cache: &ObjectCache, selected: usize, now_unix: i64) -> Proj
     } else {
         ListingKind::Rows
     };
-    let mut detail = super::detail::hold_detail_for(cache, &rows, selected);
-    if let Some(row) = rows.get(selected) {
-        detail.insert(1, super::line("title", &row.cells[0]));
-    }
     Projection {
         listing,
         rows,
         headers: vec!["TITLE", "SIZE", "AGE"],
-        detail,
+        detail: Vec::new(),
         hold_caption: true,
     }
 }
 
-pub(crate) fn nodes(cache: &ObjectCache, selected: usize, now_unix: i64) -> Projection {
+pub(crate) fn nodes(cache: &ObjectCache, now_unix: i64) -> Projection {
     let mut rows: Vec<TableRow> = cache
         .live_kind(Kind::Node)
         .map(|obj| {
@@ -193,17 +174,16 @@ pub(crate) fn nodes(cache: &ObjectCache, selected: usize, now_unix: i64) -> Proj
     } else {
         ListingKind::Rows
     };
-    let detail = super::detail::node_detail_for(cache, &rows, selected, now_unix);
     Projection {
         listing,
         rows,
         headers: vec!["NODE", "READY", "HEARTBEAT"],
-        detail,
+        detail: Vec::new(),
         hold_caption: false,
     }
 }
 
-pub(crate) fn box_listing(cache: &ObjectCache, selected: usize, now_unix: i64) -> Projection {
+pub(crate) fn box_listing(cache: &ObjectCache, now_unix: i64) -> Projection {
     let objects: Vec<&HomeObject> = cache.live().collect();
     let Some(generation) = committed_inventory_generation(objects.iter().copied(), now_unix) else {
         return unavailable(vec!["ROOT", "PATH", "BYTES"]);
@@ -226,12 +206,11 @@ pub(crate) fn box_listing(cache: &ObjectCache, selected: usize, now_unix: i64) -
     } else {
         ListingKind::Rows
     };
-    let detail = super::detail::remotefile_detail_for(cache, &rows, selected);
     Projection {
         listing,
         rows,
         headers: vec!["ROOT", "PATH", "BYTES"],
-        detail,
+        detail: Vec::new(),
         hold_caption: false,
     }
 }

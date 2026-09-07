@@ -1,16 +1,16 @@
 use mediaops_core::{Kind, Spec};
-use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::actions::MutationTarget;
 use crate::cache::ObjectKey;
 use crate::inventory::committed_inventory_generation;
 use crate::model::{Screen, UiModel};
-use crate::projection::{Projection, project};
+use crate::projection::{Projection, filtered_rows, select_detail};
 use crate::session::Session;
 
-pub fn project_ui(session: &Session, ui: &mut UiModel) -> Projection {
+/// Reconcile live selection and geometry without arming an undrawn target.
+pub fn reconcile_ui(session: &Session, ui: &mut UiModel) -> Projection {
     let now = crate::clock::unix_now();
-    let mut projection = project(&session.cache, ui.screen, ui.selected, now);
+    let mut projection = filtered_rows(&session.cache, ui.screen, now, &ui.filter);
     if let Some(key) = &ui.selected_key {
         match projection.rows.iter().position(|row| {
             row.kind == key.kind
@@ -25,7 +25,17 @@ pub fn project_ui(session: &Session, ui: &mut UiModel) -> Projection {
         }
     }
     ui.selected = ui.selected.min(projection.rows.len().saturating_sub(1));
-    projection = project(&session.cache, ui.screen, ui.selected, now);
+    select_detail(&session.cache, ui.screen, &mut projection, ui.selected, now);
+    let shell = crate::geometry::Shell::for_ui(ui);
+    let visible_rows = shell.list.table_rows().max(1);
+    ui.table_offset = ui.table_offset.min(ui.selected);
+    if ui.selected >= ui.table_offset.saturating_add(visible_rows) {
+        ui.table_offset = ui.selected.saturating_sub(visible_rows - 1);
+    }
+    ui.table_offset = ui
+        .table_offset
+        .min(projection.rows.len().saturating_sub(visible_rows));
+    crate::update::clamp_overlays(ui);
     let Some(row) = projection.rows.get(ui.selected) else {
         ui.select_row(0, 0);
         ui.clear_action_selection();
@@ -34,33 +44,20 @@ pub fn project_ui(session: &Session, ui: &mut UiModel) -> Projection {
     ui.selected_key = Some(ObjectKey::new(row.kind, &row.name));
     ui.selected_uid = Some(row.uid.clone());
     ui.selected_rv = Some(row.rv);
-    let body = Rect::new(0, 0, ui.cols, ui.rows.saturating_sub(5));
-    let detail = if ui.split_detail() {
-        Layout::horizontal([
-            Constraint::Percentage(58),
-            Constraint::Length(1),
-            Constraint::Min(24),
-        ])
-        .split(body)[2]
-    } else {
-        body
-    };
-    let value_width = usize::from(detail.width.saturating_sub(15)).max(1);
-    let total_lines: usize = projection
-        .detail
-        .iter()
-        .map(|line| crate::view_text::wrap_text(&line.value, value_width).len())
-        .sum();
-    let visible_lines = usize::from(
-        detail
-            .height
-            .saturating_sub(u16::from(projection.hold_caption)),
-    );
-    ui.detail_offset = ui
-        .detail_offset
-        .min(u16::try_from(total_lines.saturating_sub(visible_lines)).unwrap_or(u16::MAX));
+    clamp_detail_scroll(ui, &projection);
+    let value_width = shell.detail.value_width();
+    let visible_lines = usize::from(shell.detail.facts(projection.hold_caption).height);
     let identity_lines = crate::view_text::wrap_text(&row.identity, value_width).len();
     ui.identity_clipped = ui.detail_offset > 0 || identity_lines > visible_lines;
+    projection
+}
+
+/// Capture mutation eligibility only for the projection about to be drawn.
+pub fn project_ui(session: &Session, ui: &mut UiModel) -> Projection {
+    let projection = reconcile_ui(session, ui);
+    let Some(row) = projection.rows.get(ui.selected) else {
+        return projection;
+    };
     if !ui.mutation_pending {
         ui.rendered_target = if ui.mutations_enabled(session.sync) {
             match ui.screen {
@@ -92,10 +89,49 @@ pub fn project_ui(session: &Session, ui: &mut UiModel) -> Projection {
     projection
 }
 
+/// Production event path: reconcile before navigation, but never recapture a
+/// target before a draw. Multiple key events can arrive between redraw ticks.
+pub fn handle_event(
+    session: &Session,
+    ui: &mut UiModel,
+    event: &crossterm::event::Event,
+) -> crate::update::UpdateEffect {
+    let projection = reconcile_ui(session, ui);
+    let command = crate::keys::command_for_ui(event, ui);
+    let page = crate::geometry::Shell::for_ui(ui).page(ui, projection.hold_caption);
+    let effect = crate::update::apply(
+        crate::update::Update {
+            ui,
+            sync: session.sync,
+            row_count: projection.rows.len(),
+            page,
+        },
+        command,
+    );
+    clamp_detail_scroll(ui, &projection);
+    effect
+}
+
+/// Also called on key events, so End then Up works even between redraws.
+pub fn clamp_detail_scroll(ui: &mut UiModel, projection: &Projection) {
+    let shell = crate::geometry::Shell::for_ui(ui);
+    let value_width = shell.detail.value_width();
+    let total_lines: usize = projection
+        .detail
+        .iter()
+        .map(|line| crate::view_text::wrap_text(&line.value, value_width).len())
+        .sum();
+    let visible_lines = usize::from(shell.detail.facts(projection.hold_caption).height);
+    ui.detail_offset = ui
+        .detail_offset
+        .min(u16::try_from(total_lines.saturating_sub(visible_lines)).unwrap_or(u16::MAX));
+}
+
 pub fn can_submit(session: &Session, ui: &UiModel, target: &MutationTarget) -> bool {
     if !session.sync.writes_allowed()
         || !ui.in_detail
         || ui.help
+        || ui.input.is_some()
         || ui.undersize()
         || ui.identity_clipped
         || ui.rendered_target.as_ref() != Some(target)

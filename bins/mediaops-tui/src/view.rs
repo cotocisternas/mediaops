@@ -1,15 +1,15 @@
-//! Draw the operations ledger. Tokens from DESIGN.md.
+//! Resource browser shell. Geometry is shared with interaction and scrolling.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
 
 use crate::disk::DiskObservation;
-use crate::model::{SyncState, UiModel};
+use crate::geometry::Shell;
+use crate::model::{InputMode, SyncState, UiModel};
 use crate::projection::Projection;
 use crate::report::render_report;
 use crate::view_chrome::{
-    render_detail, render_footer, render_help, render_masthead, render_rule, render_status,
-    render_table, render_undersize,
+    render_detail, render_footer, render_help, render_hints, render_masthead, render_pane,
+    render_status, render_table, render_tabs, render_undersize,
 };
 
 pub fn render(
@@ -25,40 +25,46 @@ pub fn render(
         render_undersize(frame, color);
         return;
     }
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(frame.area());
-    render_masthead(frame, chunks[0], ui, sync, disk, color);
-    render_rule(frame, chunks[1]);
-    if ui.help {
-        render_help(frame, chunks[2], ui);
-    } else if let Some(report) = ui.report.as_ref() {
-        render_report(frame, chunks[2], report, ui.report_offset);
-    } else if ui.split_detail() {
-        let panes = Layout::horizontal([
-            Constraint::Percentage(58),
-            Constraint::Length(1),
-            Constraint::Min(24),
-        ])
-        .split(chunks[2]);
-        render_table(frame, panes[0], ui, projection, sync, color, list_failed);
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new("|\n".repeat(usize::from(panes[1].height))),
-            panes[1],
+    let shell = Shell::new(frame.area(), ui.split_detail());
+    render_masthead(frame, shell.header, sync, disk, color);
+    render_hints(frame, shell.hints, ui, sync, color);
+    render_tabs(frame, shell.tabs, ui, color);
+    let filter_editing = matches!(ui.input, Some(InputMode::Filter { .. }));
+    let focused = ui.input.is_none();
+    if ui.help && !filter_editing {
+        render_pane(
+            frame,
+            shell.overlay,
+            if focused {
+                " Help [focus] "
+            } else {
+                " Help [preview] "
+            },
+            focused,
+            color,
         );
-        render_detail(frame, panes[2], ui, projection, color);
-    } else if ui.in_detail {
-        render_detail(frame, chunks[2], ui, projection, color);
+        render_help(frame, shell.overlay.inner, ui);
+    } else if let Some(report) = ui.report.as_ref().filter(|_| !filter_editing) {
+        render_pane(
+            frame,
+            shell.overlay,
+            if focused {
+                " Sync report [focus] "
+            } else {
+                " Sync report [preview] "
+            },
+            focused,
+            color,
+        );
+        render_report(frame, shell.overlay.inner, report, ui.report_offset);
     } else {
-        render_table(frame, chunks[2], ui, projection, sync, color, list_failed);
+        if ui.split_detail() || !ui.in_detail {
+            render_table(frame, shell.list, ui, projection, sync, color, list_failed);
+        }
+        if ui.split_detail() || ui.in_detail {
+            render_detail(frame, shell.detail, ui, projection, color);
+        }
     }
-    render_rule(frame, chunks[3]);
-    render_status(frame, chunks[4], ui, sync, projection, list_failed);
-    render_footer(frame, chunks[5], ui, sync, color);
+    render_status(frame, shell.status, ui, sync, projection, list_failed);
+    render_footer(frame, shell.footer, ui, sync, color);
 }

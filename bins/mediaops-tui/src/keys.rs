@@ -3,7 +3,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use crate::actions::Mutation;
-use crate::model::Screen;
+use crate::model::{Screen, UiModel};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -18,12 +18,68 @@ pub enum Command {
     RowEnd,
     EnterDetail,
     Back,
+    Filter,
+    CommandInput,
+    InputChar(char),
+    InputBackspace,
+    InputClear,
+    InputAccept,
+    InputCancel,
     Mutate(Mutation),
     PreviewSync,
     RunSync,
     ReleaseSync,
     Resize { cols: u16, rows: u16 },
     Ignore,
+}
+
+/// Text input is decoded before global shortcuts. Release events still reach
+/// the sync latch, but cannot insert text or queue an operation.
+pub fn command_for_ui(event: &Event, ui: &UiModel) -> Command {
+    // The resize notice replaces every pane, including the editor. Honor its
+    // advertised exit key without interpreting hidden input or action keys.
+    if ui.undersize() {
+        return match command_from_event(event) {
+            command @ (Command::Quit | Command::ReleaseSync | Command::Resize { .. }) => command,
+            _ => Command::Ignore,
+        };
+    }
+    if ui.input.is_none() {
+        return command_from_event(event);
+    }
+    match event {
+        Event::Resize(cols, rows) => Command::Resize {
+            cols: *cols,
+            rows: *rows,
+        },
+        Event::Key(key) => {
+            if key.kind == KeyEventKind::Release && matches!(key.code, KeyCode::Char('S' | 's')) {
+                return Command::ReleaseSync;
+            }
+            if key.kind != KeyEventKind::Press {
+                return Command::Ignore;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                return match key.code {
+                    KeyCode::Char('c') => Command::Quit,
+                    KeyCode::Char('u') => Command::InputClear,
+                    _ => Command::Ignore,
+                };
+            }
+            match key.code {
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::ALT) && !c.is_control() =>
+                {
+                    Command::InputChar(c)
+                }
+                KeyCode::Backspace => Command::InputBackspace,
+                KeyCode::Enter => Command::InputAccept,
+                KeyCode::Esc => Command::InputCancel,
+                _ => Command::Ignore,
+            }
+        }
+        _ => Command::Ignore,
+    }
 }
 
 pub fn command_from_event(event: &Event) -> Command {
@@ -70,10 +126,12 @@ fn command_from_key(key: KeyEvent) -> Command {
         KeyCode::Down | KeyCode::Char('j') => Command::RowDelta(1),
         KeyCode::PageUp => Command::PageDelta(-1),
         KeyCode::PageDown => Command::PageDelta(1),
-        KeyCode::Home => Command::RowHome,
-        KeyCode::End => Command::RowEnd,
-        KeyCode::Enter => Command::EnterDetail,
+        KeyCode::Home | KeyCode::Char('g') => Command::RowHome,
+        KeyCode::End | KeyCode::Char('G') => Command::RowEnd,
+        KeyCode::Enter | KeyCode::Char('d') => Command::EnterDetail,
         KeyCode::Esc => Command::Back,
+        KeyCode::Char('/') => Command::Filter,
+        KeyCode::Char(':') => Command::CommandInput,
         KeyCode::Char('W') => Command::Mutate(Mutation::ApplyWant),
         KeyCode::Char('D') => Command::Mutate(Mutation::DeleteWant),
         KeyCode::Char('A') => Command::Mutate(Mutation::ApproveHold),

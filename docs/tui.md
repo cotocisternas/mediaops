@@ -1,6 +1,6 @@
 # Home TUI
 
-`mediaops-tui` is an additive Home API viewer with scoped Want/Hold actions.
+`mediaops-tui` is a keyboard-driven Home API resource browser with scoped Want/Hold actions.
 It is not a `mediaops` subcommand.
 
 ```bash
@@ -32,11 +32,48 @@ detail, and actions still target those IDs, never the display label. If no name
 metadata is available, a readable key label or the original ID is shown instead
 of guessing a name or making an external metadata request.
 
-Tab / Shift-Tab cycle screens. Arrows and `j`/`k`, PageUp/Down, Home/End move
-rows. In detail, those keys scroll facts instead. Enter opens detail; Esc goes
-back. `?` is read-only help. `p` previews eligible copies. `S` schedules a
-fresh sync (not permanent watching). `q`, Ctrl-C, and SIGTERM exit 0 after
-restoring the terminal.
+All seven resource tabs stay visible; the active tab and focused pane are
+emphasized. The table frame names the resource and its count, and `>` marks the
+selected row. At 120 columns or wider, a detail preview follows the selected
+row. Enter or `d` focuses detail. In narrower terminals it opens a full-width
+detail pane. Esc returns to the list. The minimum size is 60×16.
+
+Tab / Shift-Tab cycle screens. Arrows and `j`/`k`, PageUp/Down, Home/End or
+`g`/`G` move rows. In detail, help, or a report, those keys scroll instead.
+`?` is read-only help. `p` previews eligible copies. `S` schedules a fresh sync
+(not permanent watching). `q`, Ctrl-C, and SIGTERM exit 0 after restoring the terminal.
+
+## Filter and resource commands
+
+Press `/` and type to filter the current table by readable text or exact identity.
+Matching is case-insensitive literal text, including Unicode; it is not a regular
+expression. Enter keeps the filter. Esc while editing restores the previous
+filter; Esc in the list clears it. Switching resources resets it. The query
+stays in the pane frame, including detail; lists show matching counts and row
+position. Zero results show `no matching resources`.
+Unavailable or stale data keeps its corresponding status.
+
+Press `:` to navigate by resource name, for example `:jobs` then Enter.
+The hint row suggests matching commands.
+
+| Command | Opens |
+| --- | --- |
+| `:overview` | Overview |
+| `:want`, `:wants` | Wants |
+| `:job`, `:jobs` | Jobs |
+| `:hold`, `:holds` | Holds |
+| `:title`, `:titles` | Titles |
+| `:node`, `:nodes` | Nodes |
+| `:box` | Box listing |
+| `:help` | Help |
+| `:q`, `:quit` | Exit |
+
+During filter or command entry, keys such as `q`, `W`, `A`, `p`, and `S` are
+text. Backspace edits, Ctrl-U clears, Esc cancels, and Ctrl-C exits. Paste and
+repeat events are ignored. Enter only keeps a filter or runs one of the listed
+navigation commands; it never writes or schedules a sync.
+
+## Progress and status
 
 Jobs show copied bytes as a percentage of their captured file size. `100%` means
 the bytes have arrived; the phase distinguishes verification from installation.
@@ -49,14 +86,15 @@ the retry countdown and disables actions. `?` includes the complete status text
 when it is too long for the status row, plus service/log inspection commands;
 help scrolls with the same navigation keys. Navigation dismisses a completed
 operation's message from the status row and retains it in help as `Last status`.
+An outcome received during input stays available after the editor closes.
 An unavailable inventory points to
 Nodes. When identity visibility disables an action, the status explains how to
 restore it.
 
 ## Mutations
 
-Only in selected detail, and only while the stream is `Current`, the terminal is
-at least 60×16, and the identity is not clipped:
+Only in focused detail with no input editor open, and only while the stream is
+`Current`, the terminal is at least 60×16, and the identity is not clipped:
 
 | Key | Action |
 | --- | --- |
@@ -72,7 +110,7 @@ release, not merely its TitleId. Repeat, paste, and help never queue a write.
 ## Sync
 
 Global, not a Want/Hold mutation. Requires `Current`, at least 60×16, no help
-overlay, and no pending operation:
+overlay or input editor, and no pending operation:
 
 | Key | Action |
 | --- | --- |
@@ -81,7 +119,8 @@ overlay, and no pending operation:
 
 The report pane shows request id, captured generation, copy/reuse/present/
 blocked/ineligible counts, and scrollable source/destination/reason rows.
-Esc returns. There is no confirmation prompt and no automatic Hold decision.
+If the report arrives during input, it waits until the editor closes. Esc
+returns. There is no confirmation prompt and no automatic Hold decision.
 
 Writes check the displayed UID and resourceVersion against a fresh read and
 submit once. Conflicts refresh rather than retry; an uncertain response is shown

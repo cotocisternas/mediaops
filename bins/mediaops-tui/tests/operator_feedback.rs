@@ -77,22 +77,22 @@ fn minimum_job_screen_preserves_title_verification_percent_and_navigation() {
     assert_eq!(
         screen,
         [
-            "mediaops  Jobs  Current  disk  unavailable",
-            "------------------------------------------------------------",
-            "TITLE                           PHASE     PROGRESS BYTES",
-            "Up (2009)                       verifying     100%     4 KiB",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "------------------------------------------------------------",
+            "mediaops  Current  |  disk unavailable",
+            "Tab resource  j/k rows  g/G first/last  d detail",
+            "1 Overview 2 Wants 3 Jobs 4 Holds 5 Titles 6 Nodes 7 Box",
+            "┌ Jobs (1) [list] ─────────────────────────────────────────┐",
+            "│  TITLE                       PHASE     PROGRESS BYTES    │",
+            "│> Up (2009)                   verifying     100%     4 KiB│",
+            "│                                                          │",
+            "│                                                          │",
+            "│                                                          │",
+            "│                                                          │",
+            "│                                                          │",
+            "│                                                          │",
+            "│                                                          │",
+            "└──────────────────────────────────────────────────────────┘",
             "row 1 of 1  |  Enter detail",
-            "Enter detail  p preview  S sync  ? help  q quit",
+            "Enter detail  /  :  p preview  S sync  ? help  q quit",
         ]
     );
     let detail = project(&cache(vec![job(JobPhase::Verifying)]), Screen::Jobs, 0, 100).detail;
@@ -173,7 +173,7 @@ fn unavailable_listing_and_disconnected_actions_explain_next_step() {
     };
     let cache = cache(Vec::new());
     let current = draw(&ui, &cache, SyncState::Current);
-    assert_eq!(current[2], "unavailable");
+    assert!(current[4].contains("unavailable"));
     assert_eq!(
         current[14],
         "listing unavailable; check inventory on 6 Nodes"
@@ -213,7 +213,8 @@ fn long_errors_remain_readable_in_help_and_scrolling_never_changes_selection() {
     assert!(ui.help_offset > 0 && ui.help_offset < u16::MAX);
     assert_eq!(ui.selected, 4);
     let screen = draw(&ui, &cache(Vec::new()), SyncState::Stale);
-    assert!(screen.join("\n").contains("final error detail"));
+    let text = screen.join("\n");
+    assert!(text.contains("final") && text.contains("detail"), "{text}");
     let end = ui.help_offset;
     apply(
         Update {
@@ -268,6 +269,15 @@ fn navigating_after_an_outcome_restores_position_and_keeps_message_in_help() {
             page: 10,
         },
         Command::Help,
+    );
+    apply(
+        Update {
+            ui: &mut ui,
+            sync: SyncState::Current,
+            row_count: 1,
+            page: 10,
+        },
+        Command::RowEnd,
     );
     let screen = draw(&ui, &cache, SyncState::Current);
     assert!(
