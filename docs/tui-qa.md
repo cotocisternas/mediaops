@@ -7,6 +7,10 @@ a real PTY.
 verification versus byte completion, scheduling pauses, absent workers,
 heartbeat age, inventory failure guidance and scrollable connection errors.
 
+`tests/resource_browser.rs` covers filtering, resource aliases, editor isolation,
+filtered identity and mutation targets, live replacement, pane focus in color
+and monochrome, Unicode input, and shared scroll/identity geometry.
+
 ## Local fixture
 
 ```bash
@@ -43,7 +47,18 @@ Must return the terminal to cooked mode after draw (and after a panic).
 Drive a real terminal (tmux is fine for keys; do not treat `tmux capture-pane`
 as truecolor evidence):
 
-- [ ] seven screens, Tab / 1–7, j/k, Enter/Esc, `?`, `q`
+- [ ] seven visible tabs, Tab / 1–7, j/k, g/G, Enter/d/Esc, `?`, `q`
+- [ ] `:jobs` and singular aliases navigate; `:help` opens help; `:q` quits; an unknown command explains the available commands
+- [ ] `/matrix` filters readable titles and exact IDs; Enter keeps it; Esc in the list clears it; Esc during editing restores the prior filter
+- [ ] filtered detail and selected action identify the same exact object, including two Holds sharing one title
+- [ ] typing `qWDXASp123?gG` in either editor remains text; Enter cannot write; Backspace, Ctrl-U, Unicode, and cancellation work
+- [ ] no matches is distinct from known-empty or unavailable; the active filter remains visible
+- [ ] at 120+ columns the detail preview follows selection; Enter focuses detail, and Esc restores list navigation
+- [ ] exactly 120×16: the complete Hold caption fits; PageDown/Up advances by the visible rows or fact lines
+- [ ] type a filter and press Enter twice quickly: detail remains on the filtered object even before a redraw
+- [ ] cancel a resource command after scrolling: the list viewport stays in place
+- [ ] start a preview and immediately open `/`: keep filtering the visible list; receive the completed report after leaving the editor
+- [ ] completion messages arriving during command input remain readable after it closes
 - [ ] Jobs show readable titles, complete phase names and percentages at 60 columns; detail separates copied bytes from verification/installation
 - [ ] Overview exposes scheduling/encode pauses; missing or expired workers have an inspection command
 - [ ] row/line position follows navigation; long errors remain readable via `?`, End, Up, Home without changing the selected object
@@ -55,7 +70,7 @@ as truecolor evidence):
 - [ ] missing socket shows reconnecting, not a local DB
 - [ ] kill the fixture: `NOT CURRENT`, mutations off, then restart: Current
 - [ ] wait past inventory freshness: Holds/Box become unavailable
-- [ ] resize below 60×16: notice, mutations off; restore size
+- [ ] resize below 60×16 from list, detail and input: notice, mutations off, advertised quit works; restore size
 - [ ] `--color never` and `NO_COLOR`: reverse/bold still mark focus and stale
 - [ ] Unicode title clips on cell width, not byte length
 - [ ] redirected stdin/stdout or `TERM=dumb`: exit 2, no escapes

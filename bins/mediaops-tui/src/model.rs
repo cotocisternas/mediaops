@@ -7,6 +7,12 @@ pub const MIN_COLS: u16 = 60;
 pub const MIN_ROWS: u16 = 16;
 pub const SPLIT_COLS: u16 = 120;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputMode {
+    Filter { original: String },
+    Command { text: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Overview,
@@ -57,6 +63,19 @@ impl Screen {
         }
     }
 
+    pub fn from_alias(alias: &str) -> Option<Self> {
+        match alias {
+            "overview" => Some(Self::Overview),
+            "want" | "wants" => Some(Self::Wants),
+            "job" | "jobs" => Some(Self::Jobs),
+            "hold" | "holds" => Some(Self::Holds),
+            "title" | "titles" => Some(Self::Titles),
+            "node" | "nodes" => Some(Self::Nodes),
+            "box" => Some(Self::BoxListing),
+            _ => None,
+        }
+    }
+
     pub fn next(self) -> Self {
         Self::ALL[(self.number() as usize) % Self::ALL.len()]
     }
@@ -96,6 +115,8 @@ pub struct UiModel {
     pub in_detail: bool,
     pub help: bool,
     pub help_offset: u16,
+    pub input: Option<InputMode>,
+    pub filter: String,
     pub selected: usize,
     pub table_offset: usize,
     pub detail_offset: u16,
@@ -107,8 +128,10 @@ pub struct UiModel {
     pub sync_key_held: bool,
     pub keyboard_event_types: bool,
     pub report: Option<SyncReport>,
+    pub deferred_report: Option<SyncReport>,
     pub report_offset: u16,
     pub message: Option<String>,
+    pub message_unseen: bool,
     pub last_message: Option<String>,
     pub connection_message: Option<String>,
     pub selected_key: Option<ObjectKey>,
@@ -125,6 +148,8 @@ impl Default for UiModel {
             in_detail: false,
             help: false,
             help_offset: 0,
+            input: None,
+            filter: String::new(),
             selected: 0,
             table_offset: 0,
             detail_offset: 0,
@@ -136,8 +161,10 @@ impl Default for UiModel {
             sync_key_held: false,
             keyboard_event_types: false,
             report: None,
+            deferred_report: None,
             report_offset: 0,
             message: None,
+            message_unseen: false,
             last_message: None,
             connection_message: None,
             selected_key: None,
@@ -150,6 +177,20 @@ impl Default for UiModel {
 }
 
 impl UiModel {
+    pub fn completion_message(&mut self, message: Option<String>) {
+        self.message_unseen = message.is_some();
+        self.message = message;
+    }
+
+    pub fn present_deferred_report(&mut self) {
+        if self.input.is_none()
+            && let Some(report) = self.deferred_report.take()
+        {
+            self.report = Some(report);
+            self.report_offset = 0;
+        }
+    }
+
     pub fn undersize(&self) -> bool {
         self.cols < MIN_COLS || self.rows < MIN_ROWS
     }
@@ -162,6 +203,7 @@ impl UiModel {
         sync.writes_allowed()
             && self.in_detail
             && !self.help
+            && self.input.is_none()
             && !self.undersize()
             && !self.identity_clipped
             && !self.mutation_pending
@@ -173,6 +215,7 @@ impl UiModel {
     pub fn sync_actions_enabled(&self, sync: SyncState) -> bool {
         sync.writes_allowed()
             && !self.help
+            && self.input.is_none()
             && !self.undersize()
             && !self.mutation_pending
             && !self.sync_pending

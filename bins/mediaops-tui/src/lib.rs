@@ -6,6 +6,7 @@ pub mod cache;
 mod clock;
 pub mod disk;
 pub mod format;
+pub mod geometry;
 pub mod interaction;
 pub mod inventory;
 pub mod keys;

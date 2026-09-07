@@ -20,6 +20,7 @@ pub const HOLD_CAPTION: &str = "Approve records a decision; it does not install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListingKind {
     KnownEmpty(&'static str),
+    NoMatches,
     Unavailable,
     Rows,
 }
@@ -50,14 +51,95 @@ pub struct Projection {
 }
 
 pub fn project(cache: &ObjectCache, screen: Screen, selected: usize, now_unix: i64) -> Projection {
+    let mut projection = project_rows(cache, screen, now_unix);
+    select_detail(cache, screen, &mut projection, selected, now_unix);
+    projection
+}
+
+fn project_rows(cache: &ObjectCache, screen: Screen, now_unix: i64) -> Projection {
     match screen {
-        Screen::Overview => overview::overview(cache, selected, now_unix),
-        Screen::Wants => lists::wants(cache, selected, now_unix),
-        Screen::Jobs => lists::jobs(cache, selected, false, now_unix),
-        Screen::Holds => lists::holds(cache, selected, now_unix),
-        Screen::Titles => overview::titles(cache, selected, now_unix),
-        Screen::Nodes => lists::nodes(cache, selected, now_unix),
-        Screen::BoxListing => lists::box_listing(cache, selected, now_unix),
+        Screen::Overview => overview::overview(cache, now_unix),
+        Screen::Wants => lists::wants(cache, now_unix),
+        Screen::Jobs => lists::jobs(cache, false, now_unix),
+        Screen::Holds => lists::holds(cache, now_unix),
+        Screen::Titles => overview::titles(cache, now_unix),
+        Screen::Nodes => lists::nodes(cache, now_unix),
+        Screen::BoxListing => lists::box_listing(cache, now_unix),
+    }
+}
+
+/// Build rows once, then select detail by the retained row's exact object key.
+/// Filtering never turns a displayed row index into an unfiltered source index.
+pub fn project_filtered(
+    cache: &ObjectCache,
+    screen: Screen,
+    selected: usize,
+    now_unix: i64,
+    query: &str,
+) -> Projection {
+    let mut projection = filtered_rows(cache, screen, now_unix, query);
+    let selected = selected.min(projection.rows.len().saturating_sub(1));
+    select_detail(cache, screen, &mut projection, selected, now_unix);
+    projection
+}
+
+pub(crate) fn filtered_rows(
+    cache: &ObjectCache,
+    screen: Screen,
+    now_unix: i64,
+    query: &str,
+) -> Projection {
+    let mut projection = project_rows(cache, screen, now_unix);
+    if !query.is_empty() {
+        // Uppercase maps both Greek sigma forms to Σ, independent of whether
+        // the query contains the whole word or only its final letter.
+        let query = sanitize(query).to_uppercase();
+        projection.rows.retain(|row| {
+            sanitize(&row.identity).to_uppercase().contains(&query)
+                || row
+                    .cells
+                    .iter()
+                    .any(|cell| sanitize(cell).to_uppercase().contains(&query))
+        });
+        if projection.rows.is_empty() && projection.listing != ListingKind::Unavailable {
+            projection.listing = ListingKind::NoMatches;
+        }
+    }
+    projection
+}
+
+pub(crate) fn select_detail(
+    cache: &ObjectCache,
+    screen: Screen,
+    projection: &mut Projection,
+    selected: usize,
+    now_unix: i64,
+) {
+    let rows = &projection.rows;
+    projection.detail = match screen {
+        Screen::Overview => overview::overview_detail(cache, rows, selected, now_unix),
+        Screen::Wants => rows
+            .get(selected)
+            .and_then(|row| {
+                cache
+                    .get(&crate::cache::ObjectKey::new(row.kind, &row.name))
+                    .and_then(|entry| entry.object.as_ref())
+                    .map(detail::want_detail)
+            })
+            .unwrap_or_default(),
+        Screen::Jobs => detail::job_detail_for(cache, rows, selected),
+        Screen::Holds => detail::hold_detail_for(cache, rows, selected),
+        Screen::Titles => rows
+            .get(selected)
+            .map(|row| facts::why_facts(cache, &row.name, now_unix))
+            .unwrap_or_default(),
+        Screen::Nodes => detail::node_detail_for(cache, rows, selected, now_unix),
+        Screen::BoxListing => detail::remotefile_detail_for(cache, rows, selected),
+    };
+    if matches!(screen, Screen::Titles | Screen::Holds)
+        && let Some(row) = rows.get(selected)
+    {
+        projection.detail.insert(1, line("title", &row.cells[0]));
     }
 }
 

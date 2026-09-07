@@ -60,7 +60,7 @@ fn paint(ui: UiModel, screen: Screen, sync: SyncState) -> Vec<String> {
 }
 
 #[test]
-fn footer_allowlist_and_help_omits_mutations() {
+fn contextual_shortcuts_follow_allowlist_and_help_omits_mutations() {
     let base = |screen, detail, help| UiModel {
         screen,
         cols: 80,
@@ -93,9 +93,9 @@ fn footer_allowlist_and_help_omits_mutations() {
         Screen::Titles,
         SyncState::Current,
     );
-    let footer = titles.last().expect("footer");
-    assert!(footer.contains("W apply"), "{footer}");
-    assert!(!footer.contains("D delete"), "{footer}");
+    let shortcuts = &titles[1];
+    assert!(shortcuts.contains("W apply"), "{shortcuts}");
+    assert!(!shortcuts.contains("D delete"), "{shortcuts}");
     let help = paint(
         base(Screen::Wants, true, true),
         Screen::Wants,

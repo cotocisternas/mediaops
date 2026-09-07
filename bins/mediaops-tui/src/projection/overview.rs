@@ -5,7 +5,7 @@ use mediaops_core::{JobPhase, Kind, Spec, StatusBody, WantPhase};
 use super::{ListingKind, NOTHING_HAPPENING, Projection, TableRow, row};
 use crate::cache::ObjectCache;
 
-pub(crate) fn overview(cache: &ObjectCache, selected: usize, now_unix: i64) -> Projection {
+pub(crate) fn overview(cache: &ObjectCache, now_unix: i64) -> Projection {
     let names = super::names::Names::from_cache(cache, now_unix);
     let mut rows = Vec::new();
     for obj in cache.live_kind(Kind::Cluster) {
@@ -84,17 +84,16 @@ pub(crate) fn overview(cache: &ObjectCache, selected: usize, now_unix: i64) -> P
     } else {
         ListingKind::KnownEmpty(NOTHING_HAPPENING)
     };
-    let detail = overview_detail(cache, &rows, selected, now_unix);
     Projection {
         listing,
         rows,
         headers: vec!["KIND", "TITLE", "FACT"],
-        detail,
+        detail: Vec::new(),
         hold_caption: false,
     }
 }
 
-fn overview_detail(
+pub(super) fn overview_detail(
     cache: &ObjectCache,
     rows: &[TableRow],
     selected: usize,
@@ -131,7 +130,7 @@ fn overview_detail(
     }
 }
 
-pub(crate) fn titles(cache: &ObjectCache, selected: usize, now_unix: i64) -> Projection {
+pub(crate) fn titles(cache: &ObjectCache, now_unix: i64) -> Projection {
     let ids = super::facts::title_union(cache, now_unix);
     let names = super::names::Names::from_cache(cache, now_unix);
     let rows: Vec<TableRow> = ids
@@ -150,18 +149,11 @@ pub(crate) fn titles(cache: &ObjectCache, selected: usize, now_unix: i64) -> Pro
     } else {
         ListingKind::Rows
     };
-    let mut detail = rows
-        .get(selected)
-        .map(|r| super::facts::why_facts(cache, &r.name, now_unix))
-        .unwrap_or_default();
-    if let Some(row) = rows.get(selected) {
-        detail.insert(1, super::line("title", &row.cells[0]));
-    }
     Projection {
         listing,
         rows,
         headers: vec!["TITLE"],
-        detail,
+        detail: Vec::new(),
         hold_caption: false,
     }
 }

@@ -167,7 +167,7 @@ fn jobs_header_keeps_separate_columns_at_60() {
         false,
         false,
     );
-    let header = &lines(&term)[2];
+    let header = &lines(&term)[4];
     let title = header.find("TITLE").expect("TITLE");
     let phase = header.find("PHASE").expect("PHASE");
     assert!(phase > title + 5, "{header}");
@@ -185,7 +185,7 @@ fn selected_row_is_reverse_cyan() {
         true,
     );
     let buf = term.backend().buffer();
-    let cell = &buf[(0, 3)];
+    let cell = &buf[(1, 5)];
     assert!(cell.modifier.contains(Modifier::REVERSED), "{cell:?}");
     assert_eq!(cell.fg, Color::Cyan);
 }
