@@ -49,6 +49,61 @@ fn write_ds(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn doctor_deep_checkout_cwd_continues_to_health_checks() {
+    let dir = scratch("doctor-deep-cwd");
+    let config = scratch("doctor-deep-config");
+    std::fs::create_dir(dir.join(".git")).expect("git");
+    let cwd = dir.join("a/b/c/d/e/f");
+    std::fs::create_dir_all(cwd.join("g/h/i/j/k/l")).expect("deep tree");
+    let output = bin()
+        .current_dir(&cwd)
+        .args(["-o", "json", "doctor", "--config-dir"])
+        .arg(&config)
+        .arg("--socket")
+        .arg(config.join("missing.sock"))
+        .output()
+        .expect("doctor");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let value = stdout_json(&output);
+    assert_eq!(value["error"]["code"], "runtime");
+    assert!(!value.to_string().contains("pem scan"));
+    std::fs::remove_dir_all(dir).expect("cleanup");
+    std::fs::remove_dir_all(config).expect("cleanup config");
+}
+
+#[test]
+fn doctor_deep_checkout_cwd_credential_is_policy_refusal() {
+    let dir = scratch("doctor-deep-credential");
+    let config = scratch("doctor-credential-config");
+    std::fs::write(dir.join(".git"), "gitdir: elsewhere\n").expect("git marker");
+    let deep = dir.join("a/b/c/d/e/f/g");
+    std::fs::create_dir_all(&deep).expect("deep tree");
+    let credential = deep.join("private.key");
+    std::fs::write(&credential, "secret-content-not-for-output").expect("credential");
+    let output = bin()
+        .current_dir(&dir)
+        .args(["-o", "json", "doctor", "--config-dir"])
+        .arg(&config)
+        .arg("--socket")
+        .arg(config.join("missing.sock"))
+        .output()
+        .expect("doctor");
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    let value = stdout_json(&output);
+    assert_eq!(value["error"]["code"], "policy_refusal");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&credential.display().to_string())
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret-content-not-for-output"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret-content-not-for-output"));
+    std::fs::remove_dir_all(dir).expect("cleanup");
+    std::fs::remove_dir_all(config).expect("cleanup config");
+}
+
+#[test]
 fn identity_supports_human_and_raw_json() {
     let human = bin().output().expect("identity");
     assert!(human.status.success());

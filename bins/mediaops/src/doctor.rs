@@ -39,7 +39,7 @@ pub fn refuse_pems_in_git_work_tree(dir: &Path) -> Result<(), AppError> {
         return Ok(());
     }
     let mut hits = Vec::new();
-    walk_pems(dir, 0, &mut hits)?;
+    walk_pems(dir, &mut hits)?;
     if hits.is_empty() {
         return Ok(());
     }
@@ -52,26 +52,28 @@ pub fn refuse_pems_in_git_work_tree(dir: &Path) -> Result<(), AppError> {
     )))
 }
 
-fn walk_pems(dir: &Path, depth: u8, hits: &mut Vec<PathBuf>) -> Result<(), AppError> {
-    if depth > 4 {
-        return Err(AppError::Policy("pem scan truncated".into()));
-    }
-    let reader = std::fs::read_dir(dir).map_err(|e| AppError::Policy(e.to_string()))?;
-    for entry in reader {
-        let entry = entry.map_err(|e| AppError::Policy(e.to_string()))?;
-        let path = entry.path();
-        if path.is_dir() {
-            if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
-                continue;
+fn walk_pems(dir: &Path, hits: &mut Vec<PathBuf>) -> Result<(), AppError> {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let scan_error = |e| AppError::Policy(format!("pem scan {}: {e}", dir.display()));
+        let reader = std::fs::read_dir(&dir).map_err(scan_error)?;
+        for entry in reader {
+            let entry = entry.map_err(scan_error)?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|e| AppError::Policy(format!("pem scan {}: {e}", path.display())))?;
+            // Inspect the entry itself: child symlinks must never expand the scan.
+            if file_type.is_dir() {
+                if entry.file_name() != ".git" {
+                    pending.push(path);
+                }
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("pem" | "crt" | "key")
+            ) {
+                hits.push(path);
             }
-            walk_pems(&path, depth + 1, hits)?;
-            continue;
-        }
-        if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("pem" | "crt" | "key")
-        ) {
-            hits.push(path);
         }
     }
     Ok(())
@@ -193,6 +195,70 @@ mod tests {
         let err = refuse_pems_in_git_work_tree(&dir).expect_err("pem");
         assert!(err.to_string().contains("PEM") || err.to_string().contains("pem"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pem_scan_completes_deep_trees_and_refuses_deep_credentials() {
+        for marker_file in [false, true] {
+            let dir = crate::test_support::scratch("deep-pem-git");
+            if marker_file {
+                std::fs::write(dir.join(".git"), "gitdir: elsewhere\n").expect("git marker");
+            } else {
+                std::fs::create_dir(dir.join(".git")).expect("git directory");
+                std::fs::write(dir.join(".git/internal.key"), "metadata").expect("metadata");
+            }
+            let deep = dir.join("a/b/c/d/e/f/g/h");
+            std::fs::create_dir_all(&deep).expect("deep tree");
+            refuse_pems_in_git_work_tree(&dir).expect("complete clean scan");
+            for extension in ["pem", "crt", "key"] {
+                let credential = deep.join(format!("credential.{extension}"));
+                std::fs::write(&credential, "private-credential-content").expect("credential");
+                for root in [&dir, &deep] {
+                    let err = refuse_pems_in_git_work_tree(root).expect_err("deep credential");
+                    assert!(matches!(err, AppError::Policy(_)));
+                    assert!(err.to_string().contains(&credential.display().to_string()));
+                    assert!(!err.to_string().contains("private-credential-content"));
+                }
+                std::fs::remove_file(credential).expect("remove credential");
+            }
+            std::fs::remove_dir_all(dir).expect("cleanup");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pem_scan_does_not_follow_child_symlinks_but_refuses_credential_links() {
+        use std::os::unix::fs::symlink;
+        let dir = crate::test_support::scratch("pem-links");
+        let external = crate::test_support::scratch("pem-external");
+        std::fs::create_dir(dir.join(".git")).expect("git");
+        std::fs::write(external.join("external.pem"), "private").expect("external pem");
+        symlink(&external, dir.join("external")).expect("external link");
+        symlink(&dir, dir.join("cycle")).expect("cycle");
+        symlink(dir.join("missing"), dir.join("dangling")).expect("dangling");
+        refuse_pems_in_git_work_tree(&dir).expect("child links are not traversed");
+        for target in [&external, &dir.join("missing")] {
+            for extension in ["pem", "crt", "key"] {
+                let link = dir.join(format!("credential.{extension}"));
+                symlink(target, &link).expect("credential link");
+                let err = refuse_pems_in_git_work_tree(&dir).expect_err("credential link");
+                assert!(err.to_string().contains(&link.display().to_string()));
+                std::fs::remove_file(link).expect("unlink");
+            }
+        }
+        std::fs::remove_dir_all(dir).expect("cleanup");
+        std::fs::remove_dir_all(external).expect("cleanup external");
+    }
+
+    #[test]
+    fn pem_scan_io_errors_fail_closed() {
+        let dir = crate::test_support::scratch("pem-io");
+        std::fs::create_dir(dir.join(".git")).expect("git");
+        let missing = dir.join("missing");
+        let err = refuse_pems_in_git_work_tree(&missing).expect_err("missing scan root");
+        assert!(matches!(err, AppError::Policy(_)));
+        assert!(err.to_string().contains(&missing.display().to_string()));
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]
