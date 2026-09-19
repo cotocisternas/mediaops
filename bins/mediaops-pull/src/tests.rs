@@ -602,3 +602,65 @@ fn adding_an_episode_preserves_existing_proof_and_refuses_digest_rewrites() {
     assert_eq!(updated.files[0], status.files[0]);
     assert!(with_installed_file(&updated, first.to_str().expect("path"), &new).is_err());
 }
+
+#[tokio::test]
+async fn telemetry_observes_only_confirmed_changed_terminal_writes() {
+    use mediaops_telemetry::Terminal;
+    for (phase, expected) in [
+        (JobPhase::Failed, Terminal::Failed),
+        (JobPhase::Refused, Terminal::Refused),
+        (JobPhase::Installed, Terminal::Installed),
+    ] {
+        let mut current = job(Path::new("/unused-telemetry-test"));
+        let api = Api::new(current.clone());
+        let Spec::Job(spec) = &current.spec else {
+            panic!("Job");
+        };
+        let digest = Blake3Hex::of_bytes(&[7; 64]);
+        if phase == JobPhase::Installed {
+            let mut state = api.state.lock().unwrap();
+            let StatusBody::Title(title) = &mut state.title.status else {
+                panic!("Title");
+            };
+            title.files.push(mediaops_core::TitleFileStatus {
+                path: spec.dest_rel.clone(),
+                install_b3: digest.clone(),
+                current_b3: digest.clone(),
+                drifted: false,
+            });
+        }
+        let next = JobStatus {
+            phase,
+            bytes_done: spec.file_len,
+            verified_b3: Some(digest),
+            message: "private error must never reach observer".into(),
+            ..JobStatus::default()
+        };
+        let mut observations = Vec::new();
+        // A stale write fails persistence and must not emit telemetry.
+        current.metadata.resource_version = 0;
+        assert!(
+            save_job_observed(&api, &mut current, next.clone(), |phase, bytes| {
+                observations.push((phase, bytes))
+            })
+            .await
+            .is_err()
+        );
+        assert!(observations.is_empty());
+        current = api.job();
+        save_job_observed(&api, &mut current, next.clone(), |phase, bytes| {
+            observations.push((phase, bytes))
+        })
+        .await
+        .unwrap();
+        assert_eq!(job_status(&api.job()).phase, phase);
+        assert_eq!(observations, vec![(expected, 64)]);
+        // Reconfirming the same phase, including Installed, never counts twice.
+        save_job_observed(&api, &mut current, next, |phase, bytes| {
+            observations.push((phase, bytes))
+        })
+        .await
+        .unwrap();
+        assert_eq!(observations, vec![(expected, 64)]);
+    }
+}

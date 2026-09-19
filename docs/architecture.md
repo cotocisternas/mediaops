@@ -36,6 +36,10 @@ The CLI never dials `seedbox_address` for media traffic; it goes through the gat
 
 **`mediaopsd --role seedbox`** — exposes the WAN mTLS listener and is the only role that performs grabber HTTP on localhost. The home gateway connects to it using `mediaops.v1` Transfer/Control.
 
+The six Home processes optionally push metrics and completed operation spans over
+loopback OTLP/gRPC to local Alloy. See [Home telemetry](telemetry.md) for settings,
+signal definitions and delivery limits.
+
 ## Home API
 
 Package `mediaops.home.v1` (`proto/mediaops/home/v1/home.proto`). The API socket and database are private to the Unix account. `x-mediaops-actor` enforces cooperating roles' write rules; it is not authentication against malicious code already running as that same account. WAN access still requires mTLS through the gateway.
@@ -125,6 +129,7 @@ Cargo workspace. Edges are allowlisted and tested in `crates/arch-tests` (`make 
 | `crates/sync` | leftover planner helpers + unit text |
 | `crates/encode` | EncodePolicy. Not in this slice’s workers |
 | `crates/arr` | Grabber HTTP. Linked only into `mediaopsd` |
+| `crates/telemetry` | Optional loopback OTLP metrics and operation spans for the six Home processes |
 | `crates/arch-tests` | Dependency-graph and I/O-boundary law |
 
 Banned as direct deps: `rsync`, `rclone`, `ftp`, `ssh2`, `russh`, `ffmpeg-next`, `native-tls`. `mediaopsd`, `mediaops-home`, `mediaops-gateway`, `mediaops-scheduler`, `mediaops-inventory`, and `mediaops-pull` must not reach `store` or `encode`.

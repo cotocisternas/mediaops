@@ -34,6 +34,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    let _telemetry = mediaops_telemetry::init(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     match cli.command {
         Command::Serve {
             api_socket,

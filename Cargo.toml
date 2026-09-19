@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/telemetry",
     "crates/core",
     "crates/proto",
     "crates/store",
@@ -80,3 +81,8 @@ mediaops-encode = { path = "crates/encode" }
 mediaops-home-client = { path = "crates/home-client" }
 mediaops-apiserver = { path = "crates/api" }
 mediaops-tui = { path = "bins/mediaops-tui" }
+
+mediaops-telemetry = { path = "crates/telemetry" }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["metrics", "trace", "grpc-tonic"] }

@@ -45,7 +45,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let _telemetry = mediaops_telemetry::init(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    match cli.command {
         Command::Serve {
             socket,
             gateway_socket,
@@ -78,7 +80,10 @@ async fn run(socket: &Path, gateway: &Gateway) -> anyhow::Result<()> {
         }
     });
     loop {
-        if let Err(err) = claim_and_run(&api, gateway).await {
+        let measure = mediaops_telemetry::start(mediaops_telemetry::Operation::PullPass);
+        let result = claim_and_run(&api, gateway).await;
+        measure.finish(result.is_ok());
+        if let Err(err) = result {
             tracing::warn!(error = %err, "pull pass failed");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -583,11 +588,31 @@ async fn save_job(
     job: &mut HomeObject,
     status: JobStatus,
 ) -> anyhow::Result<()> {
-    let changed_phase = job_status(job).phase != status.phase;
+    save_job_observed(api, job, status, mediaops_telemetry::terminal).await
+}
+
+async fn save_job_observed(
+    api: &impl JobApi,
+    job: &mut HomeObject,
+    status: JobStatus,
+    observe: impl FnOnce(mediaops_telemetry::Terminal, u64),
+) -> anyhow::Result<()> {
+    let previous_phase = job_status(job).phase;
     let mut next = job.clone();
     next.status = StatusBody::Job(status);
     *job = api.patch_status(next).await?;
-    if changed_phase {
+    if previous_phase != job_status(job).phase {
+        // Observe the confirmed phase, including failures persisted by run_job
+        // before it returns Ok. Progress includes resumed bytes; do not sum it.
+        let terminal = match job_status(job).phase {
+            JobPhase::Installed => Some(mediaops_telemetry::Terminal::Installed),
+            JobPhase::Failed => Some(mediaops_telemetry::Terminal::Failed),
+            JobPhase::Refused => Some(mediaops_telemetry::Terminal::Refused),
+            _ => None,
+        };
+        if let (Some(phase), Spec::Job(spec)) = (terminal, &job.spec) {
+            observe(phase, spec.file_len);
+        }
         api.event(job).await;
     }
     Ok(())
