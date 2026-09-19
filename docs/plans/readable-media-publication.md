@@ -186,6 +186,30 @@ Generated local evidence and recovery copies are under `target/readable-publicat
 - The 45 preexisting blocked Sync entries documented in `restore-home-sync.md` remain outside this deployment; no conflict repair, Hold approval, reindex, reclaim, remote change, SSH, encoding, media overwrite or broad permission change was performed. Remote daemon and local TUI binaries were not deployed.
 - Preexisting pathname replacement races are not claimed to be full hostile-filesystem hardening; this remains outside the requested scope.
 
+### PR #16 review follow-up — 2026-09-19
+
+Implemented all three approved findings; the frozen approved intent above is unchanged.
+
+- `bins/mediaops/src/doctor.rs`: the iterative PEM scanner now tracks visited directory `(dev, ino)` identities before reading entries. Child symlinks remain excluded and metadata/read-directory/entry/type failures remain policy errors with path context. `pem_scan_visits_duplicate_directory_identities_once` seeds overlapping pending directories and a `child/.` alias, then asserts exactly one credential hit. This is a nonprivileged duplicate-identity test seam, not a reproduced bind-mount infinite traversal; no mounts were performed. Existing deep-tree, symlink and fail-closed missing-root tests still pass. Hostile concurrent pathname replacement remains outside the guarantee.
+- `crates/core/src/install.rs`: replaced recursive absolute-path parent creation with a component-wise walk from an existing directory `library_root`. The root must exist and be a directory; its permission policy is not broadened or subjected to the schema traversal-bit requirement. Each schema ancestor is checked before creating children, using the same traversal validation as recovery/replacement. Only directories created by this call receive `0755`; existing modes and supported music-directory symlinks are preserved. Digest verification, no-overwrite publication and recovery ordering are unchanged.
+- Added `private_schema_ancestor_refuses_install_before_creating_children` and `missing_library_root_refuses_install_without_creating_it`. They assert refusal, no child/root creation, and unchanged private staging bytes/mode. Existing private intermediate-parent, music-symlink/cross-device, collision and recovery coverage remains passing.
+- Corrected the comment in `publication_directories_ignore_umask_only_when_new` to point to `crates/transfer/tests/publication_umask.rs`. The integration test still checks separate child processes with umasks `077` and `000`; the parallel core harness does not change umask.
+
+Validation performed in this follow-up:
+
+| Command | Result |
+| --- | --- |
+| `NO_COLOR=1 MEDIAOPS_TEST_INSTALL_FS=/dev/shm cargo test -p mediaops-core --locked --offline install::tests` | 34 passed; actual cross-device fixtures enabled. |
+| `NO_COLOR=1 cargo test -p mediaops --locked --offline pem_scan` | 4 PEM scanner tests passed. |
+| `NO_COLOR=1 cargo test -p mediaops-transfer --locked --offline --test publication_umask` | 1 parent test passed, asserting both isolated umask children succeed. |
+| `NO_COLOR=1 MEDIAOPS_TEST_INSTALL_FS=/dev/shm make test OFFLINE=1` | Required sibling workspace build succeeded; **911 passed, 0 failed, 0 ignored**, summing Cargo harness summaries (captured umask children additional). |
+| `make test-arch OFFLINE=1` | 17 passed. |
+| `make fmt-check` | Passed after `make fmt`. |
+| `make clippy OFFLINE=1` | Passed with warnings in existing code, including statfs casts and test mutex guards held across await; no warning originates in added code. |
+| `git diff --check` | Passed. |
+
+The initial sandboxed full test attempt failed on local Unix-socket bind denials (`Operation not permitted`); the same gate passed with approved unsandboxed test execution. Logs are ignored build artifacts: `target/pr16-review-test.log`, `target/pr16-review-test-unsandboxed.log`, `target/pr16-review-arch.log`, and `target/pr16-review-clippy.log`. No deploy, live-box feature, real encode, remote operation, Git commit/push, or GitHub reply was performed. Parent owns review, commit/push and subsequent hosted CI verification; this evidence is local validation, not a claim that updated hosted CI has run.
+
 ## Suggested Review Order
 
 **Publication and recovery**

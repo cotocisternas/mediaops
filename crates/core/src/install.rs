@@ -432,9 +432,7 @@ fn install_checked(
     if expected.is_some_and(|digest| *digest != whole_file_b3) {
         return Err(InstallError::DigestMismatch);
     }
-    if let Some(parent) = dest.parent() {
-        create_library_directories(parent)?;
-    }
+    create_library_directories(library_root, &handle.dest_rel)?;
     check_publication_parents(library_root, &handle.dest_rel)?;
     check()?;
     make_media_readable(&file, &handle.source)?;
@@ -724,45 +722,66 @@ pub fn check_publication_parents(root: &Path, dest_rel: &Path) -> Result<(), Ins
                 return Err(InstallError::NotStaging(dest_rel.display().to_string()));
             }
             path.push(component);
-            let metadata = fs::metadata(&path).map_err(|err| InstallError::io(&path, &err))?;
-            if !metadata.is_dir() || metadata.mode() & 0o111 != 0o111 {
-                return Err(InstallError::io(
-                    &path,
-                    &std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "schema parent must be traversable by owner, group and other; administrator repair required",
-                    ),
-                ));
-            }
+            check_schema_parent(&path)?;
         }
     }
     Ok(())
 }
 
+fn check_schema_parent(path: &Path) -> Result<(), InstallError> {
+    let metadata = fs::metadata(path).map_err(|err| InstallError::io(path, &err))?;
+    if !metadata.is_dir() || metadata.mode() & 0o111 != 0o111 {
+        return Err(InstallError::io(
+            path,
+            &std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "schema parent must be traversable by owner, group and other; administrator repair required",
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // Follow supported directory symlinks, but never change existing directory policy.
-fn create_library_directories(path: &Path) -> Result<(), InstallError> {
-    if path.as_os_str().is_empty() || path.is_dir() {
-        return Ok(());
+fn create_library_directories(root: &Path, dest_rel: &Path) -> Result<(), InstallError> {
+    let metadata = fs::metadata(root).map_err(|err| InstallError::io(root, &err))?;
+    if !metadata.is_dir() {
+        return Err(InstallError::io(
+            root,
+            &std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "library root must be a directory",
+            ),
+        ));
     }
-    if let Some(parent) = path.parent() {
-        create_library_directories(parent)?;
-    }
-    match fs::DirBuilder::new().mode(0o755).create(path) {
-        Ok(()) => {
-            let directory = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-                .open(path)
-                .map_err(|err| InstallError::io(path, &err))?;
-            directory
-                .set_permissions(fs::Permissions::from_mode(0o755))
-                .and_then(|()| directory.sync_all())
-                .map_err(|err| InstallError::io(path, &err))?;
-            sync_parent(path)
+    let mut path = root.to_path_buf();
+    if let Some(parent) = dest_rel.parent() {
+        for component in parent.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(InstallError::NotStaging(dest_rel.display().to_string()));
+            }
+            path.push(component);
+            match fs::DirBuilder::new().mode(0o755).create(&path) {
+                Ok(()) => {
+                    let directory = fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                        .open(&path)
+                        .map_err(|err| InstallError::io(&path, &err))?;
+                    directory
+                        .set_permissions(fs::Permissions::from_mode(0o755))
+                        .and_then(|()| directory.sync_all())
+                        .map_err(|err| InstallError::io(&path, &err))?;
+                    sync_parent(&path)?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(InstallError::io(&path, &err)),
+            }
+            // Validate each ancestor before attempting to create any children.
+            check_schema_parent(&path)?;
         }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
-        Err(err) => Err(InstallError::io(path, &err)),
     }
+    Ok(())
 }
 
 fn sync_parent(path: &Path) -> Result<(), InstallError> {
@@ -859,8 +878,8 @@ mod tests {
 
     #[test]
     fn publication_directories_ignore_umask_only_when_new() {
-        // Also run in an isolated process with umask 077; never mutate the
-        // process-wide umask inside the parallel test harness.
+        // Isolated umask 077/000 coverage lives in
+        // crates/transfer/tests/publication_umask.rs, not this parallel harness.
         let tmp = TempTree::new();
         let existing = tmp.path.join("existing");
         fs::DirBuilder::new()
@@ -868,7 +887,7 @@ mod tests {
             .create(&existing)
             .expect("existing");
         let nested = existing.join("new/nested");
-        create_library_directories(&nested).expect("parents");
+        create_library_directories(&existing, Path::new("new/nested/media")).expect("parents");
         assert_eq!(mode(&existing), 0o700);
         assert_eq!(mode(nested.parent().expect("parent")), 0o755);
         assert_eq!(mode(&nested), 0o755);
@@ -1002,6 +1021,40 @@ mod tests {
             b"bytes"
         );
         assert!(!tmp.path.join(handle.dest_rel()).exists());
+    }
+
+    #[test]
+    fn private_schema_ancestor_refuses_install_before_creating_children() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let handle = staged_handle(&tmp.path, &id, &Placement::movie("The.Matrix", 1999, "mkv"));
+        fs::set_permissions(&handle.source, fs::Permissions::from_mode(0o600)).expect("private");
+        let ancestor = tmp
+            .path
+            .join(handle.dest_rel().components().next().expect("schema kind"));
+        fs::create_dir(&ancestor).expect("ancestor");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
+            .expect("private ancestor");
+        let err = install(&tmp.path, &id, &handle).expect_err("private ancestor");
+        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(fs::read_dir(&ancestor).expect("children").count(), 0);
+        assert_eq!(mode(&ancestor), 0o700);
+        assert_eq!(mode(&handle.source), 0o600);
+        assert_eq!(fs::read(&handle.source).expect("staging"), b"bytes");
+    }
+
+    #[test]
+    fn missing_library_root_refuses_install_without_creating_it() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let handle = staged_handle(&tmp.path, &id, &Placement::movie("The.Matrix", 1999, "mkv"));
+        fs::set_permissions(&handle.source, fs::Permissions::from_mode(0o600)).expect("private");
+        let missing = tmp.path.join("missing-library");
+        let err = install(&missing, &id, &handle).expect_err("missing root");
+        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::NotFound));
+        assert!(!missing.exists());
+        assert_eq!(mode(&handle.source), 0o600);
+        assert_eq!(fs::read(&handle.source).expect("staging"), b"bytes");
     }
 
     #[test]

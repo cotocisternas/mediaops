@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use mediaops_core::{ControlPort, EdgeApiReport, Envelope, KeyPresence};
@@ -53,9 +55,17 @@ pub fn refuse_pems_in_git_work_tree(dir: &Path) -> Result<(), AppError> {
 }
 
 fn walk_pems(dir: &Path, hits: &mut Vec<PathBuf>) -> Result<(), AppError> {
-    let mut pending = vec![dir.to_path_buf()];
+    walk_pending_pems(vec![dir.to_path_buf()], hits)
+}
+
+fn walk_pending_pems(mut pending: Vec<PathBuf>, hits: &mut Vec<PathBuf>) -> Result<(), AppError> {
+    let mut visited = HashSet::new();
     while let Some(dir) = pending.pop() {
         let scan_error = |e| AppError::Policy(format!("pem scan {}: {e}", dir.display()));
+        let metadata = std::fs::metadata(&dir).map_err(scan_error)?;
+        if !visited.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
         let reader = std::fs::read_dir(&dir).map_err(scan_error)?;
         for entry in reader {
             let entry = entry.map_err(scan_error)?;
@@ -248,6 +258,22 @@ mod tests {
         }
         std::fs::remove_dir_all(dir).expect("cleanup");
         std::fs::remove_dir_all(external).expect("cleanup external");
+    }
+
+    #[test]
+    fn pem_scan_visits_duplicate_directory_identities_once() {
+        let dir = crate::test_support::scratch("pem-duplicate");
+        let child = dir.join("child");
+        std::fs::create_dir(&child).expect("child");
+        let credential = child.join("credential.pem");
+        std::fs::write(&credential, "private").expect("credential");
+        let mut hits = Vec::new();
+        // Seed overlapping work and a different pathname for the same inode.
+        // This exercises duplicate visits without mounts or child symlink traversal.
+        walk_pending_pems(vec![child.clone(), child.join("."), dir.clone()], &mut hits)
+            .expect("finite scan");
+        assert_eq!(hits, vec![credential]);
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]
