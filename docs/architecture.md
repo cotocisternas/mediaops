@@ -36,6 +36,10 @@ The CLI never dials `seedbox_address` for media traffic; it goes through the gat
 
 **`mediaopsd --role seedbox`** — exposes the WAN mTLS listener and is the only role that performs grabber HTTP on localhost. The home gateway connects to it using `mediaops.v1` Transfer/Control.
 
+The six Home processes optionally push metrics and completed operation spans over
+loopback OTLP/gRPC to local Alloy. See [Home telemetry](telemetry.md) for settings,
+signal definitions and delivery limits.
+
 ## Home API
 
 Package `mediaops.home.v1` (`proto/mediaops/home/v1/home.proto`). The API socket and database are private to the Unix account. `x-mediaops-actor` enforces cooperating roles' write rules; it is not authentication against malicious code already running as that same account. WAN access still requires mTLS through the gateway.
@@ -89,7 +93,10 @@ One-way. Remote → `_incoming/…/*.partial` → per-range BLAKE3 in the sideca
 - Kill at 90% and run again: completed ranges stay; resume reads the sidecar's `range_len`.
 - Want + a completed inventory listing → controller creates a snapshotted Pull Job for each missing file. Identity is TitleId plus the schema file key. No silent replacement of an installed or drifted episode, track, or movie.
 - Title status retains both installation and current digests per file. The verified digest is persisted before installation, so a restart can recover an interrupted install and finish recording its proof.
-- Once the destination matches that saved digest, recovery removes only the owned completed staging source and sidecar before recording Title proof and Installed. Destination-verification or cleanup I/O errors leave the Job Verifying for retry; a proven mismatch refuses without overwriting either file.
+- Successful media publication sets and syncs exact `0644` permissions before installation succeeds. Newly created schema parent directories are `0755`, independent of umask; preexisting directories (including supported music directory symlinks) retain administrator policy. Completed encode replacements use the same readable media mode without changing the old live/backup inode's permissions.
+- Incomplete staging data, sidecars and writer locks are private (`0600`), with private staging containers (`0700`). A completed staged inode may become `0644` just before publication, protected by its private ancestors. Cross-device copies stay private until complete; identity-validated cleanup accepts private or promoted temporaries without removing the published link.
+- Once the destination matches the saved digest, recovery normalizes and syncs the same no-follow opened inode to `0644`, then removes only owned staging data and installation temporaries before recording Title proof and Installed. This also runs after the transfer deadline. Verification, permission, sync or cleanup I/O errors leave the Job Verifying for retry; a proven mismatch refuses without changing content or permissions.
+- This policy does not broaden existing library directories or migrate terminal Jobs. Publication and verified recovery refuse schema parents lacking traversal bits for any Unix permission class, including a private directory left by a crash between mkdir and chmod; administrator repair is required. Library-root ancestors and service-specific access remain administrator responsibilities. Exact Unix modes can change POSIX ACL masks and effective ACL permissions; no explicit ACL rewriting is performed, and effective ACL preservation is not guaranteed. Readable files alone do not guarantee Jellyfin playback for every codec or client.
 
 Range proofs verify the bytes received and retained locally; the current Range protocol does not provide an immutable remote-file snapshot. Sources must remain unchanged during a copy. With `grabber = "none"`, finish writing outside the allowlisted tree and move the completed file into place, rather than writing directly to a visible media filename.
 
@@ -125,6 +132,7 @@ Cargo workspace. Edges are allowlisted and tested in `crates/arch-tests` (`make 
 | `crates/sync` | leftover planner helpers + unit text |
 | `crates/encode` | EncodePolicy. Not in this slice’s workers |
 | `crates/arr` | Grabber HTTP. Linked only into `mediaopsd` |
+| `crates/telemetry` | Optional loopback OTLP metrics and operation spans for the six Home processes |
 | `crates/arch-tests` | Dependency-graph and I/O-boundary law |
 
 Banned as direct deps: `rsync`, `rclone`, `ftp`, `ssh2`, `russh`, `ffmpeg-next`, `native-tls`. `mediaopsd`, `mediaops-home`, `mediaops-gateway`, `mediaops-scheduler`, `mediaops-inventory`, and `mediaops-pull` must not reach `store` or `encode`.

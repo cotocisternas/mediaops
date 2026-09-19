@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+mediaops-telemetry.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 mediaops-core.workspace = true

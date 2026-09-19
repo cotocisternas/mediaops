@@ -2,7 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -173,8 +173,22 @@ where
             .create(true)
             .write(true)
             .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&partial)
+            .map_err(|err| TransferError::io(&partial, err))?;
+        let metadata = file
+            .metadata()
+            .map_err(|err| TransferError::io(&partial, err))?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(TransferError::Path(
+                "partial must be an owned, single-link regular file".into(),
+            ));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|err| TransferError::io(&partial, err))?;
         file.set_len(spec.file_len)
             .map_err(|err| TransferError::io(&partial, err))?;
@@ -243,19 +257,28 @@ fn ensure_staging_parent(root: &Path, parent: &Path) -> Result<(), TransferError
             return Err(TransferError::Path("invalid staging parent".into()));
         }
         path.push(component);
-        match fs::create_dir(&path) {
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(TransferError::io(&path, err)),
         }
-        if !fs::symlink_metadata(&path)
-            .map_err(|e| TransferError::io(&path, e))?
-            .is_dir()
-        {
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| TransferError::io(&path, e))?;
+        let metadata = directory
+            .metadata()
+            .map_err(|e| TransferError::io(&path, e))?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
             return Err(TransferError::Path(
-                "staging directories must not be symlinks".into(),
+                "staging directories must be owned directories, not symlinks".into(),
             ));
         }
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .and_then(|()| directory.sync_all())
+            .map_err(|e| TransferError::io(&path, e))?;
     }
     Ok(())
 }
@@ -296,7 +319,7 @@ fn verify_recorded_ranges(mut sidecar: Sidecar, partial: &Path) -> Result<Sideca
 fn write_range(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), TransferError> {
     let mut file = OpenOptions::new()
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|err| TransferError::io(path, err))?;
     file.seek(SeekFrom::Start(offset))
@@ -350,6 +373,72 @@ mod tests {
         RemoteRef::from_wire_parts("seedbox".into(), PathBuf::from("a.bin")).expect("ref")
     }
 
+    fn privacy_spec(root: &Path) -> PullSpec {
+        PullSpec {
+            library_root: root.into(),
+            title_id: TitleId::movie("603").expect("id"),
+            final_name: "The.Matrix.(1999).mkv".into(),
+            remote: remote(),
+            file_len: 10,
+            range_len: 4,
+            concurrency: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_hardlink_is_refused_without_chmod_or_truncation() {
+        let root = scratch("partial-alias");
+        let spec = privacy_spec(&root);
+        let layout = StagingLayout::from_spec(&spec).expect("layout");
+        ensure_staging_parent(&root, layout.partial.parent().expect("parent")).expect("parents");
+        let media = root.join("media");
+        fs::write(&media, b"unrelated longer media").expect("media");
+        fs::set_permissions(&media, fs::Permissions::from_mode(0o644)).expect("readable");
+        fs::hard_link(&media, &layout.partial).expect("alias");
+        let source = Arc::new(Mem {
+            body: b"abcdefghij".to_vec(),
+            hits: Mutex::new(Vec::new()),
+        });
+        assert!(pull_file(source.clone(), &spec).await.is_err());
+        assert!(source.hits.lock().expect("hits").is_empty());
+        for path in [&media, &layout.partial] {
+            assert_eq!(fs::read(path).expect("bytes"), b"unrelated longer media");
+            assert_eq!(fs::metadata(path).expect("mode").mode() & 0o7777, 0o644);
+        }
+        assert!(!layout.staged.exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn partial_fifo_without_reader_is_refused_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = scratch("partial-fifo");
+        let spec = privacy_spec(&root);
+        let layout = StagingLayout::from_spec(&spec).expect("layout");
+        ensure_staging_parent(&root, layout.partial.parent().expect("parent")).expect("parents");
+        let path = std::ffi::CString::new(layout.partial.as_os_str().as_bytes()).expect("path");
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let source = Arc::new(Mem {
+                body: b"abcdefghij".to_vec(),
+                hits: Mutex::new(Vec::new()),
+            });
+            let result = tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(pull_file(source, &spec));
+            let _ = send.send(result);
+        });
+        assert!(
+            receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("FIFO open must not block")
+                .is_err()
+        );
+        assert!(!layout.staged.exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[tokio::test]
     async fn pull_writes_staging_and_hashes() {
         let root = scratch("full");
@@ -369,8 +458,16 @@ mod tests {
         };
         let hits_progress = std::sync::Arc::new(Mutex::new(Vec::new()));
         let tracked = hits_progress.clone();
+        let layout = StagingLayout::from_spec(&spec).expect("layout");
+        let partial = layout.partial.clone();
         let out = pull_file_with_progress(src.clone(), &spec, move |done, total| {
             tracked.lock().expect("prog").push((done, total));
+            if partial.exists() {
+                assert_eq!(
+                    fs::metadata(&partial).expect("partial").mode() & 0o7777,
+                    0o600
+                );
+            }
         })
         .await
         .expect("pull");
@@ -384,6 +481,27 @@ mod tests {
         assert_eq!(fs::read(&out.staged).expect("read"), body);
         assert!(out.resumed_ranges.is_empty());
         assert!(!out.already_staged);
+        assert_eq!(
+            fs::metadata(&out.staged).expect("staged").mode() & 0o7777,
+            0o600
+        );
+        for directory in [
+            root.join("_incoming"),
+            out.staged.parent().expect("parent").to_path_buf(),
+        ] {
+            assert_eq!(
+                fs::metadata(directory).expect("directory").mode() & 0o7777,
+                0o700
+            );
+        }
+        assert_eq!(
+            fs::metadata(&layout.sidecar).expect("sidecar").mode() & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&layout.lock).expect("lock").mode() & 0o7777,
+            0o600
+        );
         let mut leftover = out.staged.clone();
         leftover.as_mut_os_string().push(".partial");
         assert!(!leftover.exists());
@@ -397,8 +515,15 @@ mod tests {
         // Crash window: the file is fully staged but the job row never moved.
         // The next pull must hand it on, not refuse, and must not fetch.
         let hits_before = src.hits.lock().expect("hits").len();
+        let published = root.join("published");
+        fs::hard_link(&out.staged, &published).expect("published link");
+        fs::set_permissions(&published, fs::Permissions::from_mode(0o644)).expect("readable");
         let again = pull_file(src.clone(), &spec).await.expect("already staged");
         assert!(again.already_staged);
+        assert_eq!(
+            fs::metadata(&published).expect("published").mode() & 0o7777,
+            0o644
+        );
         assert_eq!(again.staged, out.staged);
         assert_eq!(
             src.hits.lock().expect("hits").len(),

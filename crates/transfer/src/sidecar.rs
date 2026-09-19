@@ -113,13 +113,26 @@ pub fn save(path: &Path, sidecar: &Sidecar) -> Result<(), TransferError> {
     let tmp = path.with_extension("b3.tmp");
     let json = serde_json::to_vec_pretty(sidecar)
         .map_err(|err| TransferError::Sidecar(err.to_string()))?;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&tmp)
+        .map_err(|err| TransferError::io(&tmp, err))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| TransferError::io(&tmp, err))?;
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(TransferError::Sidecar(
+            "sidecar temporary must be an owned, single-link regular file".into(),
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .and_then(|()| file.set_len(0))
         .map_err(|err| TransferError::io(&tmp, err))?;
     file.write_all(&json)
         .map_err(|err| TransferError::io(&tmp, err))?;
@@ -150,6 +163,56 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    #[test]
+    fn save_keeps_control_private_and_refuses_a_shared_temporary() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = scratch("private");
+        let path = dir.join("a.partial.b3");
+        let tmp = path.with_extension("b3.tmp");
+        fs::write(&tmp, b"old temporary").expect("old");
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).expect("old mode");
+        save(&path, &Sidecar::new(10, 4)).expect("save");
+        assert_eq!(fs::metadata(&path).expect("sidecar").mode() & 0o7777, 0o600);
+        let media = dir.join("media");
+        fs::write(&media, b"unrelated media").expect("media");
+        fs::set_permissions(&media, fs::Permissions::from_mode(0o644)).expect("media mode");
+        fs::hard_link(&media, &tmp).expect("shared temporary");
+        assert!(save(&path, &Sidecar::new(10, 4)).is_err());
+        assert_eq!(fs::read(&media).expect("bytes"), b"unrelated media");
+        assert_eq!(fs::metadata(&media).expect("media").mode() & 0o7777, 0o644);
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn save_refuses_fifo_temporary_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let dir = scratch("fifo");
+        let path = dir.join("a.partial.b3");
+        let tmp = path.with_extension("b3.tmp");
+        let fifo = std::ffi::CString::new(tmp.as_os_str().as_bytes()).expect("path");
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        let output = path.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(save(&output, &Sidecar::new(10, 4)));
+        });
+        assert!(
+            receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("FIFO open must not block")
+                .is_err()
+        );
+        assert!(
+            fs::symlink_metadata(&tmp)
+                .expect("FIFO retained")
+                .file_type()
+                .is_fifo()
+        );
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]

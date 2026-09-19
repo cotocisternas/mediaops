@@ -28,6 +28,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    let _telemetry = mediaops_telemetry::init(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     match cli.command {
         Command::Serve { socket } => {
             let socket = socket.unwrap_or_else(default_api_socket);
@@ -59,7 +60,10 @@ async fn heartbeat_loop(api: HomeApi) -> anyhow::Result<()> {
         if let Err(err) = api.heartbeat(WorkerKind::Scheduler, true, None).await {
             tracing::warn!(error = %err, "scheduler heartbeat failed");
         }
-        if let Err(err) = bind_pending(&api).await {
+        let measure = mediaops_telemetry::start(mediaops_telemetry::Operation::SchedulerPass);
+        let result = bind_pending(&api).await;
+        measure.finish(result.is_ok());
+        if let Err(err) = result {
             tracing::warn!(error = %err, "scheduler bind failed");
         }
         tokio::time::sleep(Duration::from_secs(NODE_HEARTBEAT_SECS)).await;

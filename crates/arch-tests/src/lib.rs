@@ -7,6 +7,12 @@ use cargo_metadata::Metadata;
 
 /// Allowed depender → dependee workspace Cargo edges (inverted spine mermaid).
 const ALLOWED_WORKSPACE_EDGES: &[(&str, &str)] = &[
+    ("mediaops-home", "mediaops-telemetry"),
+    ("mediaops-api", "mediaops-telemetry"),
+    ("mediaops-scheduler", "mediaops-telemetry"),
+    ("mediaops-gateway", "mediaops-telemetry"),
+    ("mediaops-inventory", "mediaops-telemetry"),
+    ("mediaops-pull", "mediaops-telemetry"),
     ("mediaops-proto", "mediaops-core"),
     ("mediaops-store", "mediaops-core"),
     ("mediaops-net", "mediaops-core"),

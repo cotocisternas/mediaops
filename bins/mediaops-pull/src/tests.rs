@@ -6,6 +6,22 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize},
 };
 
+thread_local! {
+    static FAIL_RECOVERY: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn recovery_failure(operation: &str) -> io::Result<()> {
+    FAIL_RECOVERY.with(|failure| {
+        if failure.get() == Some(operation) {
+            failure.set(None);
+            return Err(io::Error::other(format!(
+                "injected recovery {operation} failure"
+            )));
+        }
+        Ok(())
+    })
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -163,6 +179,18 @@ impl JobApi for Api {
             }
             .into());
         }
+        if object.kind == Kind::Title {
+            let Spec::Job(spec) = &state.job.spec else {
+                panic!("Job")
+            };
+            assert_eq!(
+                std::fs::metadata(Path::new(&spec.library_root).join(&spec.dest_rel))
+                    .expect("publication before proof")
+                    .mode()
+                    & 0o7777,
+                0o644
+            );
+        }
         if object.kind == Kind::Title && self.fail_title_once.swap(false, Ordering::Relaxed) {
             return Err(ClientError::Connect(
                 "injected API failure after installation".into(),
@@ -301,6 +329,11 @@ async fn installation_recovers_after_title_or_job_write_failure_even_after_deadl
         assert!(std::fs::symlink_metadata(&staged).is_err());
         assert!(std::fs::symlink_metadata(&sidecar).is_err());
         assert!(lock.is_file());
+        std::fs::set_permissions(
+            dir.0.join(&spec.dest_rel),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("legacy private destination");
         // Emulate loading this durable state after an extended API outage.
         if let StatusBody::Job(status) = &mut api.state.lock().expect("state").job.status {
             status.started_unix = unix_now() - PULL_DEADLINE_SECS as i64 - 1;
@@ -310,6 +343,13 @@ async fn installation_recovers_after_title_or_job_write_failure_even_after_deadl
             .expect("resume completion");
         assert_eq!(job_status(&api.job()).phase, JobPhase::Installed);
         assert_eq!(api.title().files.len(), 1);
+        assert_eq!(
+            std::fs::metadata(dir.0.join(&spec.dest_rel))
+                .expect("dest")
+                .mode()
+                & 0o7777,
+            0o644
+        );
         assert_eq!(transfer.calls.load(Ordering::Relaxed), 1);
     }
 }
@@ -401,6 +441,8 @@ async fn matching_destination_cleans_cross_device_source() {
     std::fs::create_dir_all(parent.parent().expect("kind dir")).expect("movies");
     std::os::unix::fs::symlink(&other_parent, parent).expect("cross-device dest parent");
     std::fs::write(&destination, [7; 64]).expect("dest copy");
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+        .expect("private");
     let dest_dev = std::fs::symlink_metadata(&destination)
         .expect("dest meta")
         .dev();
@@ -425,6 +467,70 @@ async fn matching_destination_cleans_cross_device_source() {
     assert!(std::fs::symlink_metadata(&sidecar).is_err());
     assert!(lock.is_file());
     let _ = std::fs::remove_dir_all(&other_parent);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_permission_and_fsync_failures_keep_verifying_without_proof() {
+    for operation in ["chmod", "fsync"] {
+        let dir = Scratch::new();
+        let (mut job, spec) = stage_verifying_job(&dir.0).await;
+        if let StatusBody::Job(status) = &mut job.status {
+            status.started_unix = unix_now() - PULL_DEADLINE_SECS as i64 - 1;
+        }
+        let destination = dir.0.join(&spec.dest_rel);
+        let (staged, sidecar, _) = staging_files(&spec);
+        std::fs::create_dir_all(destination.parent().expect("parent")).expect("mkdir");
+        std::fs::hard_link(&staged, &destination).expect("published private inode");
+        let api = Api::new(job.clone());
+        // finish_verifying performs its synchronous filesystem work before its
+        // first await; the one-shot fault stays local to this test's thread.
+        FAIL_RECOVERY.with(|failure| failure.set(Some(operation)));
+        let err = finish_verifying(&api, &mut job, &spec)
+            .await
+            .expect_err("retryable operation");
+        assert!(err.downcast_ref::<Retryable>().is_some());
+        FAIL_RECOVERY.with(|failure| assert_eq!(failure.get(), None));
+        assert_eq!(job_status(&api.job()).phase, JobPhase::Verifying);
+        assert!(api.title().files.is_empty());
+        assert_eq!(std::fs::read(&destination).expect("dest"), vec![7; 64]);
+        assert!(staged.exists() && sidecar.exists());
+        assert_eq!(
+            std::fs::metadata(&destination).expect("mode").mode() & 0o7777,
+            if operation == "chmod" { 0o600 } else { 0o644 }
+        );
+        finish_verifying(&api, &mut job, &spec)
+            .await
+            .expect("retry completes");
+        assert_eq!(job_status(&api.job()).phase, JobPhase::Installed);
+        assert_eq!(api.title().files.len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_refuses_private_schema_parent_without_broadening_or_proof() {
+    let dir = Scratch::new();
+    let (job, spec) = stage_verifying_job(&dir.0).await;
+    let destination = dir.0.join(&spec.dest_rel);
+    let (staged, sidecar, _) = staging_files(&spec);
+    let parent = destination.parent().expect("parent");
+    std::fs::create_dir_all(parent).expect("mkdir");
+    std::fs::hard_link(&staged, &destination).expect("published private inode");
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .expect("private parent");
+    let api = Api::new(job);
+    assert!(run_job(&api, &NeverTransfer, api.job()).await.is_err());
+    assert_eq!(job_status(&api.job()).phase, JobPhase::Verifying);
+    assert!(api.title().files.is_empty());
+    assert!(staged.exists() && sidecar.exists());
+    assert_eq!(
+        std::fs::metadata(parent).expect("parent").mode() & 0o7777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&destination).expect("dest").mode() & 0o7777,
+        0o600
+    );
+    assert_eq!(std::fs::read(destination).expect("bytes"), vec![7; 64]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -483,12 +589,18 @@ async fn mismatching_destination_preserves_staging() {
     let (staged, sidecar, lock) = staging_files(&spec);
     std::fs::create_dir_all(destination.parent().expect("parent")).expect("mkdir");
     std::fs::write(&destination, [9; 64]).expect("other dest");
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+        .expect("private");
     let api = Api::new(job);
     run_job(&api, &NeverTransfer, api.job())
         .await
         .expect("refusal recorded");
     assert_eq!(job_status(&api.job()).phase, JobPhase::Refused);
     assert_eq!(std::fs::read(&destination).expect("dest"), vec![9; 64]);
+    assert_eq!(
+        std::fs::metadata(&destination).expect("mode").mode() & 0o7777,
+        0o600
+    );
     assert_eq!(std::fs::read(&staged).expect("staging retained"), [7; 64]);
     assert!(sidecar.is_file());
     assert!(lock.is_file());
@@ -601,4 +713,66 @@ fn adding_an_episode_preserves_existing_proof_and_refuses_digest_rewrites() {
     assert_eq!(updated.files.len(), 2);
     assert_eq!(updated.files[0], status.files[0]);
     assert!(with_installed_file(&updated, first.to_str().expect("path"), &new).is_err());
+}
+
+#[tokio::test]
+async fn telemetry_observes_only_confirmed_changed_terminal_writes() {
+    use mediaops_telemetry::Terminal;
+    for (phase, expected) in [
+        (JobPhase::Failed, Terminal::Failed),
+        (JobPhase::Refused, Terminal::Refused),
+        (JobPhase::Installed, Terminal::Installed),
+    ] {
+        let mut current = job(Path::new("/unused-telemetry-test"));
+        let api = Api::new(current.clone());
+        let Spec::Job(spec) = &current.spec else {
+            panic!("Job");
+        };
+        let digest = Blake3Hex::of_bytes(&[7; 64]);
+        if phase == JobPhase::Installed {
+            let mut state = api.state.lock().unwrap();
+            let StatusBody::Title(title) = &mut state.title.status else {
+                panic!("Title");
+            };
+            title.files.push(mediaops_core::TitleFileStatus {
+                path: spec.dest_rel.clone(),
+                install_b3: digest.clone(),
+                current_b3: digest.clone(),
+                drifted: false,
+            });
+        }
+        let next = JobStatus {
+            phase,
+            bytes_done: spec.file_len,
+            verified_b3: Some(digest),
+            message: "private error must never reach observer".into(),
+            ..JobStatus::default()
+        };
+        let mut observations = Vec::new();
+        // A stale write fails persistence and must not emit telemetry.
+        current.metadata.resource_version = 0;
+        assert!(
+            save_job_observed(&api, &mut current, next.clone(), |phase, bytes| {
+                observations.push((phase, bytes))
+            })
+            .await
+            .is_err()
+        );
+        assert!(observations.is_empty());
+        current = api.job();
+        save_job_observed(&api, &mut current, next.clone(), |phase, bytes| {
+            observations.push((phase, bytes))
+        })
+        .await
+        .unwrap();
+        assert_eq!(job_status(&api.job()).phase, phase);
+        assert_eq!(observations, vec![(expected, 64)]);
+        // Reconfirming the same phase, including Installed, never counts twice.
+        save_job_observed(&api, &mut current, next, |phase, bytes| {
+            observations.push((phase, bytes))
+        })
+        .await
+        .unwrap();
+        assert_eq!(observations, vec![(expected, 64)]);
+    }
 }

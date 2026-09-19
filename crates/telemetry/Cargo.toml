@@ -1,0 +1,19 @@
+[package]
+name = "mediaops-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tonic = { workspace = true, features = ["transport"] }
+
+[dev-dependencies]
+tonic = { workspace = true, features = ["router"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic", "metrics", "trace"] }

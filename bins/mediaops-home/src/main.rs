@@ -37,6 +37,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    let _telemetry = mediaops_telemetry::init(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     let bin_dir = std::env::current_exe()?
         .parent()
         .map(Path::to_path_buf)
@@ -62,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
                         // Never `?` here: returning would drop the supervisor
                         // and leave the other four running unsupervised with
                         // no way to stop them through the service unit.
-                        match spawn_role(&bin_dir, ROLES[i], &cli) {
+                        let result = spawn_role(&bin_dir, ROLES[i], &cli);
+                        mediaops_telemetry::restart(ROLES[i], result.is_ok());
+                        match result {
                             Ok(next) => *child = next,
                             Err(err) => {
                                 tracing::error!(role = ROLES[i], error = %err, "respawn failed");

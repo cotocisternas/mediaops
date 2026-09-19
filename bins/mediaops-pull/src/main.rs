@@ -45,7 +45,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let _telemetry = mediaops_telemetry::init(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    match cli.command {
         Command::Serve {
             socket,
             gateway_socket,
@@ -78,7 +80,10 @@ async fn run(socket: &Path, gateway: &Gateway) -> anyhow::Result<()> {
         }
     });
     loop {
-        if let Err(err) = claim_and_run(&api, gateway).await {
+        let measure = mediaops_telemetry::start(mediaops_telemetry::Operation::PullPass);
+        let result = claim_and_run(&api, gateway).await;
+        measure.finish(result.is_ok());
+        if let Err(err) = result {
             tracing::warn!(error = %err, "pull pass failed");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -425,7 +430,8 @@ fn place_verified(spec: &JobSpec, expected: &Blake3Hex, deadline: Instant) -> an
         Err(err) => match installed_matches(spec, expected) {
             Ok(true) => {
                 tracing::warn!(error = %err, "installed file recovered after cleanup failure");
-                cleanup_owned_staging(spec)
+                cleanup_owned_staging(spec)?;
+                cleanup_install_temporary(spec).map_err(retryable)
             }
             Ok(false) => {
                 // A returned failure is terminal here. Process death is recovered
@@ -454,13 +460,38 @@ fn installed_matches(spec: &JobSpec, expected: &Blake3Hex) -> anyhow::Result<boo
                     Refusal("existing destination does not match the verified file").into(),
                 );
             }
-            match hash_file(&destination, spec.file_len, None) {
-                Ok(digest) if digest == *expected => Ok(true),
-                Ok(_) => {
-                    Err(Refusal("existing destination does not match the verified file").into())
-                }
-                Err(err) => Err(retryable(err)),
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&destination)
+                .map_err(retryable)?;
+            let metadata = file.metadata().map_err(retryable)?;
+            if !metadata.is_file() || metadata.len() != spec.file_len {
+                return Err(
+                    Refusal("existing destination does not match the verified file").into(),
+                );
             }
+            let digest = Blake3Hex::of_reader(&mut file).map_err(retryable)?;
+            if digest != *expected {
+                return Err(
+                    Refusal("existing destination does not match the verified file").into(),
+                );
+            }
+            mediaops_core::install::check_publication_parents(
+                Path::new(&spec.library_root),
+                Path::new(&spec.dest_rel),
+            )
+            .map_err(retryable)?;
+            // Hash and normalize the same no-follow inode, even after the deadline.
+            #[cfg(test)]
+            tests::recovery_failure("chmod").map_err(retryable)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))
+                .map_err(retryable)?;
+            #[cfg(test)]
+            tests::recovery_failure("fsync").map_err(retryable)?;
+            file.sync_all().map_err(retryable)?;
+            Ok(true)
         }
     }
 }
@@ -583,11 +614,31 @@ async fn save_job(
     job: &mut HomeObject,
     status: JobStatus,
 ) -> anyhow::Result<()> {
-    let changed_phase = job_status(job).phase != status.phase;
+    save_job_observed(api, job, status, mediaops_telemetry::terminal).await
+}
+
+async fn save_job_observed(
+    api: &impl JobApi,
+    job: &mut HomeObject,
+    status: JobStatus,
+    observe: impl FnOnce(mediaops_telemetry::Terminal, u64),
+) -> anyhow::Result<()> {
+    let previous_phase = job_status(job).phase;
     let mut next = job.clone();
     next.status = StatusBody::Job(status);
     *job = api.patch_status(next).await?;
-    if changed_phase {
+    if previous_phase != job_status(job).phase {
+        // Observe the confirmed phase, including failures persisted by run_job
+        // before it returns Ok. Progress includes resumed bytes; do not sum it.
+        let terminal = match job_status(job).phase {
+            JobPhase::Installed => Some(mediaops_telemetry::Terminal::Installed),
+            JobPhase::Failed => Some(mediaops_telemetry::Terminal::Failed),
+            JobPhase::Refused => Some(mediaops_telemetry::Terminal::Refused),
+            _ => None,
+        };
+        if let (Some(phase), Spec::Job(spec)) = (terminal, &job.spec) {
+            observe(phase, spec.file_len);
+        }
         api.event(job).await;
     }
     Ok(())

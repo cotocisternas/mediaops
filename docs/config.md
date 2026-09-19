@@ -157,3 +157,8 @@ A spoken name (`Hearts`, `Mr Robot`) only resolves when something already knows 
 ## Unmonitor
 
 Inventory owns best-effort movie/album unmonitor. After a successful listing heartbeat, with `grabber = "servarr"`, it calls ControlPort `wanted_missing` then `unmonitor` for TitleIds with recorded installation proof, a non-drifted local regular file, and an exact match in that response. Series are never unmonitored. `grabber = "none"` skips these unmonitor-related calls; normal listing still runs through the gateway. No Want is required for unmonitor, and Cluster lock does not suppress it. Failures log and retry on later refreshes; they do not roll back `list_generation` or write Jobs.
+
+## Home telemetry
+
+See [local Home telemetry](telemetry.md) for optional Alloy metrics and operation
+traces, service environment settings, and delivery limits.

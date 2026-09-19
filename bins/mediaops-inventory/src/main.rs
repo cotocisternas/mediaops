@@ -38,6 +38,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    let _telemetry = mediaops_telemetry::init(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     match cli.command {
         Command::Serve {
             socket,
@@ -67,7 +68,9 @@ async fn run(api_socket: &Path, gw: &Path, tls: &Path) -> anyhow::Result<()> {
         }
     });
     loop {
+        let measure = mediaops_telemetry::start(mediaops_telemetry::Operation::InventoryScan);
         let result = refresh(&api, gw, tls).await;
+        measure.finish(result.is_ok());
         if let Err(err) = result {
             tracing::warn!(error = %err, "inventory refresh failed");
         }

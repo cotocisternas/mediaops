@@ -159,3 +159,8 @@ mediaops repair edge --repair --confirm
 
 This uses SSH for nginx maintenance and the gateway Control API for edge apply
 and verification. It is not a read-only health check and is never part of tests.
+
+## Home telemetry
+
+See [local Home telemetry](telemetry.md) for optional Alloy metrics and operation
+traces, service environment settings, and delivery limits.

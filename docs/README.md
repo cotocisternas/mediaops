@@ -15,3 +15,8 @@ BMAD material is historical, not an alternative runbook or active backlog.
 | [Backlog](backlog.md) | Current deferred product work, including continuous automatic sync |
 
 Agent rules live in [AGENTS.md](../AGENTS.md). The GitHub landing page is [README.md](../README.md).
+
+## Home telemetry
+
+See [local Home telemetry](telemetry.md) for optional Alloy metrics and operation
+traces, service environment settings, and delivery limits.
