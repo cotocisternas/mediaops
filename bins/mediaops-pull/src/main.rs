@@ -430,7 +430,8 @@ fn place_verified(spec: &JobSpec, expected: &Blake3Hex, deadline: Instant) -> an
         Err(err) => match installed_matches(spec, expected) {
             Ok(true) => {
                 tracing::warn!(error = %err, "installed file recovered after cleanup failure");
-                cleanup_owned_staging(spec)
+                cleanup_owned_staging(spec)?;
+                cleanup_install_temporary(spec).map_err(retryable)
             }
             Ok(false) => {
                 // A returned failure is terminal here. Process death is recovered
@@ -459,13 +460,38 @@ fn installed_matches(spec: &JobSpec, expected: &Blake3Hex) -> anyhow::Result<boo
                     Refusal("existing destination does not match the verified file").into(),
                 );
             }
-            match hash_file(&destination, spec.file_len, None) {
-                Ok(digest) if digest == *expected => Ok(true),
-                Ok(_) => {
-                    Err(Refusal("existing destination does not match the verified file").into())
-                }
-                Err(err) => Err(retryable(err)),
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&destination)
+                .map_err(retryable)?;
+            let metadata = file.metadata().map_err(retryable)?;
+            if !metadata.is_file() || metadata.len() != spec.file_len {
+                return Err(
+                    Refusal("existing destination does not match the verified file").into(),
+                );
             }
+            let digest = Blake3Hex::of_reader(&mut file).map_err(retryable)?;
+            if digest != *expected {
+                return Err(
+                    Refusal("existing destination does not match the verified file").into(),
+                );
+            }
+            mediaops_core::install::check_publication_parents(
+                Path::new(&spec.library_root),
+                Path::new(&spec.dest_rel),
+            )
+            .map_err(retryable)?;
+            // Hash and normalize the same no-follow inode, even after the deadline.
+            #[cfg(test)]
+            tests::recovery_failure("chmod").map_err(retryable)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))
+                .map_err(retryable)?;
+            #[cfg(test)]
+            tests::recovery_failure("fsync").map_err(retryable)?;
+            file.sync_all().map_err(retryable)?;
+            Ok(true)
         }
     }
 }

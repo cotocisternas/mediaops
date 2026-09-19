@@ -12,7 +12,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -412,11 +412,12 @@ fn install_checked(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&handle.source)
         .map_err(|err| InstallError::io(&handle.source, &err))?;
-    if !file
+    let metadata = file
         .metadata()
-        .map_err(|e| InstallError::io(&handle.source, &e))?
-        .is_file()
-    {
+        .map_err(|e| InstallError::io(&handle.source, &e))?;
+    // Published hardlink recovery belongs to the worker's matching-digest path.
+    // Fresh publication must not chmod another pathname's inode through staging.
+    if !metadata.is_file() || metadata.nlink() != 1 {
         return Err(InstallError::NotStaging(
             handle.source.display().to_string(),
         ));
@@ -432,8 +433,11 @@ fn install_checked(
         return Err(InstallError::DigestMismatch);
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
+        create_library_directories(parent)?;
     }
+    check_publication_parents(library_root, &handle.dest_rel)?;
+    check()?;
+    make_media_readable(&file, &handle.source)?;
     move_into_place_checked(&handle.source, &dest, check)?;
     Ok(InstallOutcome {
         path: dest,
@@ -454,18 +458,19 @@ fn move_into_place_checked(
     dest: &Path,
     check: &mut impl FnMut() -> Result<(), InstallError>,
 ) -> Result<(), InstallError> {
-    copy_into_place_checked(source, dest, check)?;
+    copy_into_place_checked(source, dest, true, check)?;
     fs::remove_file(source).map_err(|err| InstallError::io(source, &err))?;
     sync_parent(source)
 }
 
 fn copy_into_place(source: &Path, dest: &Path) -> Result<(), InstallError> {
-    copy_into_place_checked(source, dest, &mut || Ok(()))
+    copy_into_place_checked(source, dest, false, &mut || Ok(()))
 }
 
 fn copy_into_place_checked(
     source: &Path,
     dest: &Path,
+    media: bool,
     check: &mut impl FnMut() -> Result<(), InstallError>,
 ) -> Result<(), InstallError> {
     check()?;
@@ -477,12 +482,13 @@ fn copy_into_place_checked(
         }
         Err(err) => return Err(InstallError::io(source, &err)),
     }
-    copy_across_devices(source, dest, check)
+    copy_across_devices(source, dest, media, check)
 }
 
 fn copy_across_devices(
     source: &Path,
     dest: &Path,
+    media: bool,
     check: &mut impl FnMut() -> Result<(), InstallError>,
 ) -> Result<(), InstallError> {
     let slot = InstallTemporary::open(source, dest, true)?.expect("created install slot");
@@ -514,8 +520,12 @@ fn copy_across_devices(
         to.write_all(bytes)
             .map_err(|e| InstallError::io(&slot.data, &e))
     })?;
-    to.sync_all()
-        .map_err(|e| InstallError::io(&slot.data, &e))?;
+    if media {
+        make_media_readable(&to, &slot.data)?;
+    } else {
+        to.sync_all()
+            .map_err(|e| InstallError::io(&slot.data, &e))?;
+    }
     check()?;
     fs::hard_link(&slot.data, dest).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -676,7 +686,10 @@ impl InstallTemporary {
                 && fs::symlink_metadata(&self.dest).is_ok_and(|dest| {
                     dest.dev() == metadata.dev() && dest.ino() == metadata.ino()
                 }));
-        if !owned_regular(&metadata) || !links_are_owned {
+        let owned_data = metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && (metadata.mode() & 0o7777 == 0o644 || metadata.mode() & 0o077 == 0);
+        if !owned_data || !links_are_owned {
             return Err(InstallError::UnsafeTemporary(
                 self.data.display().to_string(),
             ));
@@ -690,6 +703,66 @@ fn owned_regular(metadata: &fs::Metadata) -> bool {
     metadata.is_file()
         && metadata.uid() == unsafe { libc::geteuid() }
         && metadata.mode() & 0o077 == 0
+}
+
+fn make_media_readable(file: &fs::File, path: &Path) -> Result<(), InstallError> {
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .and_then(|()| file.sync_all())
+        .map_err(|err| InstallError::io(path, &err))
+}
+
+/// Refuse publication beneath schema parents that are not traversable by all
+/// Unix permission classes. This is a conservative mode-bit gate, not an ACL or
+/// service-identity access check. Library-root ancestors remain operator policy.
+/// In particular, a crash between mkdir and chmod must not turn a private parent
+/// into a silently successful installation on retry.
+pub fn check_publication_parents(root: &Path, dest_rel: &Path) -> Result<(), InstallError> {
+    let mut path = root.to_path_buf();
+    if let Some(parent) = dest_rel.parent() {
+        for component in parent.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(InstallError::NotStaging(dest_rel.display().to_string()));
+            }
+            path.push(component);
+            let metadata = fs::metadata(&path).map_err(|err| InstallError::io(&path, &err))?;
+            if !metadata.is_dir() || metadata.mode() & 0o111 != 0o111 {
+                return Err(InstallError::io(
+                    &path,
+                    &std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "schema parent must be traversable by owner, group and other; administrator repair required",
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Follow supported directory symlinks, but never change existing directory policy.
+fn create_library_directories(path: &Path) -> Result<(), InstallError> {
+    if path.as_os_str().is_empty() || path.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        create_library_directories(parent)?;
+    }
+    match fs::DirBuilder::new().mode(0o755).create(path) {
+        Ok(()) => {
+            let directory = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|err| InstallError::io(path, &err))?;
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o755))
+                .and_then(|()| directory.sync_all())
+                .map_err(|err| InstallError::io(path, &err))?;
+            sync_parent(path)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(err) => Err(InstallError::io(path, &err)),
+    }
 }
 
 fn sync_parent(path: &Path) -> Result<(), InstallError> {
@@ -738,6 +811,22 @@ pub fn replace(
     if let Some(parent) = backup_destination.parent() {
         fs::create_dir_all(parent).map_err(|err| InstallError::io(parent, &err))?;
     }
+    let conversion = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&handle.source)
+        .map_err(|err| InstallError::io(&handle.source, &err))?;
+    let metadata = conversion
+        .metadata()
+        .map_err(|err| InstallError::io(&handle.source, &err))?;
+    // A conversion must not alias live media or its backup when promoted.
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(InstallError::NotConverting(
+            handle.source.display().to_string(),
+        ));
+    }
+    check_publication_parents(library_root, &handle.dest_rel)?;
+    make_media_readable(&conversion, &handle.source)?;
     // Preserve the live entry until the encoded file can replace it atomically.
     copy_into_place(&dest, backup_destination)?;
     if let Err(err) = fs::rename(&handle.source, &dest) {
@@ -763,6 +852,181 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).expect("metadata").mode() & 0o7777
+    }
+
+    #[test]
+    fn publication_directories_ignore_umask_only_when_new() {
+        // Also run in an isolated process with umask 077; never mutate the
+        // process-wide umask inside the parallel test harness.
+        let tmp = TempTree::new();
+        let existing = tmp.path.join("existing");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&existing)
+            .expect("existing");
+        let nested = existing.join("new/nested");
+        create_library_directories(&nested).expect("parents");
+        assert_eq!(mode(&existing), 0o700);
+        assert_eq!(mode(nested.parent().expect("parent")), 0o755);
+        assert_eq!(mode(&nested), 0o755);
+        let source = tmp.path.join("source");
+        write_file(&source, b"complete");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("private");
+        let dest = nested.join("media");
+        copy_across_devices(&source, &dest, true, &mut || Ok(())).expect("copy");
+        assert_eq!(mode(&source), 0o600);
+        assert_eq!(mode(&dest), 0o644);
+    }
+
+    #[test]
+    fn promoted_temporary_cleanup_validates_modes_links_and_marker() {
+        let tmp = TempTree::new();
+        let source = tmp.path.join("source");
+        let dest = tmp.path.join("dest");
+        let slot = InstallTemporary::open(&source, &dest, true)
+            .expect("slot")
+            .expect("present");
+        for permissions in [0o600, 0o644] {
+            write_file(&slot.data, b"complete");
+            fs::set_permissions(&slot.data, fs::Permissions::from_mode(permissions)).expect("mode");
+            slot.clear_data().expect("one link cleanup");
+            write_file(&slot.data, b"complete");
+            fs::set_permissions(&slot.data, fs::Permissions::from_mode(permissions)).expect("mode");
+            fs::hard_link(&slot.data, &dest).expect("published");
+            let third = tmp.path.join("third");
+            fs::hard_link(&slot.data, &third).expect("unknown link");
+            assert!(slot.clear_data().is_err());
+            fs::remove_file(&third).expect("remove third");
+            slot.clear_data().expect("two link cleanup");
+            assert_eq!(mode(&dest), permissions);
+            assert_eq!(fs::read(&dest).expect("bytes"), b"complete");
+            fs::remove_file(&dest).expect("next case");
+        }
+        write_file(&slot.data, b"unsafe");
+        fs::set_permissions(&slot.data, fs::Permissions::from_mode(0o666)).expect("mode");
+        assert!(slot.clear_data().is_err());
+        let marker = slot.data.parent().expect("dir").join("owner");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).expect("marker mode");
+        drop(slot);
+        assert!(InstallTemporary::open(&source, &dest, false).is_err());
+    }
+
+    #[test]
+    fn cross_device_collision_preserves_destination_and_backup_copy_stays_private() {
+        let tmp = TempTree::new();
+        let source = tmp.path.join("source");
+        let dest = tmp.path.join("dest");
+        write_file(&source, b"new media");
+        write_file(&dest, b"unrelated");
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o640)).expect("dest mode");
+        assert!(matches!(
+            copy_across_devices(&source, &dest, true, &mut || Ok(())),
+            Err(InstallError::DestinationExists(_))
+        ));
+        assert_eq!(fs::read(&dest).expect("dest"), b"unrelated");
+        assert_eq!(mode(&dest), 0o640);
+        let slot = InstallTemporary::open(&source, &dest, false)
+            .expect("slot")
+            .expect("present");
+        assert_eq!(mode(&slot.data), 0o644);
+        slot.clear_data().expect("clean promoted loser");
+        let backup = tmp.path.join("backup");
+        copy_across_devices(&dest, &backup, false, &mut || Ok(())).expect("backup");
+        assert_eq!(mode(&dest), 0o640);
+        assert_eq!(mode(&backup), 0o600);
+        assert_eq!(fs::read(&backup).expect("backup"), b"unrelated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permission_failure_is_not_success() {
+        let tmp = TempTree::new();
+        let path = tmp.path.join("file");
+        write_file(&path, b"complete");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private");
+        let descriptor = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(&path)
+            .expect("path descriptor");
+        assert!(make_media_readable(&descriptor, &path).is_err());
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn publication_refuses_shared_staging_without_changing_its_alias() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let handle = staged_handle(&tmp.path, &id, &Placement::movie("The.Matrix", 1999, "mkv"));
+        fs::set_permissions(&handle.source, fs::Permissions::from_mode(0o600)).expect("private");
+        let alias = tmp.path.join("unrelated");
+        fs::hard_link(&handle.source, &alias).expect("alias");
+        assert!(matches!(
+            install(&tmp.path, &id, &handle),
+            Err(InstallError::NotStaging(_))
+        ));
+        for path in [&handle.source, &alias] {
+            assert_eq!(mode(path), 0o600);
+            assert_eq!(fs::read(path).expect("bytes"), b"bytes");
+        }
+        assert!(!tmp.path.join(handle.dest_rel()).exists());
+    }
+
+    #[test]
+    fn interrupted_private_schema_parent_refuses_install_without_broadening() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let handle = staged_handle(&tmp.path, &id, &Placement::movie("The.Matrix", 1999, "mkv"));
+        fs::set_permissions(&handle.source, fs::Permissions::from_mode(0o600)).expect("private");
+        let parent = tmp
+            .path
+            .join(handle.dest_rel())
+            .parent()
+            .expect("parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent).expect("crash-equivalent parents");
+        // A private intermediate parent must not be hidden by an accessible leaf.
+        let interrupted = parent.parent().expect("movies");
+        fs::set_permissions(interrupted, fs::Permissions::from_mode(0o700))
+            .expect("mkdir before chmod");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("leaf");
+        let err = install(&tmp.path, &id, &handle).expect_err("administrator repair required");
+        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(mode(interrupted), 0o700);
+        assert_eq!(mode(&handle.source), 0o600);
+        assert_eq!(
+            fs::read(&handle.source).expect("staging retained"),
+            b"bytes"
+        );
+        assert!(!tmp.path.join(handle.dest_rel()).exists());
+    }
+
+    #[test]
+    fn replacement_refuses_conversion_hardlink_without_changing_live_or_alias() {
+        let tmp = TempTree::new();
+        let id = TitleId::movie("603").expect("id");
+        let placement = Placement::movie("The.Matrix", 1999, "mkv");
+        let handle = staged_handle(&tmp.path, &id, &placement);
+        let live = install(&tmp.path, &id, &handle).expect("install").path;
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o640)).expect("live mode");
+        let conversion = tmp.path.join("The.Matrix.(1999).mkv.converting");
+        fs::hard_link(&live, &conversion).expect("live alias");
+        let handle =
+            VerifiedConvertingHandle::verify(&id, conversion.clone(), &placement).expect("handle");
+        let backup = tmp.path.join("backup");
+        assert!(matches!(
+            replace(&tmp.path, &id, &handle, &backup),
+            Err(InstallError::NotConverting(_))
+        ));
+        for path in [&live, &conversion] {
+            assert_eq!(mode(path), 0o640);
+            assert_eq!(fs::read(path).expect("bytes"), b"bytes");
+        }
+        assert!(!backup.exists());
+    }
 
     #[test]
     fn concurrent_no_replace_gate_has_one_winner_and_preserves_loser() {
@@ -851,7 +1115,7 @@ mod tests {
         let dest = tmp.path.join("destination");
         write_file(&source, &vec![9; 3 * 64 * 1024]);
         let mut checks = 0;
-        let result = copy_across_devices(&source, &dest, &mut || {
+        let result = copy_across_devices(&source, &dest, true, &mut || {
             checks += 1;
             if checks == 5 {
                 Err(InstallError::DeadlineExceeded)
@@ -865,11 +1129,12 @@ mod tests {
             .expect("owned slot")
             .expect("present");
         assert_eq!(fs::metadata(&slot.data).expect("partial").len(), 64 * 1024);
+        assert_eq!(mode(&slot.data), 0o600);
         let data = slot.data.clone();
         slot.clear_data().expect("recover space");
         assert!(!data.exists());
         drop(slot);
-        copy_across_devices(&source, &dest, &mut || Ok(())).expect("retry");
+        copy_across_devices(&source, &dest, true, &mut || Ok(())).expect("retry");
         assert_eq!(
             fs::read(&dest).expect("dest"),
             fs::read(&source).expect("source")
@@ -983,6 +1248,7 @@ mod tests {
             .path
             .join(staging_path(&id, filename).expect("stage"));
         write_file(&source, b"verified music");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).expect("private");
         let handle = VerifiedStagingHandle::verify(&library.path, &id, source.clone(), &placement)
             .expect("handle");
         let result = install_verified_before(
@@ -994,6 +1260,8 @@ mod tests {
         )
         .expect("cross-device install");
         assert_eq!(fs::read(&result.path).expect("music"), b"verified music");
+        assert_eq!(mode(&result.path), 0o644);
+        assert_eq!(result.whole_file_b3, Blake3Hex::of_bytes(b"verified music"));
         assert_eq!(
             fs::metadata(&result.path).expect("installed disk").dev(),
             fs::metadata(&music.path).expect("music disk").dev()
@@ -1128,12 +1396,14 @@ mod tests {
         let lib = tmp.path.join("library");
         let staged = lib.join(&staged_rel);
         write_file(&staged, b"matrix-bytes");
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).expect("private");
 
         let handle = VerifiedStagingHandle::verify(&lib, &title_id, staged.clone(), &placement)
             .expect("verify staging");
         let installed = install(&lib, &title_id, &handle).expect("install");
         let expected = lib.join(render(&title_id, &placement).expect("render"));
         assert_eq!(installed.path, expected);
+        assert_eq!(mode(&installed.path), 0o644);
         assert!(installed.path.starts_with(&lib));
         assert_eq!(fs::read(&installed.path).expect("read"), b"matrix-bytes");
         assert_eq!(
@@ -1168,12 +1438,17 @@ mod tests {
         let converting_handle =
             VerifiedConvertingHandle::verify(&title_id, converting.clone(), &placement)
                 .expect("verify converting");
+        fs::set_permissions(&converting, fs::Permissions::from_mode(0o600))
+            .expect("conversion mode");
+        fs::set_permissions(&installed.path, fs::Permissions::from_mode(0o640)).expect("live mode");
         let backup = tmp.path.join("backup").join("The.Matrix.(1999).mkv");
         let replaced = replace(&lib, &title_id, &converting_handle, &backup).expect("replace");
 
         assert_eq!(replaced, installed.path);
         assert_eq!(fs::read(&replaced).expect("new"), b"encoded");
         assert_eq!(fs::read(&backup).expect("backup"), b"original");
+        assert_eq!(mode(&replaced), 0o644);
+        assert_eq!(mode(&backup), 0o640);
         assert!(!converting.exists());
         assert_eq!(
             pathschema::parse(replaced.strip_prefix(&lib).expect("strip")).expect("parse"),
@@ -1298,6 +1573,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn replace_refuses_existing_backup_and_restores_on_converting_rename_failure() {
         let tmp = TempTree::new();
@@ -1327,11 +1603,32 @@ mod tests {
         assert_eq!(fs::read(&converting).expect("converting"), b"encoded");
 
         fs::remove_file(&backup).expect("clear backup");
-        fs::remove_file(&converting).expect("drop converting");
-        let err =
-            replace(&lib, &title_id, &converting_handle, &backup).expect_err("converting gone");
-        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::NotFound));
-        assert_eq!(fs::read(&installed).expect("restored"), b"original");
+        let other_device = TempTree::new_at(Path::new("/dev/shm"));
+        let converting = other_device.path.join("The.Matrix.(1999).mkv.converting");
+        write_file(&converting, b"encoded");
+        fs::set_permissions(&converting, fs::Permissions::from_mode(0o600))
+            .expect("private conversion");
+        fs::set_permissions(&installed.path, fs::Permissions::from_mode(0o640)).expect("live mode");
+        assert_ne!(
+            fs::metadata(&converting).expect("conversion").dev(),
+            fs::metadata(&installed.path).expect("live").dev()
+        );
+        let converting_handle =
+            VerifiedConvertingHandle::verify(&title_id, converting.clone(), &placement)
+                .expect("valid conversion");
+        // Opening and chmodding succeed, then backup is linked successfully;
+        // the actual rename across devices fails after backup creation.
+        let err = replace(&lib, &title_id, &converting_handle, &backup)
+            .expect_err("rename crosses devices");
+        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::CrossesDevices));
+        assert_eq!(fs::read(&installed).expect("preserved"), b"original");
+        assert_eq!(mode(&installed.path), 0o640);
+        assert_eq!(fs::metadata(&installed.path).expect("live").nlink(), 1);
+        assert_eq!(
+            fs::read(&converting).expect("retained conversion"),
+            b"encoded"
+        );
+        assert_eq!(mode(&converting), 0o644);
         assert!(!backup.exists());
     }
 
