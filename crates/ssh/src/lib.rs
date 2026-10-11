@@ -447,7 +447,10 @@ pub async fn install_provider(
             // daemon is gone the moment you disconnect.
             exec.run(&ssh_exec(
                 ssh_config,
-                &["sh", "-c", "sudo -n loginctl enable-linger \"$(id -un)\""],
+                // ssh joins argv with spaces for the remote shell, so a nested
+                // `sh -c '...'` loses its quoting. Pass the words directly; the
+                // remote shell expands `$(id -un)`.
+                &["sudo", "-n", "loginctl", "enable-linger", "$(id -un)"],
             ))
             .await?;
             // `enable --now` is a no-op for a unit that is already running on
@@ -818,7 +821,8 @@ mod tests {
         assert!(
             calls.iter().any(|c| {
                 c.program_name() == "ssh"
-                    && c.args.iter().any(|a| a.contains("loginctl enable-linger"))
+                    && c.args.iter().any(|a| a == "loginctl")
+                    && c.args.iter().any(|a| a == "enable-linger")
             }),
             "linger so mediaopsd survives logout: {calls:?}"
         );
