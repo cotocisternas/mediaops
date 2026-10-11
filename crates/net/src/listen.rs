@@ -27,8 +27,11 @@ static TCP_CONNECTS: AtomicU64 = AtomicU64::new(0);
 /// stream can carry at most `window / RTT` bytes per second. On a WAN link
 /// with a 200+ ms round trip the library defaults (1-2 MiB) cap each
 /// connection far below the link rate, so every channel and server asks for
-/// room to hold a whole 32 MiB Range plus slack. Memory stays bounded: a
-/// Range is already buffered in full on both ends.
+/// room to hold a whole 32 MiB Range plus slack. The windows bound transport
+/// buffering per stream and per connection; they do not bound total memory.
+/// Peak memory still scales with Range concurrency (each in-flight Range is
+/// buffered in full by the daemon and the pull worker), and larger receive
+/// windows let the gateway queue more transport data than the defaults did.
 const H2_STREAM_WINDOW: u32 = 32 * 1024 * 1024;
 const H2_CONN_WINDOW: u32 = 64 * 1024 * 1024;
 
