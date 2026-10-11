@@ -23,6 +23,18 @@ use crate::seedbox::Seedbox;
 
 static TCP_CONNECTS: AtomicU64 = AtomicU64::new(0);
 
+/// HTTP/2 flow-control windows. A Range response is one HTTP/2 stream, and a
+/// stream can carry at most `window / RTT` bytes per second. On a WAN link
+/// with a 200+ ms round trip the library defaults (1-2 MiB) cap each
+/// connection far below the link rate, so every channel and server asks for
+/// room to hold a whole 32 MiB Range plus slack. The windows bound transport
+/// buffering per stream and per connection; they do not bound total memory.
+/// Peak memory still scales with Range concurrency (each in-flight Range is
+/// buffered in full by the daemon and the pull worker), and larger receive
+/// windows let the gateway queue more transport data than the defaults did.
+const H2_STREAM_WINDOW: u32 = 32 * 1024 * 1024;
+const H2_CONN_WINDOW: u32 = 64 * 1024 * 1024;
+
 /// How many times [`connect_tcp`] has run in this process (AD-12 tests).
 pub fn tcp_connect_count() -> u64 {
     TCP_CONNECTS.load(Ordering::SeqCst)
@@ -115,6 +127,8 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     Server::builder()
+        .initial_stream_window_size(H2_STREAM_WINDOW)
+        .initial_connection_window_size(H2_CONN_WINDOW)
         .add_service(
             mediaops_proto::control_service_server::ControlServiceServer::new(seedbox.clone()),
         )
@@ -138,6 +152,8 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     Server::builder()
+        .initial_stream_window_size(H2_STREAM_WINDOW)
+        .initial_connection_window_size(H2_CONN_WINDOW)
         .add_service(
             mediaops_proto::control_service_server::ControlServiceServer::new(gateway.clone()),
         )
@@ -170,6 +186,8 @@ pub async fn connect_tcp(
     Endpoint::from_shared("http://localhost")
         .map_err(|err| NetError::Connect(err.to_string()))?
         .connect_timeout(Duration::from_secs(10))
+        .initial_stream_window_size(H2_STREAM_WINDOW)
+        .initial_connection_window_size(H2_CONN_WINDOW)
         .concurrency_limit(1)
         .connect_with_connector(svc)
         .await
@@ -194,6 +212,8 @@ pub async fn connect_unix(path: &Path, client: Arc<ClientConfig>) -> Result<Chan
     Endpoint::from_shared("http://localhost")
         .map_err(|err| NetError::Connect(err.to_string()))?
         .connect_timeout(Duration::from_secs(10))
+        .initial_stream_window_size(H2_STREAM_WINDOW)
+        .initial_connection_window_size(H2_CONN_WINDOW)
         .connect_with_connector(svc)
         .await
         .map_err(|err| NetError::Connect(err.to_string()))
