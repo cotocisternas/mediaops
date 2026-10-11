@@ -259,7 +259,10 @@ pub async fn write_remote_file(
     }
     let escaped = contents.replace('\'', "'\\''");
     let script = format!("printf '%s' '{escaped}' > {remote_path}");
-    exec.run(&ssh_exec(ssh_config, &["sudo", "/bin/sh", "-c", &script]))
+    // ssh joins argv with spaces for the remote shell, so the script must be
+    // quoted once more or the `>` redirect runs as the login user, not root.
+    let quoted = format!("'{}'", script.replace('\'', "'\\''"));
+    exec.run(&ssh_exec(ssh_config, &["sudo", "/bin/sh", "-c", &quoted]))
         .await?;
     Ok(diff)
 }
