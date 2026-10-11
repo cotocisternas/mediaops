@@ -259,7 +259,10 @@ pub async fn write_remote_file(
     }
     let escaped = contents.replace('\'', "'\\''");
     let script = format!("printf '%s' '{escaped}' > {remote_path}");
-    exec.run(&ssh_exec(ssh_config, &["sudo", "/bin/sh", "-c", &script]))
+    // ssh joins argv with spaces for the remote shell, so the script must be
+    // quoted once more or the `>` redirect runs as the login user, not root.
+    let quoted = format!("'{}'", script.replace('\'', "'\\''"));
+    exec.run(&ssh_exec(ssh_config, &["sudo", "/bin/sh", "-c", &quoted]))
         .await?;
     Ok(diff)
 }
@@ -305,6 +308,18 @@ pub async fn nginx_test_and_reload(
     exec.run(&ssh_exec(ssh_config, &["sudo", "nginx", "-s", "reload"]))
         .await?;
     Ok(())
+}
+
+/// `sudo -n loginctl enable-linger <login user>` on the box.
+///
+/// `ssh` joins argv with spaces and the remote shell re-parses the result, so
+/// the words are passed directly (no nested `sh -c '...'`, whose quoting would
+/// be lost); the remote shell expands `$(id -un)`.
+pub fn enable_linger_command(ssh_config: &Path) -> ExecCommand {
+    ssh_exec(
+        ssh_config,
+        &["sudo", "-n", "loginctl", "enable-linger", "$(id -un)"],
+    )
 }
 
 pub fn ssh_exec(ssh_config: &Path, remote_argv: &[&str]) -> ExecCommand {
@@ -445,11 +460,7 @@ pub async fn install_provider(
             // User units die with the last SSH session unless lingering is on.
             // SeedIt4Me has passwordless sudo for this; without linger the
             // daemon is gone the moment you disconnect.
-            exec.run(&ssh_exec(
-                ssh_config,
-                &["sh", "-c", "sudo -n loginctl enable-linger \"$(id -un)\""],
-            ))
-            .await?;
+            exec.run(&enable_linger_command(ssh_config)).await?;
             // `enable --now` is a no-op for a unit that is already running on
             // the old binary or the old bind; a re-bootstrap must restart it.
             exec.run(&ssh_exec(
@@ -737,6 +748,111 @@ mod tests {
         );
     }
 
+    /// What the remote login shell receives from `ssh seedbox <argv...>`: ssh
+    /// joins the argv with single spaces and the remote shell parses it again.
+    fn remote_command_line(cmd: &ExecCommand) -> String {
+        assert_eq!(cmd.program_name(), "ssh");
+        assert_eq!(&cmd.args[..1], ["-F"]);
+        assert_eq!(cmd.args[2], "seedbox");
+        cmd.args[3..].join(" ")
+    }
+
+    /// Run `line` the way the box would, with `sudo` and `loginctl` replaced by
+    /// shims in `bin` so no real privilege or SSH is involved.
+    fn run_remote_line(line: &str, bin: &Path, extra_env: &[(&str, &Path)]) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).expect("bin dir");
+        let shims = [
+            // sudo -n cmd... => cmd...
+            (
+                "sudo",
+                "#!/bin/sh\nwhile [ \"$1\" = \"-n\" ]; do shift; done\nexec \"$@\"\n",
+            ),
+            // loginctl records its argv so the test can inspect it
+            (
+                "loginctl",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOGINCTL_OUT\"\n",
+            ),
+        ];
+        for (name, body) in shims {
+            let path = bin.join(name);
+            std::fs::write(&path, body).expect("shim");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let path_var = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(line).env("PATH", path_var);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("sh");
+        assert!(
+            out.status.success(),
+            "remote shell failed for {line:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mediaops-ssh-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    #[tokio::test]
+    async fn remote_file_write_survives_the_remote_shell() {
+        // Quotes, `$host`, backticks, `$(..)`, backslashes, newlines and a
+        // missing trailing newline must all arrive byte for byte.
+        let contents = "location /sonarr {\n  proxy_set_header Host $host;\n  # it's \"quoted\" `tick` $(not run) \\ back\n  set $x '$y';\n}";
+        let dir = scratch_dir("write");
+        let target = dir.join("sonarr.conf");
+        let exec = TranscriptExec::new();
+        write_remote_file(
+            &exec,
+            Path::new("/tmp/ssh_config"),
+            target.to_str().expect("utf8"),
+            contents,
+        )
+        .await
+        .expect("write");
+        let write = exec.recorded().pop().expect("a write call");
+        run_remote_line(&remote_command_line(&write), &dir.join("bin"), &[]);
+        assert_eq!(std::fs::read_to_string(&target).expect("written"), contents);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn linger_command_expands_the_login_user_remotely() {
+        let dir = scratch_dir("linger");
+        let out = dir.join("loginctl.argv");
+        let line = remote_command_line(&enable_linger_command(Path::new("/tmp/ssh_config")));
+        run_remote_line(&line, &dir.join("bin"), &[("LOGINCTL_OUT", &out)]);
+        let user = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .expect("id")
+                .stdout,
+        )
+        .expect("utf8");
+        assert_eq!(
+            std::fs::read_to_string(&out).expect("argv"),
+            format!("enable-linger\n{}\n", user.trim())
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn bulk_copy_is_a_test_failure() {
         let exec = TranscriptExec::new();
@@ -818,7 +934,8 @@ mod tests {
         assert!(
             calls.iter().any(|c| {
                 c.program_name() == "ssh"
-                    && c.args.iter().any(|a| a.contains("loginctl enable-linger"))
+                    && c.args.iter().any(|a| a == "loginctl")
+                    && c.args.iter().any(|a| a == "enable-linger")
             }),
             "linger so mediaopsd survives logout: {calls:?}"
         );
